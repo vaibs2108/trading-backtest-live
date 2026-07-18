@@ -1,0 +1,49 @@
+# ── Credentials (NEVER upload) ────────────────────────────────────────────────
+.env
+backend/settings.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[oc]
+.venv/
+*.egg-info
+uv.lock
+pyproject.toml
+.python-version
+
+# ── Node / Frontend source (built in Docker) ─────────────────────────────────
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# ── Not needed at runtime ────────────────────────────────────────────────────
+.git/
+.gitignore
+.dockerignore
+.claude/
+.agents/
+scratch/
+training/
+pinescript/
+Dependencies/
+logs/
+data/
+models/
+backend/logs/
+backend/agents/backup_daily_weekly_bias/
+backend/models/model_till_*.pkl
+*.log
+
+# ── Documentation (not needed in image) ──────────────────────────────────────
+*.md
+*.docx
+AlgoTrader_Pro_Gap_Analysis_Report.docx
+MULTI_AGENT_V3_ARCHITECTURE.md
+REGIME_TREND_ARCHITECTURE.md
+LIVE_CHECKLIST.md
+agent_logic.md
+
+# ── Dev scripts not needed in prod ───────────────────────────────────────────
+backtest_optimization.py
+diag_multi_agent_today.py
+optimize_multi_agent.py

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AlgoTrader Pro - Autonomous Trading Platform</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <style>
+      :root, [data-theme="light"] {
+        --bg-primary: #f8f9fc;
+        --bg-secondary: #ffffff;
+        --bg-tertiary: #f1f3f9;
+        --bg-input: #f1f3f9;
+        --bg-hover: #e8eaf0;
+        --border: #e2e5ed;
+        --border-light: #ebedf3;
+        --text-primary: #1a1d26;
+        --text-secondary: #4a5068;
+        --text-muted: #8b90a0;
+        --text-head: #6b7188;
+        --accent: #4f6ef7;
+        --accent-hover: #3d5ce5;
+        --accent-bg: #eef1fe;
+        --green: #10b981;
+        --green-bg: #ecfdf5;
+        --red: #ef4444;
+        --red-bg: #fef2f2;
+        --yellow: #f59e0b;
+        --yellow-bg: #fffbeb;
+        --orange: #f97316;
+        --orange-bg: #fff7ed;
+        --purple: #8b5cf6;
+        --purple-bg: #f5f3ff;
+        --cyan: #06b6d4;
+        --cyan-bg: #ecfeff;
+        --sidebar-bg: #1a1d2e;
+        --sidebar-text: #a0a4b8;
+        --sidebar-active: #ffffff;
+        --sidebar-active-bg: rgba(79,110,247,0.15);
+        --sidebar-hover-bg: rgba(255,255,255,0.06);
+        --sidebar-border: rgba(255,255,255,0.06);
+        --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+        --shadow-md: 0 4px 12px rgba(0,0,0,0.08);
+        --shadow-lg: 0 8px 24px rgba(0,0,0,0.12);
+        --radius-sm: 6px;
+        --radius-md: 10px;
+        --radius-lg: 14px;
+        --radius-xl: 18px;
+        --chart-bg: #ffffff;
+        --chart-text: #6b7188;
+        --chart-grid: #ebedf3;
+      }
+      [data-theme="dark"] {
+        --bg-primary: #0b0e18;
+        --bg-secondary: #111525;
+        --bg-tertiary: #161a2c;
+        --bg-input: #161a2c;
+        --bg-hover: #1c2038;
+        --border: #1e2235;
+        --border-light: #1a1e30;
+        --text-primary: #e2e5f0;
+        --text-secondary: #a0a4b8;
+        --text-muted: #636882;
+        --text-head: #8b90a0;
+        --accent: #6381f7;
+        --accent-hover: #7b95ff;
+        --accent-bg: rgba(99,129,247,0.12);
+        --green: #22c55e;
+        --green-bg: rgba(34,197,94,0.1);
+        --red: #ef4444;
+        --red-bg: rgba(239,68,68,0.1);
+        --yellow: #f59e0b;
+        --yellow-bg: rgba(245,158,11,0.1);
+        --orange: #fb923c;
+        --orange-bg: rgba(251,146,60,0.1);
+        --purple: #a78bfa;
+        --purple-bg: rgba(167,139,250,0.1);
+        --cyan: #22d3ee;
+        --cyan-bg: rgba(34,211,238,0.1);
+        --sidebar-bg: #0d1020;
+        --sidebar-text: #636882;
+        --sidebar-active: #e2e5f0;
+        --sidebar-active-bg: rgba(99,129,247,0.15);
+        --sidebar-hover-bg: rgba(255,255,255,0.04);
+        --sidebar-border: rgba(255,255,255,0.04);
+        --shadow-sm: 0 1px 2px rgba(0,0,0,0.2);
+        --shadow-md: 0 4px 12px rgba(0,0,0,0.3);
+        --shadow-lg: 0 8px 24px rgba(0,0,0,0.4);
+        --chart-bg: #111525;
+        --chart-text: #636882;
+        --chart-grid: #1e2235;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        background: var(--bg-primary);
+        font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        color: var(--text-primary);
+        transition: background 0.2s, color 0.2s;
+        -webkit-font-smoothing: antialiased;
+      }
+      .spin { animation: spin 1s linear infinite; }
+      @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+      @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+      @keyframes slideIn { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
+      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+      .fade-in { animation: fadeIn 0.3s ease-out; }
+      .slide-in { animation: slideIn 0.25s ease-out; }
+      ::-webkit-scrollbar { width: 6px; height: 6px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+      ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+      input, select, button { font-family: inherit; }
+      input[type="number"]::-webkit-inner-spin-button { opacity: 0.5; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

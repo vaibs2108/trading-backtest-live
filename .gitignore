@@ -1,0 +1,35 @@
+# ── Credentials & Local Configs (NEVER commit) ────────────────────────────────
+.env
+settings.json
+
+# ── Python & Virtual Envs ─────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# ── Node.js & UI Builds ──────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/node_modules/
+
+# ── Data, Logs & Local Scratch Space ──────────────────────────────────────────
+logs/
+data/
+scratch/
+Dependencies/
+
+# ── Exclude Extra Context & Training Files (as requested) ─────────────────────
+Research/
+training/
+pinescript/
+*.pine
+*.md
+!README.md       # Keep README.md
+!DEPLOY*.md      # Optional: Keep if you need deployment docs
+
+# ── Exclude Diagnostic/Optimization Scripts ───────────────────────────────────
+backtest_optimization.py
+diag_multi_agent_today.py

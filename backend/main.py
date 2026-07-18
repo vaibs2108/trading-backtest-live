@@ -1,0 +1,4046 @@
+"""
+main.py — FastAPI application: REST API + WebSocket for live signals & chart data.
+"""
+import asyncio
+import logging
+import json
+import os
+import pytz
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+_IST = pytz.timezone("Asia/Kolkata")
+
+# ── Data health tracking ─────────────────────────────────────────────────────
+_data_health_state = {
+    "is_stale": False,
+    "last_candle_time": None,
+    "staleness_seconds": 0,
+    "broker_failures": 0,
+    "last_check_time": None,
+}
+
+# ── Application-level start/stop control ────────────────────────────────────
+_app_running = True  # When False, polling loop and data fetching are paused
+
+import pandas as pd
+
+def _format_ist_timestamp(ts_val) -> str:
+    """
+    Normalize and convert any candle or system timestamp into an ISO 8601 string 
+    localized to Asia/Kolkata with the +05:30 suffix.
+    """
+    if ts_val is None:
+        dt = datetime.now(_IST)
+    elif isinstance(ts_val, (int, float)):
+        dt = datetime.fromtimestamp(ts_val, tz=_IST)
+    elif isinstance(ts_val, datetime):
+        if ts_val.tzinfo is None:
+            dt = _IST.localize(ts_val)
+        else:
+            dt = ts_val.astimezone(_IST)
+    elif isinstance(ts_val, pd.Timestamp):
+        dt = ts_val.to_pydatetime()
+        if dt.tzinfo is None:
+            dt = _IST.localize(dt)
+        else:
+            dt = dt.astimezone(_IST)
+    else:
+        try:
+            parsed = pd.to_datetime(ts_val)
+            dt = parsed.to_pydatetime()
+            if dt.tzinfo is None:
+                dt = _IST.localize(dt)
+            else:
+                dt = dt.astimezone(_IST)
+        except Exception:
+            dt = datetime.now(_IST)
+    return dt.isoformat()
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+import broker
+import strategy
+import strategy_router
+import signal_journal_manager
+from config import get_settings, save_settings, INSTRUMENT_META, TIMEFRAME_LABELS, MARKET_HOURS
+from trade_manager import get_trade_manager, ActivePosition
+from capital_tracker import get_capital_tracker
+import slippage_tracker
+import performance_tracker
+from watchdog import write_heartbeat, save_app_state
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Ensure logs directory exists
+os.makedirs("logs", exist_ok=True)
+
+console_handler = logging.StreamHandler()
+console_handler.encoding = "utf-8"
+
+file_handler = logging.FileHandler("logs/app.log")
+file_handler.encoding = "utf-8"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        console_handler,
+        file_handler,
+    ],
+)
+logger = logging.getLogger(__name__)
+
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Dhan ML Trading Engine", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve React frontend
+FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+if FRONTEND_DIST.exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+
+# ── WebSocket connection manager ──────────────────────────────────────────────
+class ConnectionManager:
+    def __init__(self):
+        self.active: list[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        self.active.discard(ws) if hasattr(self.active, 'discard') else None
+        if ws in self.active:
+            self.active.remove(ws)
+
+    async def broadcast(self, data: dict):
+        disconnected = []
+        for ws in self.active:
+            try:
+                await ws.send_json(data)
+            except Exception:
+                disconnected.append(ws)
+        for ws in disconnected:
+            self.disconnect(ws)
+
+ws_manager = ConnectionManager()
+
+# ── In-memory state ───────────────────────────────────────────────────────────
+_live_frames: dict = {}          # cached multi-TF data
+_live_frames_instrument: str = ""   # which instrument _live_frames belongs to
+_last_signal: dict = {}          # last computed signal
+_all_strat_sigs_cache: dict = {}  # cached signals from ALL strategies (set by polling loop)
+_signal_history: list = []       # all signals this session
+_SIGNAL_HISTORY_PATH = Path(__file__).parent / "data" / "signal_history.json"
+
+# Cached frames from the polling loop — avoids re-fetching for chart_signals
+_cached_frames: dict = {}
+_cached_frames_ts: float = 0.0  # time.time() of last cache update
+_cached_frames_instrument: str = ""
+
+# Cached chart_signals backtest result — avoids re-running backtest on every page load
+_chart_signals_cache: dict = {}  # {strategy: {"signals": [...], "ts": float}}
+
+def _load_signal_history():
+    global _signal_history
+    try:
+        path = _SIGNAL_HISTORY_PATH
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                _signal_history = json.load(f)
+            logger.info(f"Loaded {len(_signal_history)} signals from history log.")
+        else:
+            _signal_history = []
+    except Exception as e:
+        logger.error(f"Failed to load signal history: {e}")
+        _signal_history = []
+
+def _save_signal_history():
+    try:
+        path = _SIGNAL_HISTORY_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(_signal_history, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save signal history: {e}")
+
+def _add_signal_to_history(sig: dict, source: str = "strategy"):
+    global _signal_history
+    if not sig or sig.get("signal") in ("HOLD", None):
+        return
+    # Tag with instrument, strategy, and source so signals don't bleed
+    cfg = get_settings()
+    strat_id = sig.get("strategy", cfg.strategy)
+    direction = sig.get("signal")
+    # Ensure 'time' is always set — strategies should provide it from the candle
+    # timestamp, but if empty fall back to wall-clock IST.
+    if not sig.get("time"):
+        sig["time"] = datetime.now(_IST).isoformat()
+    entry = {**sig, "instrument": cfg.instrument, "strategy": strat_id, "source": source, "recorded_at": datetime.now(_IST).isoformat()}
+
+    # DEDUP 1: exact same candle time + direction + instrument + strategy → skip
+    exists = any(
+        s.get("time") == sig.get("time") and s.get("signal") == direction
+        and s.get("instrument") == cfg.instrument and s.get("strategy") == strat_id
+        for s in _signal_history
+    )
+    if exists:
+        return
+
+    # DEDUP 2: same direction as the last signal for this strategy+instrument → skip
+    # Only log when direction CHANGES (e.g. HOLD→SHORT, SHORT→LONG, SHORT→SHORT_EXIT)
+    # This prevents 5 consecutive M:S markers when the signal persists across bars
+    last_for_strat = None
+    for s in reversed(_signal_history):
+        if s.get("strategy") == strat_id and s.get("instrument") == cfg.instrument:
+            last_for_strat = s
+            break
+    if last_for_strat and last_for_strat.get("signal") == direction:
+        return  # same direction already logged — skip
+
+    _signal_history.append(entry)
+    _signal_history = _signal_history[-100:]  # keep last 100
+    _save_signal_history()
+
+_chart_data: dict = {}           # OHLCV for charting
+_last_telegram_signal_key: tuple = ("", "")  # (direction, candle_ts) of last sent Telegram alert
+_pending_telegram_signal: dict = {}  # Signal that needs confirmation on next poll cycle
+_last_telegram_signal_alerts: dict = {}  # {strategy_id: (signal, candle_ts)} — dedup signal notifications
+_active_trade_signal: dict = {}  # The signal that triggered the current open trade (persists until position is closed)
+_recently_closed_symbols: dict = {}  # {symbol: datetime} — prevents Dhan sync from re-importing a position that was just closed locally
+_last_loss_direction: str = "NONE"   # direction of last losing trade
+_last_loss_time: Optional[datetime] = None  # timezone-aware datetime of last loss
+
+# ── Signal deduplication & cooldown state (mirrors backtest behavior) ────────
+# Fix A: Track last processed candle timestamp per strategy to avoid re-evaluating
+#        the same 5m candle across multiple 60s polling cycles.
+_last_processed_candle_ts: dict = {}  # {strat_id: candle_timestamp_str}
+
+# Fix B: Cooldown after exit for ALL strategies (not just active auto-trade).
+#        Mirrors backtest's block_long_until / block_short_until per strategy.
+_virtual_cooldown: dict = {}  # {strat_id: {"direction": str, "until": datetime}}
+
+# Fix D: Track last date for daily regime state reset
+_last_regime_reset_date: Optional[object] = None  # date object
+
+_activity_logs: list = []
+
+def add_activity_log(msg: str):
+    try:
+        t_str = datetime.now(_IST).strftime("%H:%M:%S")
+        log_entry = f"[{t_str}] {msg}"
+        _activity_logs.append(log_entry)
+        if len(_activity_logs) > 50:
+            _activity_logs.pop(0)
+    except Exception:
+        pass
+
+def record_cooldown_loss(direction: str):
+    global _last_loss_direction, _last_loss_time
+    _last_loss_direction = direction
+    _last_loss_time = datetime.now(_IST)
+    logger.info(f"Cooldown registered: {direction} blocked for {getattr(get_settings(), 'cooldown_bars', 0) * 5} mins")
+
+def _safe_pnl_exit_price(pos, index_ltp: float) -> float:
+    """
+    Return the correct exit price for PnL calculation.
+    For OPTIONS positions: fetch option premium, with sanity check.
+    For INDEX positions: return index_ltp as-is.
+    
+    CRITICAL: entry_price for OPTIONS is the option premium (~500-2000).
+    Using index LTP (~57000) as exit_price would produce absurd PnL.
+    """
+    if pos.trade_mode != "OPTIONS" or not pos.symbol:
+        return index_ltp
+    
+    # Try to fetch option premium
+    try:
+        if broker.is_connected():
+            fetched = broker.get_option_ltp(pos.symbol)
+            if fetched > 0:
+                return fetched
+    except Exception as e:
+        logger.warning(f"_safe_pnl_exit_price: could not fetch option LTP: {e}")
+    
+    # Fallback: if we can't get option premium, DON'T use index LTP.
+    # Use entry_price as conservative estimate (PnL = 0) rather than
+    # a wildly wrong number that could show crores of fake P&L.
+    logger.warning(
+        f"_safe_pnl_exit_price: using entry_price as fallback for {pos.symbol} "
+        f"(entry={pos.entry_price}, index_ltp={index_ltp})"
+    )
+    return pos.entry_price
+
+_exit_signal_logged_for_position: str = ""  # order_id for which we already logged an exit signal this position lifetime
+_exit_telegram_sent_for_position: str = ""  # order_id for which we already sent an exit alert this position lifetime
+
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
+class ConnectRequest(BaseModel):
+    client_code: str
+    access_token: str
+
+class SettingsUpdate(BaseModel):
+    strategy: Optional[str] = None
+    instrument: Optional[str] = None
+    trade_mode: Optional[str] = None
+    index_expiry: Optional[int] = None
+    options_expiry: Optional[int] = None
+    strike_type: Optional[str] = None
+    strike_offset: Optional[int] = None
+    lot_multiplier: Optional[int] = None
+    max_daily_loss: Optional[float] = None
+    max_daily_profit: Optional[float] = None
+    auto_trade: Optional[bool] = None
+    ml_threshold: Optional[float] = None
+    atr_sl_mult: Optional[float] = None
+    atr_t1_mult: Optional[float] = None
+    atr_t2_mult: Optional[float] = None
+    chart_timeframe: Optional[str] = None
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    # Agent Engine settings
+    agent_weight_macro: Optional[float] = None
+    agent_weight_structure: Optional[float] = None
+    agent_weight_momentum: Optional[float] = None
+    agent_weight_trigger: Optional[float] = None
+    agent_weight_volume: Optional[float] = None
+    agent_weight_memory: Optional[float] = None
+    min_orchestrator_score: Optional[float] = None
+    chart_patterns_enabled: Optional[bool] = None
+    pattern_memory_enabled: Optional[bool] = None
+    # Auto-trade settings
+    auto_square_off_minutes: Optional[int] = None
+    auto_kill_switch: Optional[bool] = None
+    auto_kill_switch_max_failures: Optional[int] = None
+    starting_capital: Optional[float] = None
+    data_stale_threshold_min: Optional[int] = None
+    # Regime Strategy settings
+    regime_trail_mult: Optional[float] = None
+    regime_trail_activation: Optional[float] = None
+    regime_be_trigger: Optional[float] = None
+    regime_be_buffer: Optional[float] = None
+
+class BacktestRequest(BaseModel):
+    instrument: str = "BANKNIFTY"
+    from_date: str = ""
+    to_date: str = ""
+    initial_capital: float = 500_000
+    lot_multiplier: int = 1
+    strategy: Optional[str] = None  # override active strategy for this backtest
+
+class ManualTradeRequest(BaseModel):
+    action: str   # LONG | SHORT | EXIT
+
+
+# ── REST Endpoints ────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def root():
+    if FRONTEND_DIST.exists():
+        return FileResponse(str(FRONTEND_DIST / "index.html"))
+    return {"status": "Dhan ML Trading Engine running", "docs": "/docs"}
+
+
+@app.post("/api/connect")
+async def connect_broker(req: ConnectRequest):
+    cfg = get_settings()
+    success, msg = broker.connect(req.client_code, req.access_token)
+    # Credentials are NOT saved to settings.json — they come from .env only
+    return {"success": success, "message": msg, "connected": broker.is_connected()}
+
+
+def _get_active_entries(cfg, tm) -> dict:
+    """Find active (OPEN) signal journal entries, overlaid with real live position if applicable."""
+    active_entries = {}
+    try:
+        from signal_journal_manager import _load
+        entries = _load()
+        for e in entries:
+            if e.get("status") == "OPEN" and e.get("instrument") == cfg.instrument:
+                strat = e.get("strategy")
+                if strat:
+                    active_entries[strat] = {
+                        "signal": e.get("direction"),
+                        "entry": e.get("entry_price"),
+                        "sl": e.get("sl"),
+                        "target1": e.get("target1"),
+                        "target2": e.get("target2"),
+                        "time": e.get("entry_time"),
+                        "strategy": strat,
+                        "instrument": e.get("instrument"),
+                        "reasons": e.get("reasons", []),
+                        "regime": e.get("regime", ""),
+                        "regime_confidence": e.get("regime_confidence", 0.0),
+                        "playbook": e.get("playbook", ""),
+                        "macro_bias": e.get("macro_bias", ""),
+                        "atr_5m": e.get("atr_5m", 0.0),
+                        "weighted_score": e.get("weighted_score", 0.0),
+                        "ml_prob": e.get("ml_prob", 0.0),
+                        "adx_1h": e.get("adx_1h", 0.0),
+                        "rr_t1": e.get("rr_t1", 0.0),
+                        "entry_quality": e.get("entry_quality", 0.0),
+                    }
+    except Exception as e_journal:
+        logger.warning(f"Failed to load active entries from journal: {e_journal}")
+
+    if tm.position and tm.position.instrument == cfg.instrument:
+        active_entries[cfg.strategy] = {
+            "signal": tm.position.direction,
+            "entry": getattr(tm.position, "index_entry_price", 0.0) or tm.position.entry_price,
+            "sl": tm.position.sl,
+            "target1": tm.position.target1,
+            "target2": tm.position.target2,
+            "time": tm.position.entry_time,
+            "strategy": cfg.strategy,
+            "instrument": tm.position.instrument,
+            "reasons": _active_trade_signal.get("reasons", []) if _active_trade_signal else ["Active live position"],
+            "regime": _active_trade_signal.get("regime", "") if _active_trade_signal else "",
+            "regime_confidence": _active_trade_signal.get("regime_confidence", 0.0) if _active_trade_signal else 0.0,
+            "playbook": _active_trade_signal.get("playbook", "") if _active_trade_signal else "",
+            "macro_bias": _active_trade_signal.get("macro_bias", "") if _active_trade_signal else "",
+            "atr_5m": _active_trade_signal.get("atr_5m", 0.0) if _active_trade_signal else tm.position.entry_atr,
+            "weighted_score": _active_trade_signal.get("weighted_score", 0.0) if _active_trade_signal else 0.0,
+            "ml_prob": _active_trade_signal.get("ml_prob", 0.0) if _active_trade_signal else 0.0,
+            "adx_1h": _active_trade_signal.get("adx_1h", 0.0) if _active_trade_signal else 0.0,
+            "rr_t1": _active_trade_signal.get("rr_t1", 0.0) if _active_trade_signal else 0.0,
+            "entry_quality": _active_trade_signal.get("entry_quality", 0.0) if _active_trade_signal else 0.0,
+        }
+    else:
+        active_entries.pop(cfg.strategy, None)
+
+    return active_entries
+
+
+@app.get("/api/status")
+async def get_status():
+    cfg = get_settings()
+    tm  = get_trade_manager()
+
+    # Synchronize positions from Dhan first!
+    if broker.is_connected():
+        _sync_dhan_positions(cfg, tm)
+
+    bal = 0.0
+    if broker.is_connected():
+        try:
+            bal = broker.get_balance()
+            if bal > 0 and cfg.auto_trade:
+                ct = get_capital_tracker()
+                ct.current_equity = bal
+                if ct.current_equity > ct.peak_equity:
+                    ct.peak_equity = ct.current_equity
+                ct._check_breach()
+                ct._save()
+        except Exception as e:
+            logger.warning(f"Failed to sync broker balance in status: {e}")
+            
+    lot = broker.get_lot_size(cfg.instrument) if broker.is_connected() else INSTRUMENT_META.get(cfg.instrument, {}).get("lot_size", 15)
+    ltp = broker.get_ltp(cfg.instrument) if broker.is_connected() else None
+
+    # Compute Live P&L from TradeManager's tracked position (most accurate)
+    live_pnl = 0.0
+    if tm.position and tm.position.instrument == cfg.instrument and ltp:
+        if tm.position.order_id.startswith("PAPER_"):
+            tm.update_pnl(ltp)
+        live_pnl = round(tm.position.current_pnl, 2)
+
+    # Today's P&L: use journal-derived stats as authoritative source
+    try:
+        from journal_manager import get_today_journal_stats
+        journal_stats = get_today_journal_stats(cfg.instrument)
+    except Exception as e:
+        logger.warning(f"Failed to get journal stats: {e}")
+        journal_stats = {"total_trades": 0, "wins": 0, "losses": 0, "gross_pnl": 0.0, "trade_log": []}
+
+    # Today's total P&L = journal closed trades P&L + current unrealized P&L
+    today_pnl = round(journal_stats["gross_pnl"] + live_pnl, 2)
+
+    # Build trade_state — journal is authoritative for real broker trades only
+    trade_state = tm.get_state()
+    jds = trade_state["day_stats"]
+    # Use journal stats (already filtered to exclude paper trades)
+    jds["total_trades"] = journal_stats["total_trades"]
+    jds["wins"] = journal_stats["wins"]
+    jds["losses"] = journal_stats["losses"]
+    jds["gross_pnl"] = today_pnl
+    if journal_stats["trade_log"]:
+        jds["trade_log"] = journal_stats["trade_log"]
+
+    return {
+        "connected":    broker.is_connected(),
+        "instrument":   cfg.instrument,
+        "trade_mode":   cfg.trade_mode,
+        "auto_trade":   cfg.auto_trade,
+        "balance":      bal,
+        "live_pnl":     live_pnl,
+        "today_pnl":    today_pnl,
+        "lot_size":     lot,
+        "ltp":          ltp,
+        "trade_state":  trade_state,
+        "last_signal":  _last_signal,
+        "active_trade_signal": _active_trade_signal,
+        "active_entries": _get_active_entries(cfg, tm),
+        "capital_state": get_capital_tracker().get_state(),
+        "data_health":  _data_health_state,
+        "app_running":  _app_running,
+        "max_daily_loss": cfg.max_daily_loss,
+        "max_daily_profit": cfg.max_daily_profit,
+    }
+
+
+@app.get("/api/sparkline")
+async def get_sparkline():
+    cfg = get_settings()
+    instrument = cfg.instrument
+    inst_map = {
+        "NIFTY": {"id": 13, "seg": "IDX_I"},
+        "BANKNIFTY": {"id": 25, "seg": "IDX_I"},
+        "FINNIFTY": {"id": 27, "seg": "IDX_I"},
+        "MIDCPNIFTY": {"id": 442, "seg": "IDX_I"},
+        "SENSEX": {"id": 51, "seg": "IDX_I"}
+    }
+    
+    meta = inst_map.get(instrument.upper(), {"id": 25, "seg": "IDX_I"})
+    
+    if not broker.is_connected():
+        return {"instrument": instrument, "closes": [], "pct_change": 0.0}
+        
+    try:
+        from datetime import datetime, timedelta
+        import pytz
+        _IST = pytz.timezone("Asia/Kolkata")
+        now_ist = datetime.now(_IST)
+        from_date = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
+        to_date = now_ist.strftime("%Y-%m-%d")
+        
+        res = broker._dhan_client.historical_daily_data(
+            security_id=meta["id"],
+            exchange_segment=meta["seg"],
+            instrument_type="INDEX",
+            from_date=from_date,
+            to_date=to_date,
+            expiry_code=0
+        )
+        if isinstance(res, dict) and res.get("status") == "success" and "data" in res and isinstance(res["data"], dict) and "close" in res["data"]:
+            closes = [float(val) for val in res["data"]["close"] if val is not None]
+            closes = closes[-20:]
+            
+            pct_change = 0.0
+            if len(closes) >= 2:
+                last_c = closes[-1]
+                first_c = closes[0]
+                if first_c > 0:
+                    pct_change = round(((last_c - first_c) / first_c) * 100, 2)
+                    
+            return {"instrument": instrument, "closes": closes, "pct_change": pct_change}
+    except Exception as e:
+        logger.error(f"Error fetching sparkline: {e}")
+        
+    return {"instrument": instrument, "closes": [], "pct_change": 0.0}
+
+
+@app.get("/api/activity_logs")
+async def get_activity_logs():
+    return {"logs": _activity_logs}
+
+
+@app.get("/api/settings")
+async def get_settings_endpoint():
+    cfg = get_settings()
+    return cfg.model_dump(exclude={"dhan_access_token", "dhan_client_code"})
+
+
+@app.post("/api/settings")
+async def update_settings(req: SettingsUpdate):
+    data = {k: v for k, v in req.model_dump().items() if v is not None}
+    cfg = save_settings(data)
+    tm = get_trade_manager()
+    tm.update_limits(cfg.max_daily_loss, cfg.max_daily_profit)
+    # Sync capital tracker settings
+    ct = get_capital_tracker()
+    ct.update_config(cfg.starting_capital)
+    
+    log_msgs = []
+    if "instrument" in data:
+        log_msgs.append(f"Changed target instrument to {data['instrument']}")
+    if "strategy" in data:
+        strat_lbl = "Multi-Agent" if data["strategy"] == "multi_agent" else "Regime T/R"
+        log_msgs.append(f"Changed strategy to {strat_lbl}")
+    if "auto_trade" in data:
+        status_lbl = "ENABLED" if data["auto_trade"] else "DISABLED"
+        log_msgs.append(f"Auto-trading {status_lbl}")
+    if "max_daily_loss" in data:
+        log_msgs.append(f"Daily risk limit updated to ₹{float(data['max_daily_loss']):,.2f}")
+    
+    if log_msgs:
+        for msg in log_msgs:
+            add_activity_log(msg)
+    else:
+        add_activity_log(f"Settings updated: {list(data.keys())}")
+        
+    return {"success": True, "settings": cfg.model_dump(exclude={"dhan_access_token"})}
+
+
+@app.get("/api/chart/{timeframe}")
+async def get_chart_data(timeframe: str, instrument: Optional[str] = None):
+    """Get OHLCV data for charting the specified instrument + timeframe."""
+    if not broker.is_connected():
+        raise HTTPException(status_code=400, detail="Not connected to broker")
+    cfg = get_settings()
+    inst = instrument or cfg.instrument
+    days_map = {"1": 3, "5": 15, "15": 30, "25": 40, "60": 90, "DAY": 365}
+    days = days_map.get(timeframe, 30)
+    import pytz
+    kolkata_tz = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(kolkata_tz)
+    from_d = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
+    to_d   = (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
+    df = broker.get_historical_data(inst, timeframe, from_d, to_d, use_index=True)
+    if df is None or df.empty:
+        raise HTTPException(status_code=500, detail="Failed to fetch chart data")
+
+    # Compute indicators for overlay
+    try:
+        edf = strategy_router.add_indicators(df.copy())
+        df["supertrend"]     = edf["supertrend"]
+        df["supertrend_dir"] = edf["supertrend_dir"]
+        df["ema7"]           = edf["ema7"]
+        df["ema21"]          = edf["ema21"]
+    except Exception:
+        pass
+
+    records = []
+    _IST_OFFSET = 19800  # 5h30m in seconds — TradingView displays UTC; add offset so x-axis reads IST
+    for _, row in df.iterrows():
+        ts_val = pd.Timestamp(row["timestamp"])
+        if ts_val.tz is None:
+            ts_val = ts_val.tz_localize("Asia/Kolkata")
+        else:
+            ts_val = ts_val.tz_convert("Asia/Kolkata")
+
+        r = {
+            "time":  int(ts_val.timestamp()) + _IST_OFFSET,
+            "open":  round(float(row["open"]),2),
+            "high":  round(float(row["high"]),2),
+            "low":   round(float(row["low"]),2),
+            "close": round(float(row["close"]),2),
+            "volume": int(row.get("volume",0) or 0),
+        }
+        for col in ["supertrend","ema7","ema21","supertrend_dir"]:
+            if col in row and not pd.isna(row[col]):
+                r[col] = round(float(row[col]),2)
+        records.append(r)
+
+    return {"instrument": inst, "timeframe": timeframe,
+            "label": TIMEFRAME_LABELS.get(timeframe, timeframe),
+            "candles": records, "count": len(records)}
+
+
+@app.post("/api/app/start")
+async def app_start():
+    """Resume the application — re-enable polling loop and data fetching."""
+    global _app_running
+    _app_running = True
+    logger.info("Application STARTED by user")
+    try:
+        save_app_state("RUNNING", "Started by user")
+    except Exception:
+        pass
+    return {"success": True, "app_running": True}
+
+
+@app.post("/api/app/stop")
+async def app_stop():
+    """Pause the application — disable polling loop and data fetching. Does NOT close positions."""
+    global _app_running
+    _app_running = False
+    logger.info("Application STOPPED by user")
+    try:
+        save_app_state("STOPPED", "Stopped by user")
+    except Exception:
+        pass
+    return {"success": True, "app_running": False}
+
+
+@app.get("/api/signal")
+async def get_signal():
+    """Compute and return the latest signal."""
+    if not broker.is_connected():
+        raise HTTPException(status_code=400, detail="Not connected to broker")
+    cfg = get_settings()
+    tm  = get_trade_manager()
+
+    frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument)
+    if not frames:
+        raise HTTPException(status_code=500, detail="Failed to fetch market data")
+
+    if tm.position and tm.position.instrument == cfg.instrument:
+        strat_pos = tm.position.direction
+    else:
+        strat_pos = _get_strategy_position(cfg.strategy, cfg.instrument)
+
+    sig = strategy_router.get_current_signal(frames, position=strat_pos)
+    sig["instrument"] = cfg.instrument
+    global _last_signal, _live_frames, _live_frames_instrument
+    _last_signal = sig
+    _live_frames = frames
+    _live_frames_instrument = cfg.instrument
+
+    await ws_manager.broadcast({"type": "signal", "data": sig})
+    return sig
+
+
+
+
+@app.get("/api/signals_all")
+async def get_signals_all():
+    """Return cached signals from ALL strategies as computed by the polling loop.
+    This is the SINGLE source of truth — the same evaluation that drives chart
+    markers, signal journal, and Telegram alerts.  We never re-evaluate
+    strategies here; doing so caused panels to diverge from the journal/chart."""
+    cfg = get_settings()
+    tm  = get_trade_manager()
+
+    # Return the cache populated by _signal_polling_loop
+    results = dict(_all_strat_sigs_cache)  # shallow copy
+
+    # If the cache is empty (engine hasn't run yet), return minimal HOLD stubs
+    if not results:
+        for strat_id in strategy_router.STRATEGY_OPTIONS:
+            results[strat_id] = {"signal": "HOLD", "strategy": strat_id, "instrument": cfg.instrument}
+
+    active_entries = _get_active_entries(cfg, tm)
+    return {"active_strategy": cfg.strategy, "signals": results, "active_entries": active_entries}
+
+@app.post("/api/trade/manual")
+async def manual_trade(req: ManualTradeRequest):
+    """Manually trigger a trade (for testing/override)."""
+    if not broker.is_connected():
+        raise HTTPException(status_code=400, detail="Not connected to broker")
+    cfg = get_settings()
+    tm  = get_trade_manager()
+    add_activity_log(f"Manual action triggered: {req.action}")
+
+    if req.action == "EXIT":
+        if tm.position is None:
+            return {"success": False, "error": "No open position"}
+        pos = tm.position
+        
+        # Always capture index LTP for journal/display
+        index_exit_ltp = broker.get_ltp(pos.instrument or cfg.instrument) or pos.index_entry_price or 0.0
+
+        # Determine option premium LTP for PnL calc (only for imported Dhan sync OPTIONS positions)
+        use_option_ltp = pos.trade_mode == "OPTIONS" and pos.order_id.startswith("DHAN_SYNC_")
+        if use_option_ltp:
+            opt_premium = 0.0
+            try:
+                opt_premium = broker.get_option_ltp(pos.symbol)
+            except Exception as e:
+                logger.warning(f"Could not fetch option LTP for manual exit: {e}")
+            ltp = opt_premium if opt_premium > 0 else pos.entry_price
+        else:
+            ltp = index_exit_ltp or broker.get_ltp(cfg.instrument) or pos.entry_price
+
+        if not pos.order_id.startswith("PAPER_"):
+            if getattr(pos, "sl_order_id", None):
+                try:
+                    broker.cancel_broker_sl(pos.sl_order_id)
+                except Exception as sl_cancel_err:
+                    logger.warning(f"Could not cancel broker SL during manual exit: {sl_cancel_err}")
+                pos.sl_order_id = None
+            result = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+        else:
+            result = {"success": True, "order_id": pos.order_id}
+            
+        # Try to fetch actual realized P&L from Dhan after exit order is placed
+        realized_pnl = None
+        if not pos.order_id.startswith("PAPER_"):
+            try:
+                await asyncio.sleep(1.0) # sleep to allow fill
+                df = broker.get_positions()
+                if df is not None and not df.empty:
+                    matched_rows = df[df['tradingSymbol'] == pos.symbol].to_dict(orient="records")
+                    if matched_rows:
+                        matched_row = matched_rows[0]
+                        realized_pnl = float(matched_row.get('realizedProfit', 0.0) or matched_row.get('realisedProfit', 0.0) or 0.0)
+            except Exception as e:
+                logger.warning(f"Failed to fetch realized profit for manual exit P&L: {e}")
+
+        global _active_trade_signal
+        rec = tm.close_position(ltp, "MANUAL_EXIT", pnl_override=realized_pnl)
+        _active_trade_signal = {}
+        
+        # Log exit signal to history log
+        try:
+            exit_sig = {
+                "signal": "LONG_EXIT" if pos.direction == "LONG" else "SHORT_EXIT",
+                "time": datetime.now(pytz.timezone("Asia/Kolkata")).isoformat(),
+                "entry": ltp,
+                "close": ltp,
+                "strategy": getattr(pos, "strategy", cfg.strategy),
+                "reason": "MANUAL_EXIT",
+                "reasons": ["Manual exit triggered by user"]
+            }
+            _add_signal_to_history(exit_sig)
+            signal_journal_manager.close_entry(
+                exit_sig, cfg.instrument, "MANUAL_EXIT", index_price=index_exit_ltp
+            )
+        except Exception as ex_err:
+            logger.error(f"Failed to log manual exit signal: {ex_err}")
+
+        # Update Trading Journal (use index LTP for display consistency)
+        try:
+            import pytz
+            from journal_manager import close_journal_entry
+            close_journal_entry(
+                symbol=pos.symbol,
+                exit_price=index_exit_ltp if index_exit_ltp > 0 else ltp,
+                exit_time=datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"),
+                exit_reason="MANUAL_EXIT",
+                pnl=rec.get("pnl", 0.0),
+                order_id=pos.order_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to close journal entry: {e}")
+
+        # Send Telegram exit alert (option premium ltp for PnL, index_exit_ltp for price display)
+        try:
+            send_telegram_exit_alert(pos, ltp, "MANUAL_EXIT", rec.get("pnl", 0.0), index_exit_price=index_exit_ltp or ltp)
+        except Exception as e:
+            logger.warning(f"Telegram exit alert failed: {e}")
+            
+        return {"success": True, "message": "Position closed manually", "order": result}
+
+    # Entry
+    ok = True
+    reason = "OK"
+    if cfg.auto_trade:
+        ok, reason = tm.can_trade
+        if ok:
+            ct_ok, ct_reason = get_capital_tracker().can_trade()
+            if not ct_ok:
+                ok, reason = False, ct_reason
+    if not ok:
+        return {"success": False, "error": reason}
+
+    if not _last_signal or _last_signal.get("signal") == "HOLD":
+        return {"success": False, "error": "No active signal to trade"}
+
+    sig = _last_signal
+    result = _execute_order(sig, cfg, req.action)
+    return result
+
+
+@app.get("/api/positions")
+async def get_positions():
+    if not broker.is_connected():
+        return {"positions": [], "connected": False}
+    try:
+        df = broker.get_positions()
+        if df is None or df.empty:
+            return {"positions": [], "pnl": 0}
+        return {"positions": df.to_dict(orient="records"), "pnl": broker.get_live_pnl()}
+    except Exception as e:
+        return {"positions": [], "error": str(e)}
+
+
+@app.post("/api/backtest")
+async def run_backtest(req: BacktestRequest):
+    """Run backtest on Dhan live data for specified instrument and date range."""
+    if not broker.is_connected():
+        raise HTTPException(status_code=400, detail="Not connected to broker")
+
+    import pytz
+    kolkata_tz = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(kolkata_tz)
+
+    to_d = req.to_date or now_ist.strftime("%Y-%m-%d")
+    from_d = req.from_date or (now_ist - timedelta(days=365)).strftime("%Y-%m-%d")
+
+    # Add 100 calendar days of warm-up data before the requested start date
+    from_dt = datetime.strptime(from_d, "%Y-%m-%d")
+    warmup_from_d = (from_dt - timedelta(days=100)).strftime("%Y-%m-%d")
+
+    logger.info(f"Backtest: {req.instrument} from {from_d} to {to_d} (with warm-up from {warmup_from_d})")
+    frames = await asyncio.to_thread(
+        _fetch_frames_range, req.instrument, warmup_from_d, to_d
+    )
+    if not frames:
+        raise HTTPException(status_code=500, detail="Failed to fetch backtest data")
+
+    # Use dynamic lot size from Dhan (falls back to hardcoded INSTRUMENT_META)
+    lot_size = broker.get_lot_size(req.instrument) if broker.is_connected() else INSTRUMENT_META.get(req.instrument, INSTRUMENT_META["BANKNIFTY"])["lot_size"]
+    # Temporarily override strategy if request specifies one
+    cfg = get_settings()
+    bt_strategy = req.strategy or cfg.strategy
+    original_strategy = cfg.strategy
+    if bt_strategy != original_strategy:
+        cfg.strategy = bt_strategy
+
+    try:
+        result = await asyncio.to_thread(
+            strategy_router.run_backtest,
+            frames,
+            req.initial_capital,
+            lot_size,
+            req.lot_multiplier,
+            from_d,
+            to_d,
+        )
+    finally:
+        if cfg.strategy != original_strategy:
+            cfg.strategy = original_strategy
+
+    result["strategy_used"] = bt_strategy
+    return result
+
+
+
+@app.get("/api/strategies")
+async def get_strategies():
+    """Return list of available strategies."""
+    from strategy_router import get_strategy_list
+    cfg = get_settings()
+    return {"strategies": get_strategy_list(), "active": cfg.strategy}
+
+
+@app.get("/api/signal_history")
+async def get_signal_history(instrument: Optional[str] = None):
+    cfg = get_settings()
+    inst = instrument or cfg.instrument
+    filtered = []
+    for s in _signal_history:
+        if s.get("instrument", "") != inst:
+            continue
+        is_strategy = (s.get("source", "strategy") == "strategy" and s.get("reason", "") not in ("DHAN_SYNC_EXIT", "DHAN_SYNC"))
+        is_sync_exit = (
+            (s.get("source") == "broker_sync" or s.get("reason") == "DHAN_SYNC_EXIT")
+            and s.get("signal") in ("LONG_EXIT", "SHORT_EXIT")
+        )
+        if is_strategy or is_sync_exit:
+            filtered.append(s)
+    return {"signals": filtered[-80:]}
+
+
+
+@app.delete("/api/signal_history")
+async def clear_signal_history():
+    global _signal_history, _exit_signal_logged_for_position, _exit_telegram_sent_for_position
+    global _last_processed_candle_ts, _virtual_cooldown
+    _signal_history = []
+    _exit_signal_logged_for_position = ""
+    _exit_telegram_sent_for_position = ""
+    _last_processed_candle_ts = {}
+    _virtual_cooldown = {}
+    _save_signal_history()
+    _chart_signals_cache.clear()  # Invalidate backtest cache too
+    logger.info("Signal history cleared by user request")
+    return {"success": True, "message": "Signal history cleared"}
+
+
+@app.get("/api/chart_signals")
+async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
+    """Run backtest for the selected strategy and return entry/exit markers for chart overlay.
+
+    This mirrors TradingView behaviour: applying a strategy shows signals
+    over the entire available history, not just today.
+    """
+    cfg = get_settings()
+    strat = strategy or cfg.strategy
+
+    # Check backtest result cache first (valid for 2 min)
+    import time as _t
+    _now = _t.time()
+    _bt_cache = _chart_signals_cache.get(strat)
+    if _bt_cache and (_now - _bt_cache["ts"]) < 60:
+        logger.info(f"chart_signals: returning cached result for {strat} ({_now - _bt_cache['ts']:.0f}s old)")
+        return _bt_cache["result"]
+
+    # Use cached frames from the polling loop if available and fresh (< 3 min)
+    _cache_age = _now - _cached_frames_ts
+    if _cached_frames and _cached_frames_instrument == cfg.instrument and _cache_age < 180:
+        frames = _cached_frames
+        logger.info(f"chart_signals: using cached frames ({_cache_age:.0f}s old)")
+    else:
+        frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument)
+    if not frames:
+        return {"signals": [], "strategy": strat}
+
+    def _run_bt():
+        try:
+            if strat == "regime_trend_range":
+                from strategies.regime_strategy import run_backtest
+            else:
+                from strategy import run_backtest
+            return run_backtest(frames)
+        except Exception as e:
+            logger.error(f"chart_signals backtest error ({strat}): {e}", exc_info=True)
+            return None
+
+    result = await asyncio.to_thread(_run_bt)
+    if not result:
+        return {"signals": [], "strategy": strat}
+
+    raw_trades = result.get("trades", [])
+
+    cutoff_date = (datetime.now(_IST) - timedelta(days=days)).date()
+
+    signals = []
+    for t in raw_trades:
+        entry_time = str(t.get("entry_time", ""))
+        exit_time = str(t.get("exit_time", ""))
+        direction = t.get("direction", "")
+
+        # Filter by days
+        try:
+            if pd.to_datetime(entry_time).date() < cutoff_date:
+                continue
+        except Exception:
+            continue
+
+        # Entry marker
+        signals.append({
+            "signal": direction,
+            "time": entry_time,
+            "entry": t.get("entry_price", 0),
+            "sl": t.get("sl", 0),
+            "target1": t.get("target1", 0),
+            "target2": t.get("target2", 0),
+            "strategy": strat,
+        })
+
+        # Exit marker
+        if exit_time:
+            signals.append({
+                "signal": f"{direction}_EXIT",
+                "time": exit_time,
+                "entry": t.get("exit_price", 0),
+                "close": t.get("exit_price", 0),
+                "exit_price": t.get("exit_price", 0),
+                "reason": t.get("exit_reason", ""),
+                "pnl": t.get("pnl", 0),
+                "pnl_pts": t.get("pnl_pts", 0),
+                "strategy": strat,
+            })
+
+    response = {"signals": signals, "strategy": strat, "trades": len(raw_trades)}
+    # Cache the result for 2 minutes
+    _chart_signals_cache[strat] = {"result": response, "ts": _t.time()}
+    return response
+
+
+@app.get("/api/signal_journal")
+async def get_signal_journal_endpoint():
+    """Fetch strategy signal journal entries (theoretical P&L, all instruments)."""
+    entries = signal_journal_manager.get_journal(None)
+    return {"entries": entries}
+
+
+@app.delete("/api/signal_journal")
+async def clear_signal_journal_endpoint():
+    signal_journal_manager.clear_journal()
+    logger.info("Signal journal cleared by user request")
+    return {"success": True}
+
+
+def reconstruct_dhan_trades(trades: list) -> list:
+    """
+    Reconstruct open/closed trades from raw Dhan executions using a FIFO/matching algorithm.
+    """
+    # Sort trades chronologically by execution/create time
+    def get_time(t):
+        for key in ["createTime", "exchangeTime", "updateTime"]:
+            val = t.get(key)
+            if val and val != "NA":
+                return val
+        return ""
+    
+    trades_sorted = sorted(trades, key=get_time)
+    
+    # Group by symbol
+    from collections import defaultdict
+    by_symbol = defaultdict(list)
+    for t in trades_sorted:
+        sym = t.get("customSymbol") or t.get("tradingSymbol")
+        if sym:
+            by_symbol[sym].append(t)
+            
+    reconstructed = []
+    
+    # Helper to guess instrument from symbol
+    def guess_instrument(symbol: str) -> str:
+        s = symbol.upper()
+        if "BANKNIFTY" in s:
+            return "BANKNIFTY"
+        if "FINNIFTY" in s:
+            return "FINNIFTY"
+        if "MIDCPNIFTY" in s:
+            return "MIDCPNIFTY"
+        if "CRUDEOIL" in s:
+            return "CRUDEOIL"
+        if "NIFTY" in s:
+            return "NIFTY"
+        return "INDEX"
+        
+    for symbol, sym_trades in by_symbol.items():
+        active = None  # tracks the current active open position for this symbol
+        
+        for t_exec in sym_trades:
+            qty = int(t_exec.get("tradedQuantity", 0) or t_exec.get("quantity", 0) or 0)
+            if qty <= 0:
+                continue
+            price = float(t_exec.get("tradedPrice", 0.0) or t_exec.get("price", 0.0) or 0.0)
+            tx_type = (t_exec.get("transactionType") or t_exec.get("type") or "").upper()
+            if not tx_type:
+                continue
+                
+            time_str = get_time(t_exec)
+            if "T" in time_str:
+                parts = time_str.split("T")
+            else:
+                parts = time_str.split(" ")
+            date_part = parts[0] if len(parts) > 0 else ""
+            time_part = parts[1] if len(parts) > 1 else ""
+            
+            # De-duplicate trade_id safely
+            etid = t_exec.get("exchangeTradeId") or t_exec.get("tradeId")
+            if etid and etid != "0":
+                trade_id = etid
+            else:
+                trade_id = f"DHAN_{t_exec.get('orderId')}_{tx_type}"
+            
+            direction = "LONG" if tx_type == "BUY" else "SHORT"
+            
+            if active is None:
+                # Open a new position
+                active = {
+                    "trade_id": trade_id,
+                    "status": "OPEN",
+                    "instrument": guess_instrument(symbol),
+                    "symbol": symbol,
+                    "direction": direction,
+                    "qty": qty,
+                    "entry_date": date_part,
+                    "entry_time": time_part,
+                    "entry_price": price,
+                    "exit_price": None,
+                    "exit_time": None,
+                    "exit_reason": None,
+                    "pnl": None,
+                    "reasons": []
+                }
+            else:
+                # We have an active position
+                if active["direction"] == direction:
+                    # Same direction: add to position (scale up)
+                    total_qty = active["qty"] + qty
+                    active["entry_price"] = round(((active["entry_price"] * active["qty"]) + (price * qty)) / total_qty, 2)
+                    active["qty"] = total_qty
+                else:
+                    # Opposite direction: reduce or close position
+                    if qty >= active["qty"]:
+                        # Fully closed (and potentially flipped)
+                        closed_qty = active["qty"]
+                        pnl = round((price - active["entry_price"]) * closed_qty, 2) if active["direction"] == "LONG" else round((active["entry_price"] - price) * closed_qty, 2)
+                        
+                        active["status"] = "CLOSED"
+                        active["exit_price"] = price
+                        active["exit_time"] = time_part
+                        active["pnl"] = pnl
+                        active["exit_reason"] = "DHAN_CLOSED"
+                        reconstructed.append(active)
+                        
+                        rem_qty = qty - closed_qty
+                        if rem_qty > 0:
+                            # Flipped position
+                            active = {
+                                "trade_id": trade_id,
+                                "status": "OPEN",
+                                "instrument": guess_instrument(symbol),
+                                "symbol": symbol,
+                                "direction": direction,
+                                "qty": rem_qty,
+                                "entry_date": date_part,
+                                "entry_time": time_part,
+                                "entry_price": price,
+                                "exit_price": None,
+                                "exit_time": None,
+                                "exit_reason": None,
+                                "pnl": None,
+                                "reasons": []
+                            }
+                        else:
+                            active = None
+                    else:
+                        # Partially closed
+                        pnl = round((price - active["entry_price"]) * qty, 2) if active["direction"] == "LONG" else round((active["entry_price"] - price) * qty, 2)
+                        
+                        # Append the closed part to history
+                        closed_part = active.copy()
+                        closed_part["qty"] = qty
+                        closed_part["status"] = "CLOSED"
+                        closed_part["exit_price"] = price
+                        closed_part["exit_time"] = time_part
+                        closed_part["pnl"] = pnl
+                        closed_part["exit_reason"] = "DHAN_PARTIAL_CLOSE"
+                        reconstructed.append(closed_part)
+                        
+                        # Reduce active position quantity
+                        active["qty"] -= qty
+                        
+        if active is not None:
+            # Still open at the end of the query range
+            reconstructed.append(active)
+            
+    return reconstructed
+
+
+def align_with_strategy_journal(reconstructed_trades: list) -> list:
+    try:
+        from journal_manager import load_journal
+        strategy_journal = load_journal()
+        if not strategy_journal:
+            return reconstructed_trades
+            
+        for rt in reconstructed_trades:
+            # Try to find a match in the strategy journal
+            match = None
+            rt_time_sec = None
+            try:
+                # Convert rt["entry_time"] to seconds for comparison if possible
+                h, m, s = map(int, rt["entry_time"].split(":"))
+                rt_time_sec = h * 3600 + m * 60 + s
+            except:
+                pass
+                
+            for sj in strategy_journal:
+                # Check instrument match
+                sj_inst = (sj.get("instrument") or "").upper()
+                rt_sym = (rt.get("symbol") or "").upper()
+                if sj_inst not in rt_sym and rt_sym not in sj_inst:
+                    continue
+                    
+                # Check direction match
+                if sj.get("direction") != rt.get("direction"):
+                    continue
+                    
+                # Check date match
+                if sj.get("entry_date") != rt.get("entry_date"):
+                    continue
+                    
+                # Check time proximity (within 10 minutes)
+                if rt_time_sec is not None:
+                    try:
+                        sj_time = sj.get("entry_time", "")
+                        sh, sm, ss = map(int, sj_time.split(":"))
+                        sj_time_sec = sh * 3600 + sm * 60 + ss
+                        if abs(rt_time_sec - sj_time_sec) <= 600: # 10 mins
+                            match = sj
+                            break
+                    except:
+                        pass
+                        
+            if match:
+                # Enrich with strategy details
+                rt["ml_prob"] = match.get("ml_prob")
+                rt["weighted_score"] = match.get("weighted_score")
+                rt["macro_bias"] = match.get("macro_bias")
+                rt["h1_trend"] = match.get("h1_trend")
+                rt["reasons"] = match.get("reasons", [])
+                
+    except Exception as e:
+        logger.warning(f"Error aligning reconstructed trades with strategy journal: {e}")
+        
+    return reconstructed_trades
+
+
+@app.get("/api/journal")
+async def get_journal(from_date: Optional[str] = None, to_date: Optional[str] = None):
+    """Fetch actual broker-executed trades from Dhan API. Fallbacks to empty if disconnected."""
+    try:
+        if not broker.is_connected():
+            return {
+                "journal": [],
+                "status": "disconnected",
+                "error": "Connect to Dhan broker to view actual broker execution logs."
+            }
+            
+        from datetime import timedelta
+        
+        # Calculate defaults: today + last 7 days
+        now_ist = datetime.now(_IST)
+        if not from_date:
+            from_date = (now_ist - timedelta(days=7)).strftime("%Y-%m-%d")
+        if not to_date:
+            to_date = now_ist.strftime("%Y-%m-%d")
+            
+        # Fetch trades from history
+        logger.info(f"get_journal: from_date={from_date}, to_date={to_date}")
+        hist_trades = broker.get_trade_history(from_date, to_date)
+        logger.info(f"get_journal: hist_trades count = {len(hist_trades)}")
+        
+        # Fetch trades from today's book
+        today_trades = broker.get_trade_book()
+        logger.info(f"get_journal: today_trades count = {len(today_trades)}")
+        
+        # Combine and deduplicate
+        all_execs = {}
+        for idx, t in enumerate(hist_trades + today_trades):
+            etid = t.get("exchangeTradeId") or t.get("tradeId")
+            tx_type = t.get("transactionType") or t.get("type") or ""
+            px = t.get("tradedPrice") or t.get("price") or 0.0
+            order_id = t.get("orderId") or ""
+            if etid and etid != "0":
+                trade_key = etid
+            else:
+                trade_key = f"{order_id}_{tx_type}_{px}_{idx}"
+            all_execs[trade_key] = t
+                
+        # Reconstruct closed/open trades
+        reconstructed = reconstruct_dhan_trades(list(all_execs.values()))
+        logger.info(f"get_journal: reconstructed count = {len(reconstructed)}")
+        
+        # Enrich with strategy journal reasons
+        enriched = align_with_strategy_journal(reconstructed)
+        
+
+        # Sort oldest first (chronological)
+        def sort_key(t):
+            d = t.get("entry_date", "")
+            tm = t.get("entry_time", "")
+            return f"{d} {tm}"
+            
+        enriched_sorted = sorted(enriched, key=sort_key)
+        
+        return {
+            "journal": enriched_sorted,
+            "status": "connected",
+            "from_date": from_date,
+            "to_date": to_date
+        }
+        
+    except Exception as e:
+        logger.error(f"Error loading broker journal: {e}")
+        return {"journal": [], "error": str(e)}
+
+
+@app.post("/api/telegram/test")
+async def test_telegram_alert():
+    """Trigger a test Telegram alert using 100% LIVE data — real strategy engine + real Tradehull option data."""
+    try:
+        cfg = get_settings()
+        logger.info(f"Telegram test requested. Bot token len: {len(cfg.telegram_bot_token)}, Chat ID: {cfg.telegram_chat_id}")
+        if not cfg.telegram_bot_token or not cfg.telegram_chat_id:
+            raise HTTPException(status_code=400, detail="Telegram bot credentials are not configured in settings/.env")
+
+        if not broker.is_connected():
+            raise HTTPException(status_code=400, detail="Connect to Dhan first to fetch live data")
+
+        # ── 1. Run the REAL strategy engine to get live scores/reasons ────
+        frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument)
+        if not frames:
+            raise HTTPException(status_code=500, detail="Failed to fetch market data for strategy engine")
+
+        live_sig = strategy_router.get_current_signal(frames, position="NONE")
+
+        # Use whatever the strategy says (LONG, SHORT, or HOLD)
+        signal_direction = live_sig.get("signal", "HOLD")
+        # For the test alert, if signal is HOLD we still send a demo using LONG direction
+        direction = signal_direction if signal_direction in ("LONG", "SHORT") else "LONG"
+
+        # ── 2. Resolve real prices ────────────────────────────────────────
+        meta = INSTRUMENT_META[cfg.instrument]
+        lot_size = broker.get_lot_size(cfg.instrument)
+        qty = lot_size * cfg.lot_multiplier
+
+        # Fetch live index LTP
+        index_ltp = broker.get_ltp(cfg.instrument)
+        if not index_ltp:
+            fallback = {"BANKNIFTY": 56800.0, "NIFTY": 23450.0, "SENSEX": 76500.0}
+            index_ltp = fallback.get(cfg.instrument, 50000.0)
+
+        if cfg.trade_mode == "OPTIONS":
+            # Resolve real option symbol via Tradehull API
+            expiry = cfg.options_expiry
+            opt_symbol, opt_strike = broker.get_option_symbol(
+                cfg.instrument, direction, expiry,
+                cfg.strike_type, cfg.strike_offset
+            )
+            if opt_symbol is None:
+                raise HTTPException(status_code=500, detail="Could not resolve option symbol from Dhan")
+
+            # Fetch live option premium (supplementary only — index prices remain the main prices)
+            try:
+                opt_premium = broker.get_option_ltp(opt_symbol)
+            except Exception as e:
+                logger.warning(f"Could not fetch option LTP for {opt_symbol}: {e}")
+                opt_premium = 0.0
+
+            # Always use index-level prices as the main prices
+            entry_price = live_sig.get("entry", index_ltp)
+            sl_price    = live_sig.get("sl", index_ltp * 0.997)
+            t1_price    = live_sig.get("target1", index_ltp * 1.004)
+            t2_price    = live_sig.get("target2", index_ltp * 1.007)
+
+            symbol = opt_symbol
+            opt_type_label = "CE" if direction == "LONG" else "PE"
+        else:
+            # INDEX mode — use strategy's real SL/target levels (already index-level)
+            entry_price = live_sig.get("entry", index_ltp)
+            sl_price    = live_sig.get("sl", index_ltp * 0.997)
+            t1_price    = live_sig.get("target1", index_ltp * 1.004)
+            t2_price    = live_sig.get("target2", index_ltp * 1.007)
+            symbol = f"{cfg.instrument} INDEX"
+            opt_strike = None
+            opt_type_label = None
+            opt_premium = 0.0
+
+        # ── 3. Build signal dict from REAL strategy output ────────────────
+        real_sig = {
+            "entry": entry_price,
+            "sl": sl_price,
+            "target1": t1_price,
+            "target2": t2_price,
+            # Real scores from the strategy engine
+            "weighted_score": live_sig.get("weighted_score", 0.0),
+            "ml_prob": live_sig.get("ml_prob", 0.0),
+            "macro_bias": live_sig.get("macro_bias", "NEUTRAL"),
+            "h1_trend": live_sig.get("h1_trend", "NEUTRAL"),
+            "macro_confidence": live_sig.get("macro_confidence"),
+            "structure_confidence": live_sig.get("structure_confidence"),
+            "momentum_confidence": live_sig.get("momentum_confidence"),
+            "trigger_quality": live_sig.get("trigger_quality"),
+            "volume_confirms": live_sig.get("volume_confirms"),
+            "memory_win_rate": live_sig.get("memory_win_rate"),
+            # Options supplementary info
+            "opt_strike": opt_strike if cfg.trade_mode == "OPTIONS" else None,
+            "opt_type": opt_type_label if cfg.trade_mode == "OPTIONS" else None,
+            "opt_premium": opt_premium if cfg.trade_mode == "OPTIONS" and opt_premium > 0 else None,
+            "opt_symbol": symbol if cfg.trade_mode == "OPTIONS" else None,
+            # Real reasons from the agents
+            "reasons": live_sig.get("reasons", []),
+        }
+
+        result = {
+            "success": True,
+            "direction": direction,
+            "symbol": symbol,
+            "qty": qty,
+            "order_id": "TEST_LIVE_" + datetime.now(_IST).strftime("%H%M%S")
+        }
+
+        send_telegram_entry_alert(real_sig, result)
+
+        signal_label = signal_direction if signal_direction != "HOLD" else "HOLD (sent as LONG demo)"
+        return {
+            "success": True,
+            "message": f"Test alert sent -- {symbol} @ Rs.{entry_price:.2f} | Signal: {signal_label}",
+            "details": {
+                "symbol": symbol,
+                "signal": signal_direction,
+                "direction_used": direction,
+                "entry": entry_price,
+                "sl": sl_price,
+                "t1": t1_price,
+                "t2": t2_price,
+                "index_ltp": index_ltp,
+                "qty": qty,
+                "weighted_score": live_sig.get("weighted_score"),
+                "ml_prob": live_sig.get("ml_prob"),
+                "macro_bias": live_sig.get("macro_bias"),
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send test Telegram alert: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/cancel_all")
+async def cancel_all():
+    if not broker.is_connected():
+        raise HTTPException(status_code=400, detail="Not connected")
+    try:
+        broker.get_tsl().cancel_all_orders()
+        get_trade_manager().position = None
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+
+# ── WebSocket endpoint ────────────────────────────────────────────────────────
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws_manager.connect(ws)
+    logger.info("WebSocket client connected")
+    try:
+        # Send current state immediately on connect
+        await ws.send_json({"type": "init", "data": {
+            "connected": broker.is_connected(),
+            "signal": _last_signal,
+            "state": get_trade_manager().get_state(),
+        }})
+        while True:
+            # Keep alive — client can send pings
+            try:
+                data = await asyncio.wait_for(ws.receive_text(), timeout=30)
+                if data == "ping":
+                    await ws.send_json({"type": "pong"})
+            except asyncio.TimeoutError:
+                await ws.send_json({"type": "heartbeat", "ts": datetime.now(_IST).isoformat()})
+    except WebSocketDisconnect:
+        ws_manager.disconnect(ws)
+        logger.info("WebSocket client disconnected")
+
+
+# ── Background polling (auto-signal every 5 min bar) ─────────────────────────
+
+@app.on_event("startup")
+async def startup_event():
+    Path("logs").mkdir(exist_ok=True)
+    _load_signal_history()
+    add_activity_log("Trading Engine Booted successfully.")
+    
+    # Auto-connect if credentials are provided in config/env
+    cfg = get_settings()
+    if cfg.dhan_client_code and cfg.dhan_access_token:
+        logger.info("Auto-connecting to Dhan on startup...")
+        success, msg = broker.connect(cfg.dhan_client_code, cfg.dhan_access_token)
+        if success:
+            logger.info("Dhan auto-connection successful")
+            add_activity_log("Dhan auto-connection successful.")
+        else:
+            logger.warning(f"Dhan auto-connection failed: {msg}")
+            add_activity_log(f"Dhan auto-connection failed: {msg}")
+            
+    # Sync position from broker on startup if auto_trade is enabled
+    if cfg.auto_trade and broker.is_connected():
+        logger.info("Auto-trade ON: syncing position from broker...")
+        try:
+            broker_pos = broker.sync_position_from_broker(cfg.instrument)
+            if broker_pos and broker_pos.get("has_position"):
+                tm = get_trade_manager()
+                tm.sync_from_broker(broker_pos, cfg.instrument)
+                logger.info(f"Restored position from broker: {broker_pos['direction']} {broker_pos['symbol']}")
+                add_activity_log(f"Restored position from broker: {broker_pos['direction']} {broker_pos['symbol']}")
+            else:
+                logger.info("No open position found at broker on startup")
+                add_activity_log("No open position found at broker on startup.")
+        except Exception as e:
+            logger.error(f"Broker position sync on startup failed: {e}")
+            add_activity_log(f"Broker position sync on startup failed: {e}")
+
+    # Sync capital tracker with settings on startup
+    ct = get_capital_tracker()
+    ct.update_config(cfg.starting_capital)
+
+    asyncio.create_task(_signal_polling_loop())
+
+    # Mark app as running for watchdog crash detection
+    try:
+        save_app_state("RUNNING", "Started normally")
+        write_heartbeat()
+    except Exception:
+        pass
+    add_activity_log("Engine Polling Loop active.")
+
+    logger.info("Dhan ML Trading Engine started")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Graceful shutdown: save state, log daily performance snapshot."""
+    logger.info("Shutting down gracefully...")
+    try:
+        save_app_state("STOPPED", "Graceful shutdown")
+    except Exception:
+        pass
+    try:
+        cfg = get_settings()
+        performance_tracker.log_daily_snapshot(cfg.starting_capital)
+    except Exception as e:
+        logger.warning(f"Failed to log daily performance snapshot: {e}")
+    logger.info("Shutdown complete")
+
+
+def _get_strategy_position(strat_id: str, instrument: str) -> str:
+    """Check the signal journal for any active OPEN entries to find the strategy's virtual position."""
+    try:
+        from signal_journal_manager import _load
+        entries = _load()
+        for e in reversed(entries):
+            if (e.get("strategy") == strat_id and 
+                e.get("instrument") == instrument and 
+                e.get("status") == "OPEN"):
+                return e.get("direction", "NONE")
+    except Exception as e:
+        logger.warning(f"Error checking virtual position for {strat_id}: {e}")
+    return "NONE"
+
+
+def _check_virtual_exits(ltp: float, cfg, frames=None, latest_candle_ts: str = None):
+    """
+    Check open signal journal entries for all strategies.
+    If the current index LTP hits the entry's SL or Target 2, close the entry.
+    Also log the exit signal to history so the UI clears.
+    Also trails the stop loss dynamically in real-time matching the strategy settings.
+    """
+    if frames is not None and not isinstance(frames, dict):
+        latest_candle_ts = frames
+        frames = None
+        
+    if not ltp or ltp <= 0:
+        return
+    try:
+        from signal_journal_manager import _load, close_entry, _save
+        import pandas as pd
+        tm = get_trade_manager()
+        entries = _load()
+        journal_modified = False
+
+        # Get ATR for trailing SL calculations
+        atr_v = ltp * 0.002
+        if frames and "5" in frames and not frames["5"].empty:
+            try:
+                last_row = frames["5"].iloc[-1]
+                atr_v = float(last_row.get("atr", ltp * 0.002))
+                if pd.isna(atr_v) or atr_v < 5:
+                    atr_v = ltp * 0.002
+            except Exception:
+                pass
+
+        for e in entries:
+            if e.get("status") != "OPEN" or e.get("instrument") != cfg.instrument:
+                continue
+            
+            strat_id = e.get("strategy")
+            
+            # If the active strategy is currently in a live/paper trade, let position monitor handle it
+            if tm.position and tm.position.instrument == cfg.instrument and strat_id == cfg.strategy:
+                continue
+
+            # Processor-managed strategies: exits are handled by LiveBarProcessor
+            # on bar boundaries (matching backtest exactly). Skip real-time exit checks.
+            if strat_id in ("regime_trend_range", "multi_agent"):
+                continue
+
+                
+            direction = e.get("direction")
+            sl = float(e.get("sl", 0) or 0)
+            t2 = float(e.get("target2", 0) or 0)
+            entry_price = float(e.get("entry_price", 0) or 0)
+
+            # ── Dynamic Trailing SL updates for virtual entries ─────────────
+            if entry_price > 0:
+                # Initialize tracking variables if they don't exist
+                if "highest_since_entry" not in e:
+                    e["highest_since_entry"] = entry_price
+                if "lowest_since_entry" not in e:
+                    e["lowest_since_entry"] = entry_price
+                if "trail_step" not in e:
+                    e["trail_step"] = 0
+
+                if strat_id == "regime_trend_range":
+                    # Regime strategy trailing logic
+                    trail_mult = getattr(cfg, "regime_trail_mult", 1.5)
+                    trail_activation = getattr(cfg, "regime_trail_activation", 0.3)
+                    be_trigger = getattr(cfg, "regime_be_trigger", 0.4)
+                    be_buffer = getattr(cfg, "regime_be_buffer", 0.3)
+                    
+                    if direction == "LONG":
+                        if ltp > e["highest_since_entry"]:
+                            e["highest_since_entry"] = ltp
+                            journal_modified = True
+                        profit = e["highest_since_entry"] - entry_price
+                        if profit >= atr_v * trail_activation:
+                            trail_sl = e["highest_since_entry"] - atr_v * trail_mult
+                            if be_trigger > 0 and profit > atr_v * be_trigger:
+                                trail_sl = max(trail_sl, entry_price + atr_v * be_buffer)
+                            if trail_sl > sl:
+                                sl = trail_sl
+                                e["sl"] = round(sl, 2)
+                                journal_modified = True
+                    elif direction == "SHORT":
+                        if ltp < e["lowest_since_entry"]:
+                            e["lowest_since_entry"] = ltp
+                            journal_modified = True
+                        profit = entry_price - e["lowest_since_entry"]
+                        if profit >= atr_v * trail_activation:
+                            trail_sl = e["lowest_since_entry"] + atr_v * trail_mult
+                            if be_trigger > 0 and profit > atr_v * be_trigger:
+                                trail_sl = min(trail_sl, entry_price - atr_v * be_buffer)
+                            if sl == 0 or trail_sl < sl:
+                                sl = trail_sl
+                                e["sl"] = round(sl, 2)
+                                journal_modified = True
+                                
+                elif strat_id == "multi_agent":
+                    # Multi-agent strategy trailing logic
+                    be_trigger = getattr(cfg, 'trailing_be_trigger_atr', 2.0)
+                    trail_start = getattr(cfg, 'trailing_start_atr', 2.5)
+                    trail_offset = getattr(cfg, 'trailing_offset_atr', 0.5)
+                    
+                    if atr_v > 0 and be_trigger > 0:
+                        if direction == "LONG":
+                            if ltp > e["highest_since_entry"]:
+                                e["highest_since_entry"] = ltp
+                                journal_modified = True
+                            profit = e["highest_since_entry"] - entry_price
+                            profit_atr = profit / atr_v
+                            
+                            # BE step
+                            if e["trail_step"] == 0 and profit_atr >= be_trigger:
+                                sl = entry_price
+                                e["sl"] = round(sl, 2)
+                                e["trail_step"] = 1
+                                journal_modified = True
+                            # Trail activation step
+                            if trail_start > 0 and e["trail_step"] >= 1 and profit_atr >= trail_start:
+                                e["trail_step"] = 2
+                                journal_modified = True
+                            # Trailing continuous
+                            if e["trail_step"] >= 2 and trail_offset > 0:
+                                trail_sl = entry_price + profit - trail_offset * atr_v
+                                if trail_sl > sl:
+                                    sl = trail_sl
+                                    e["sl"] = round(sl, 2)
+                                    journal_modified = True
+                                    
+                        elif direction == "SHORT":
+                            if ltp < e["lowest_since_entry"]:
+                                e["lowest_since_entry"] = ltp
+                                journal_modified = True
+                            profit = entry_price - e["lowest_since_entry"]
+                            profit_atr = profit / atr_v
+                            
+                            # BE step
+                            if e["trail_step"] == 0 and profit_atr >= be_trigger:
+                                sl = entry_price
+                                e["sl"] = round(sl, 2)
+                                e["trail_step"] = 1
+                                journal_modified = True
+                            # Trail activation step
+                            if trail_start > 0 and e["trail_step"] >= 1 and profit_atr >= trail_start:
+                                e["trail_step"] = 2
+                                journal_modified = True
+                            # Trailing continuous
+                            if e["trail_step"] >= 2 and trail_offset > 0:
+                                trail_sl = entry_price - profit + trail_offset * atr_v
+                                if sl == 0 or trail_sl < sl:
+                                    sl = trail_sl
+                                    e["sl"] = round(sl, 2)
+                                    journal_modified = True
+
+            # ── Stop Loss hit detection ──
+            # Use trail_step to distinguish trailing SL from initial SL
+            # (matches backtest: SL_HIT, TRAIL_S1, TRAIL_S2)
+            exit_triggered = False
+            exit_reason = ""
+            if sl > 0:
+                if direction == "LONG" and ltp <= sl:
+                    exit_triggered = True
+                    _ts = e.get("trail_step", 0)
+                    exit_reason = f"TRAIL_S{_ts}" if _ts > 0 else "SL_HIT"
+                elif direction == "SHORT" and ltp >= sl:
+                    exit_triggered = True
+                    _ts = e.get("trail_step", 0)
+                    exit_reason = f"TRAIL_S{_ts}" if _ts > 0 else "SL_HIT"
+            
+            # Target 2 hit detection
+            if t2 > 0:
+                if direction == "LONG" and ltp >= t2:
+                    exit_triggered = True
+                    exit_reason = "T2_HIT"
+                elif direction == "SHORT" and ltp <= t2:
+                    exit_triggered = True
+                    exit_reason = "T2_HIT"
+            
+            if exit_triggered:
+                # Construct exit signal to close entry and add to history
+                exit_sig = {
+                    "signal": "LONG_EXIT" if direction == "LONG" else "SHORT_EXIT",
+                    "time": _format_ist_timestamp(latest_candle_ts),
+                    "entry": ltp,
+                    "close": ltp,
+                    "strategy": strat_id,
+                    "instrument": cfg.instrument,
+                    "reason": exit_reason,
+                    "reasons": [f"Virtual exit triggered: {exit_reason} (LTP: {ltp})"]
+                }
+                
+                # Log to history
+                _add_signal_to_history(exit_sig)
+                logger.info(f"[{strat_id}] Virtual Exit {exit_reason} logged to history")
+                
+                # Send Telegram alert for virtual exit
+                if cfg.telegram_bot_token and cfg.telegram_chat_id:
+                    try:
+                        _sig_emoji = "🚪"
+                        _sig_msg = (
+                            f"{_sig_emoji} {strat_id.upper()} — {exit_sig['signal']}\n"
+                            f"{cfg.instrument} @ {ltp}\n"
+                            f"Reason: {exit_reason}\n"
+                        )
+                        _send_telegram_alert_wrapper(_sig_msg, cfg.telegram_bot_token, cfg.telegram_chat_id)
+                    except Exception as _tg_err:
+                        logger.warning(f"Failed to send telegram alert for virtual exit: {_tg_err}")
+
+                # Close the journal entry in the local list so the state update is written to disk correctly
+                exit_price = ltp
+                if direction == "LONG":
+                    pnl_pts = round(exit_price - entry_price, 2)
+                else:
+                    pnl_pts = round(entry_price - exit_price, 2)
+
+                lot_size = int(e.get("lot_size", 1))
+                pnl_inr = round(pnl_pts * lot_size, 2)
+
+                e.update({
+                    "exit_time":   exit_sig.get("time", datetime.now(_IST).isoformat()),
+                    "exit_price":  exit_price,
+                    "exit_reason": exit_reason,
+                    "pnl_pts":     pnl_pts,
+                    "pnl_inr":     pnl_inr,
+                    "status":      "WIN" if pnl_pts > 0 else "LOSS",
+                })
+                journal_modified = True
+
+                # Fix B: Record cooldown for this strategy after a losing exit
+                # Mirrors backtest's block_long_until / block_short_until logic
+                global _virtual_cooldown
+                cooldown_bars = getattr(cfg, 'cooldown_bars', 0)
+                if pnl_pts <= 0 and cooldown_bars > 0:
+                    import pytz
+                    _cooldown_mins = cooldown_bars * 5  # each bar = 5 minutes
+                    _virtual_cooldown[strat_id] = {
+                        "direction": direction,
+                        "until": datetime.now(pytz.timezone("Asia/Kolkata")) + timedelta(minutes=_cooldown_mins),
+                    }
+                    logger.info(f"[{strat_id}] Cooldown set: {direction} blocked for {_cooldown_mins} mins after loss")
+
+                logger.info(
+                    f"Signal journal (virtual): CLOSE {direction} @ {exit_price} -> "
+                    f"{pnl_pts:+.0f} pts / Rs.{pnl_inr:+,.0f} [{cfg.instrument}]"
+                )
+
+        if journal_modified:
+            _save(entries)
+
+    except Exception as e:
+        logger.error(f"Error checking virtual exits: {e}")
+
+
+async def _signal_polling_loop():
+    """Poll for new signals every 60 seconds when connected and market is open."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            # Application-level pause: skip all work when stopped
+            if not _app_running:
+                continue
+            # Write heartbeat for watchdog liveness monitoring
+            try:
+                write_heartbeat()
+            except Exception:
+                pass
+
+            if not broker.is_connected():
+                continue
+            
+            add_activity_log("Engine Heartbeat: Active & monitoring status.")
+            import pytz
+            now = datetime.now(pytz.timezone("Asia/Kolkata"))
+            cfg = get_settings()
+            tm  = get_trade_manager()
+
+            # Skip weekends — both NSE and MCX are closed Sat/Sun
+            if now.weekday() >= 5:
+                continue
+
+            # Instrument-aware market hours
+            _inst_exchange = INSTRUMENT_META.get(cfg.instrument, {}).get("exchange_index", "INDEX")
+            if _inst_exchange == "MCX":
+                # MCX CrudeOil: 9:00 AM – 11:30 PM IST (Mon–Fri)
+                _is_open = (now.hour >= 9) and (now.hour < 23 or (now.hour == 23 and now.minute <= 30))
+            else:
+                # NSE / BSE: 9:15 AM – 3:30 PM IST (Mon–Fri)
+                _is_open = (now.hour > 9 or (now.hour == 9 and now.minute >= 15)) and \
+                           (now.hour < 15 or (now.hour == 15 and now.minute <= 30))
+            if not _is_open:
+                continue
+
+            frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument)
+
+            # Cache frames for chart_signals endpoint (avoids 12.5s re-fetch)
+            global _cached_frames, _cached_frames_ts, _cached_frames_instrument
+            if frames:
+                import time as _time_mod
+                _cached_frames = frames
+                _cached_frames_ts = _time_mod.time()
+                _cached_frames_instrument = cfg.instrument
+
+            latest_ts = None
+            if frames and "5" in frames and not frames["5"].empty:
+                latest_ts = frames["5"].iloc[-1]["timestamp"]
+
+            # Synchronize positions from Dhan!
+            _sync_dhan_positions(cfg, tm, latest_ts)
+
+            # ── Data staleness check ─────────────────────────────────────
+            _check_data_staleness(frames, cfg)
+
+            if frames:
+                global _last_signal, _last_telegram_signal_key, _pending_telegram_signal
+                global _active_trade_signal, _recently_closed_symbols, _exit_signal_logged_for_position, _exit_telegram_sent_for_position
+                global _last_loss_direction, _last_loss_time
+
+                # Fetch current index LTP early for logging, consensus check and alerts
+                ltp = broker.get_ltp(cfg.instrument) or 0
+                add_activity_log(f"Polling loop check: {cfg.instrument} LTP = {ltp:,.2f}")
+
+                # Check for SL/Target hits on virtual journal entries
+                _check_virtual_exits(ltp, cfg, frames, latest_ts)
+
+                # Skip new signal generation if data is stale (but still monitor open positions)
+                if _data_health_state["is_stale"] and not (tm.position and tm.position.instrument == cfg.instrument):
+                    logger.warning("Data stale — skipping signal generation (no open position)")
+                    continue
+
+                pos_str = tm.position.direction if (tm.position and tm.position.instrument == cfg.instrument) else "NONE"
+
+                def send_strat_telegram_alert(strat_id, sig_dict):
+                    try:
+                        _sig_dir = sig_dict.get("signal", "")
+                        _sig_entry = sig_dict.get("entry", 0)
+                        _sig_sl = sig_dict.get("sl", 0)
+                        _sig_t1 = sig_dict.get("target1", 0)
+                        _sig_reasons = sig_dict.get("reasons", [])[:3]
+                        _sig_emoji = "\U0001f7e2" if "LONG" in _sig_dir else "\U0001f534" if "SHORT" in _sig_dir else "\u26aa"
+                        _sig_msg = (
+                            f"{_sig_emoji} {strat_id.upper()} \u2014 {_sig_dir}\n"
+                            f"{cfg.instrument} @ {ltp}\n"
+                        )
+                        if _sig_entry and "EXIT" not in _sig_dir:
+                            _sig_msg += f"Entry: {_sig_entry}  SL: {_sig_sl}  T1: {_sig_t1}\n"
+                        if _sig_reasons:
+                            _sig_msg += "\n".join(_sig_reasons[:3])
+                        _send_telegram_alert_wrapper(_sig_msg, cfg.telegram_bot_token, cfg.telegram_chat_id)
+                    except Exception as _tg_err:
+                        logger.debug(f"Signal telegram alert failed for {strat_id}: {_tg_err}")
+
+                # ── Fix D: Daily regime state reset ──────────────────────────
+                # Reset regime strategy singletons AND live bar processors at
+                # IST day boundary so stale state doesn't bleed into today.
+                global _last_regime_reset_date
+                _today_date = now.date()
+                if _last_regime_reset_date != _today_date:
+                    _last_regime_reset_date = _today_date
+                    try:
+                        from live_bar_processor import reset_all_processors
+                        reset_all_processors()  # resets regime globals + processor state
+                        logger.info("Daily processor + regime state reset (IST day boundary)")
+                    except Exception as _reset_err:
+                        logger.debug(f"Processor reset failed: {_reset_err}")
+                    # Auto-close stale OPEN journal entries from previous days
+                    try:
+                        signal_journal_manager.auto_close_stale_entries()
+                    except Exception as _stale_err:
+                        logger.debug(f"Stale journal cleanup failed: {_stale_err}")
+                    # Clear today's signal history — processors will regenerate
+                    # from scratch during catch-up replay.  Keeps yesterday's
+                    # signals intact for continuity.
+                    try:
+                        _today_str = _today_date.isoformat()
+                        _before = len(_signal_history)
+                        _signal_history[:] = [
+                            s for s in _signal_history
+                            if not s.get("time", "").startswith(_today_str)
+                        ]
+                        if len(_signal_history) != _before:
+                            _save_signal_history()
+                            logger.info(f"Cleared {_before - len(_signal_history)} stale today-signals from history")
+                    except Exception as _clr_err:
+                        logger.debug(f"Signal history cleanup failed: {_clr_err}")
+
+                # ── Bar-by-bar processor: mirrors backtest exactly ─────────
+                # Instead of evaluating only the latest bar (which misses brief
+                # regime transitions), processors evaluate ALL new completed
+                # bars since the last poll, using the EXACT same inner loop
+                # as each strategy's run_backtest.
+                global _last_processed_candle_ts, _virtual_cooldown
+                global _all_strat_sigs_cache
+
+                from live_bar_processor import get_regime_processor, get_multi_agent_processor
+
+                _lot_size = broker.get_lot_size(cfg.instrument) if broker.is_connected() else INSTRUMENT_META.get(cfg.instrument, {}).get("lot_size", 15)
+                _qty = int(_lot_size * cfg.lot_multiplier)
+
+                _all_strat_sigs = {}
+
+                for _strat_id, _processor in [
+                    ("regime_trend_range", get_regime_processor()),
+                    ("multi_agent", get_multi_agent_processor()),
+                ]:
+                    try:
+                        new_signals = _processor.process_frames(frames, cfg, _qty)
+
+                        for _live_sig in new_signals:
+                            sig_dict = _live_sig.to_signal_dict()
+                            sig_dict["instrument"] = cfg.instrument
+
+                            if _live_sig.signal_type == "ENTRY":
+                                _add_signal_to_history(sig_dict)
+                                add_activity_log(f"[{_strat_id.upper()}] Processor Entry: {_live_sig.signal} @ {_live_sig.entry_price}")
+                                logger.info(f"[{_strat_id}] Processor Entry: {_live_sig.signal} @ {_live_sig.entry_price} SL={_live_sig.sl}")
+                                # Only send Telegram for the actively selected strategy
+                                if _strat_id == cfg.strategy:
+                                    send_strat_telegram_alert(_strat_id, sig_dict)
+
+                                # Always open journal entry for virtual tracking
+                                try:
+                                    signal_journal_manager.open_entry(sig_dict, cfg.instrument, _qty)
+                                except Exception as _sj_err:
+                                    logger.error(f"Failed to open journal for {_strat_id}: {_sj_err}")
+
+                            elif _live_sig.signal_type == "EXIT":
+                                _add_signal_to_history(sig_dict)
+                                logger.info(f"[{_strat_id}] Processor Exit: {_live_sig.signal} ({_live_sig.exit_reason}) @ {_live_sig.exit_price}")
+                                # Only send Telegram for the actively selected strategy
+                                if _strat_id == cfg.strategy:
+                                    send_strat_telegram_alert(_strat_id, sig_dict)
+
+                                # Always close journal entry for virtual tracking
+                                try:
+                                    signal_journal_manager.close_entry(
+                                        sig_dict, cfg.instrument,
+                                        _live_sig.exit_reason,
+                                        index_price=_live_sig.exit_price
+                                    )
+                                except Exception as _sj_err:
+                                    logger.error(f"Failed to close journal for {_strat_id}: {_sj_err}")
+
+                        # Cache UI signal from processor state
+                        _ui_sig = _processor.get_ui_signal(cfg)
+                        _ui_sig["instrument"] = cfg.instrument
+                        _all_strat_sigs[_strat_id] = _ui_sig
+
+                    except Exception as _s_err:
+                        logger.warning(f"Processor {_strat_id} error: {_s_err}", exc_info=True)
+                        _all_strat_sigs[_strat_id] = {"signal": "ERROR", "strategy": _strat_id, "instrument": cfg.instrument, "reason": str(_s_err)}
+
+                # Publish all-strategy signals to global cache for /api/signals_all
+                # MERGE into cache — don't replace — so dedup-skipped strategies
+                # keep their last known signal instead of disappearing.
+                if _all_strat_sigs:
+                    _all_strat_sigs_cache.update(_all_strat_sigs)
+
+                # Fix C: Active strategy signal for auto-trade and UI panel
+                # Use cached signal from loop above. NEVER re-call the strategy —
+                # that was causing a 3rd evaluation and duplicate signals.
+                sig = _all_strat_sigs.get(cfg.strategy)
+                if sig is None:
+                    # Strategy was skipped (same candle dedup) — use last known signal
+                    sig = _last_signal if _last_signal else {"signal": "HOLD", "strategy": cfg.strategy}
+                sig["instrument"] = cfg.instrument
+                _last_signal = sig
+                await ws_manager.broadcast({"type": "signal", "data": sig})
+
+                # ── Auto square-off check near market close ──
+                if cfg.auto_trade and tm.position and tm.position.instrument == cfg.instrument:
+                    _meta_ex = INSTRUMENT_META.get(cfg.instrument, {}).get("exchange_fut", "NFO")
+                    _mh = MARKET_HOURS.get(_meta_ex, MARKET_HOURS.get("NFO", (9,15,15,30)))
+                    _close_h, _close_m = _mh[2], _mh[3]
+                    _squareoff_mins = cfg.auto_square_off_minutes
+                    # Calculate minutes until market close
+                    _close_dt = now.replace(hour=_close_h, minute=_close_m, second=0, microsecond=0)
+                    _mins_to_close = (_close_dt - now).total_seconds() / 60
+                    if 0 < _mins_to_close <= _squareoff_mins:
+                        logger.info(f"Auto square-off: {_mins_to_close:.0f} mins to close, squaring off position")
+                        pos = tm.position
+                        if not pos.order_id.startswith("PAPER_"):
+                            broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                        ltp = broker.get_ltp(pos.instrument) or 0
+                        _pnl_exit = _safe_pnl_exit_price(pos, ltp)
+                        rec = tm.close_position(_pnl_exit, "AUTO_SQUAREOFF")
+                        if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
+                            get_capital_tracker().record_trade_pnl(rec.get("pnl", 0.0))
+                        slippage_tracker.log_exit_fill(
+                            symbol=pos.symbol,
+                            direction=pos.direction,
+                            expected_price=ltp,
+                            actual_price=ltp,
+                            qty=pos.qty,
+                            order_id=pos.order_id,
+                            exit_reason="AUTO_SQUAREOFF",
+                            trade_mode=pos.trade_mode,
+                            instrument=pos.instrument,
+                        )
+                        _active_trade_signal = {}
+                        try:
+                            exit_sig = {
+                                "signal": "LONG_EXIT" if pos.direction == "LONG" else "SHORT_EXIT",
+                                "time": datetime.now(_IST).isoformat(),
+                                "entry": ltp, "close": ltp,
+                                "strategy": getattr(pos, "strategy", cfg.strategy),
+                                "reason": "AUTO_SQUAREOFF",
+                                "reasons": [f"Auto square-off {_squareoff_mins}min before close"]
+                            }
+                            _add_signal_to_history(exit_sig)
+                            signal_journal_manager.close_entry(exit_sig, cfg.instrument, "AUTO_SQUAREOFF", index_price=ltp)
+                        except Exception as _sq_err:
+                            logger.error(f"Square-off logging error: {_sq_err}")
+                        # Telegram exit alert for auto square-off
+                        try:
+                            send_telegram_exit_alert(pos, ltp, "AUTO_SQUAREOFF", rec.get("pnl", 0.0), index_exit_price=ltp)
+                        except Exception as _tg_err:
+                            logger.warning(f"Telegram square-off alert failed: {_tg_err}")
+                        await ws_manager.broadcast({"type": "trade_closed", "data": rec})
+
+                # ── Entry / flip / hold logic ──
+                sig_direction = sig.get("signal", "")
+
+                if sig_direction in ("LONG", "SHORT"):
+                    sig_ts = sig.get("time", "")
+                    current_key = (sig_direction, sig_ts)
+
+                    # If we already have a position in the SAME direction for this instrument — no action
+                    if tm.position and tm.position.instrument == sig.get("instrument") and tm.position.direction == sig_direction:
+                        _pending_telegram_signal = {}
+                        pass  # already in correct position
+
+                    # If we have a position in OPPOSITE direction for this instrument — EXIT ONLY (no auto-flip)
+                    # Avoids double-whipsaw trap on 5-min fake moves.
+                    # Re-entry in the new direction requires fresh 2-poll confirmation.
+                    elif tm.position and tm.position.instrument == sig.get("instrument") and tm.position.direction != sig_direction:
+                        pos = tm.position
+                        logger.info(f"Opposite signal ({sig_direction}) while in {pos.direction} — exiting only (no auto-flip)")
+                        if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
+                            broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                        ltp = broker.get_ltp(pos.instrument) or 0
+                        exit_reason = f"OPPOSITE_SIGNAL_{sig_direction}"
+                        _pnl_exit = _safe_pnl_exit_price(pos, ltp)
+                        rec = tm.close_position(_pnl_exit, exit_reason)
+                        if cfg.strategy == "multi_agent" and rec.get("pnl", 0.0) <= 0.0:
+                            record_cooldown_loss(pos.direction)
+                        _active_trade_signal = {}
+                        try:
+                            exit_sig = {
+                                "signal": "LONG_EXIT" if pos.direction == "LONG" else "SHORT_EXIT",
+                                "time": datetime.now(_IST).isoformat(),
+                                "entry": ltp, "close": ltp,
+                                "strategy": getattr(pos, "strategy", cfg.strategy),
+                                "reason": exit_reason,
+                                "reasons": [f"Exited {pos.direction} on opposite {sig_direction} signal"]
+                            }
+                            _add_signal_to_history(exit_sig)
+                            signal_journal_manager.close_entry(exit_sig, cfg.instrument, exit_reason, index_price=ltp)
+                        except Exception as _fl_err:
+                            logger.error(f"Opposite-signal exit logging error: {_fl_err}")
+                        try:
+                            send_telegram_exit_alert(pos, ltp, exit_reason, rec.get("pnl", 0.0), index_exit_price=ltp)
+                        except Exception as _tg_err:
+                            logger.warning(f"Telegram opposite-exit alert failed: {_tg_err}")
+                        await ws_manager.broadcast({"type": "trade_closed", "data": rec})
+
+                        # Seed the pending buffer so 2-poll confirmation starts NOW.
+                        # If the same signal fires again next poll, it enters as a fresh trade.
+                        _pending_telegram_signal = sig
+                        _last_telegram_signal_key = ("", "")
+
+                    # No position — use 2-poll confirmation then enter (or bypass if confirm_signals is False)
+                    else:
+                        confirm_signals = getattr(cfg, "confirm_signals", False)
+                        should_enter = False
+                        if not confirm_signals:
+                            if current_key != _last_telegram_signal_key:
+                                should_enter = True
+                                _last_telegram_signal_key = current_key
+                        else:
+                            pending_key = (_pending_telegram_signal.get("signal", ""),
+                                           _pending_telegram_signal.get("time", ""))
+                            if current_key == pending_key and current_key != _last_telegram_signal_key:
+                                should_enter = True
+                                _last_telegram_signal_key = current_key
+                                _pending_telegram_signal = {}
+                            else:
+                                _pending_telegram_signal = sig
+                                logger.info(f"Signal buffered for confirmation: {sig_direction} at {sig_ts}")
+
+                        if should_enter:
+                            ok = True
+                            reason = "OK"
+                            if cfg.auto_trade:
+                                ok, reason = tm.can_trade
+                                if ok:
+                                    ct_ok, ct_reason = get_capital_tracker().can_trade()
+                                    if not ct_ok:
+                                        ok, reason = False, ct_reason
+                            if ok:
+                                cooldown_bars = getattr(cfg, 'cooldown_bars', 0) if cfg.strategy == "multi_agent" else 0
+                                if cooldown_bars > 0 and _last_loss_direction == sig_direction and _last_loss_time:
+                                    elapsed_mins = (datetime.now(_IST) - _last_loss_time).total_seconds() / 60.0
+                                    cooldown_mins = cooldown_bars * 5
+                                    if elapsed_mins < cooldown_mins:
+                                        ok = False
+                                        reason = f"Cooldown: same direction ({sig_direction}) blocked for {cooldown_mins - elapsed_mins:.1f} more mins"
+                            if ok:
+                                result = _execute_order(sig, cfg, sig_direction)
+                                if result.get("success"):
+                                    tm.reset_order_failures()
+                                    await ws_manager.broadcast({"type": "trade_opened", "data": result})
+                                    trade_type_label = "Live" if cfg.auto_trade else "Paper"
+                                    logger.info(f"{trade_type_label} trade executed: {sig_direction} {cfg.instrument}")
+                                else:
+                                    fail_count = tm.record_order_failure()
+                                    logger.error(f"Trade execution failed: {result.get('error')}")
+                                    # Kill switch check
+                                    if cfg.auto_kill_switch and fail_count >= cfg.auto_kill_switch_max_failures:
+                                        logger.error(f"Kill switch triggered after {fail_count} consecutive failures — disabling auto_trade")
+                                        save_settings({"auto_trade": False})
+                            else:
+                                logger.info(f"Trade blocked: {reason}")
+                        else:
+                            # First appearance — buffer it, wait for confirmation
+                            _pending_telegram_signal = sig
+                            logger.info(f"Signal buffered for confirmation: {sig_direction} at {sig_ts}")
+
+                else:
+                    # No entry signal (HOLD / EXIT) — clear the pending buffer
+                    _pending_telegram_signal = {}
+
+                # Monitor open position
+                if tm.position:
+                    pos = tm.position
+                    ltp = broker.get_ltp(pos.instrument)  # INDEX LTP — used for SL/T1/T2 hit detection
+
+                    # For OPTIONS: also fetch the option premium for correct P&L tracking
+                    opt_ltp = _safe_pnl_exit_price(pos, ltp)
+
+                    if ltp:
+                        # update_pnl uses option premium so UI shows correct unrealized P&L
+                        tm.update_pnl(opt_ltp)
+
+                        exit_triggered = False
+                        exit_reason = ""
+                        exit_price = ltp
+                        pnl_price = opt_ltp
+
+                        # Verify if position was closed at broker (e.g. SL trigger)
+                        if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
+                            try:
+                                bp = broker.sync_position_from_broker(pos.instrument)
+                                if not bp or not bp.get("has_position") or bp.get("symbol") != pos.symbol:
+                                    logger.warning(f"Active position {pos.symbol} was closed at broker. Closing locally.")
+                                    exit_triggered = True
+                                    exit_reason = "BROKER_SL_HIT"
+                                    exit_price = ltp
+                                    pnl_price = opt_ltp
+                            except Exception as bp_err:
+                                logger.error(f"Error checking position sync from broker: {bp_err}")
+
+                        # ── Trailing SL for regime strategy ──────────────────
+                        if not exit_triggered and cfg.strategy == "regime_trend_range":
+                            trail_mult = getattr(cfg, "regime_trail_mult", 1.5)
+                            trail_activation = getattr(cfg, "regime_trail_activation", 0.3)
+                            be_trigger = getattr(cfg, "regime_be_trigger", 0.4)
+                            be_buffer = getattr(cfg, "regime_be_buffer", 0.3)
+                            atr_v = pos.entry_atr or sig.get("atr_5m", 0) or (ltp * 0.002)
+                            if pos.direction == "LONG":
+                                if ltp > pos.highest_since_entry:
+                                    pos.highest_since_entry = ltp
+                                profit = pos.highest_since_entry - pos.index_entry_price
+                                if profit >= atr_v * trail_activation:
+                                    trail_sl = pos.highest_since_entry - atr_v * trail_mult
+                                    if be_trigger > 0 and profit > atr_v * be_trigger:
+                                        trail_sl = max(trail_sl, pos.index_entry_price + atr_v * be_buffer)
+                                    if trail_sl > pos.sl:
+                                        logger.info(f"Trailing SL updated: {pos.sl:.2f} -> {trail_sl:.2f} (highest={pos.highest_since_entry:.2f}, ATR={atr_v:.2f})")
+                                        pos.sl = trail_sl
+                                        _sync_broker_sl(pos, cfg)
+                            elif pos.direction == "SHORT":
+                                if ltp < pos.lowest_since_entry:
+                                    pos.lowest_since_entry = ltp
+                                profit = pos.index_entry_price - pos.lowest_since_entry
+                                if profit >= atr_v * trail_activation:
+                                    trail_sl = pos.lowest_since_entry + atr_v * trail_mult
+                                    if be_trigger > 0 and profit > atr_v * be_trigger:
+                                        trail_sl = min(trail_sl, pos.index_entry_price - atr_v * be_buffer)
+                                    if trail_sl < pos.sl:
+                                        logger.info(f"Trailing SL updated: {pos.sl:.2f} -> {trail_sl:.2f} (lowest={pos.lowest_since_entry:.2f}, ATR={atr_v:.2f})")
+                                        pos.sl = trail_sl
+                                        _sync_broker_sl(pos, cfg)
+
+                        # ── Trailing SL for multi_agent strategy ──────────────
+                        # 3-step: initial → breakeven at +2.0 ATR → trail at +2.5 ATR, offset 0.5 ATR
+                        elif not exit_triggered and cfg.strategy == "multi_agent":
+                            be_trigger = getattr(cfg, 'trailing_be_trigger_atr', 0)
+                            trail_start = getattr(cfg, 'trailing_start_atr', 0)
+                            trail_offset = getattr(cfg, 'trailing_offset_atr', 0.5)
+                            atr_v = pos.entry_atr or sig.get("atr_5m", 0) or (ltp * 0.002)
+
+                            if atr_v > 0 and be_trigger > 0:
+                                if pos.direction == "LONG":
+                                    if ltp > pos.highest_since_entry:
+                                        pos.highest_since_entry = ltp
+                                    profit = pos.highest_since_entry - pos.index_entry_price
+                                    profit_atr = profit / atr_v
+                                    peak_profit_atr = profit_atr  # peak = highest since entry
+
+                                    # Step 1: Move to breakeven
+                                    if pos.trail_step == 0 and profit_atr >= be_trigger:
+                                        pos.sl = pos.index_entry_price
+                                        pos.trail_step = 1
+                                        logger.info(f"V3 Trail: BE triggered (profit={profit_atr:.1f} ATR), SL -> {pos.sl:.2f}")
+                                        _sync_broker_sl(pos, cfg)
+                                    # Step 2: Start trailing
+                                    if trail_start > 0 and pos.trail_step >= 1 and peak_profit_atr >= trail_start:
+                                        pos.trail_step = 2
+                                    # Continuous trail
+                                    if pos.trail_step >= 2 and trail_offset > 0:
+                                        trail_sl = pos.index_entry_price + profit - trail_offset * atr_v
+                                        if trail_sl > pos.sl:
+                                            logger.info(f"V3 Trail: SL {pos.sl:.2f} -> {trail_sl:.2f} (peak={profit:.0f}pts, ATR={atr_v:.0f})")
+                                            pos.sl = trail_sl
+                                            _sync_broker_sl(pos, cfg)
+
+                                elif pos.direction == "SHORT":
+                                    if ltp < pos.lowest_since_entry:
+                                        pos.lowest_since_entry = ltp
+                                    profit = pos.index_entry_price - pos.lowest_since_entry
+                                    profit_atr = profit / atr_v
+                                    peak_profit_atr = profit_atr
+
+                                    if pos.trail_step == 0 and profit_atr >= be_trigger:
+                                        pos.sl = pos.index_entry_price
+                                        pos.trail_step = 1
+                                        logger.info(f"V3 Trail: BE triggered (profit={profit_atr:.1f} ATR), SL -> {pos.sl:.2f}")
+                                        _sync_broker_sl(pos, cfg)
+                                    if trail_start > 0 and pos.trail_step >= 1 and peak_profit_atr >= trail_start:
+                                        pos.trail_step = 2
+                                    if pos.trail_step >= 2 and trail_offset > 0:
+                                        trail_sl = pos.index_entry_price - profit + trail_offset * atr_v
+                                        if trail_sl < pos.sl:
+                                            logger.info(f"V3 Trail: SL {pos.sl:.2f} -> {trail_sl:.2f} (peak={profit:.0f}pts, ATR={atr_v:.0f})")
+                                            pos.sl = trail_sl
+                                            _sync_broker_sl(pos, cfg)
+
+
+
+                        # SL/target/exit checks run for ALL positions (PAPER_, DHAN_SYNC_, SIG_).
+                        # The broker exit order is conditional on auto_trade (checked below at line that calls place_exit_order).
+                        # For DHAN_SYNC_ with auto_trade=OFF: we detect SL hit, close locally, and alert user.
+
+                        if not exit_triggered:
+                            # 0. Intraday Daily Loss Limit — DISABLED
+                            # Was producing false exits. Re-enable when PnL tracking is reliable.
+                            # daily_pnl = tm.day_stats.gross_pnl
+                            # current_unpnl = getattr(pos, "current_pnl", 0.0)
+                            # ct = get_capital_tracker()
+                            # breach_triggered, breach_msg = ct.should_force_close(
+                            #     daily_realised_pnl=daily_pnl,
+                            #     unrealised_pnl=current_unpnl,
+                            #     max_daily_loss=tm._max_daily_loss
+                            # )
+                            # if breach_triggered:
+                            #     exit_triggered = True
+                            #     exit_reason = "DAILY_LOSS_LIMIT_BREACH"
+                            #     exit_price = ltp
+                            #     logger.warning(f"Intra-trade guard: {breach_msg}. Forcing exit.")
+                            # 1. Target 2 hit (index level)
+                            if pos.target2 > 0 and (
+                               (pos.direction == "LONG" and ltp >= pos.target2) or
+                               (pos.direction == "SHORT" and ltp <= pos.target2)
+                            ):
+                                exit_triggered = True
+                                exit_reason = "T2_HIT"
+                                exit_price = pos.target2
+                            # 2. Stop Loss hit (index level)
+                            # Distinguish trailing SL from initial SL (matches backtest)
+                            elif pos.sl > 0 and (
+                                 (pos.direction == "LONG" and ltp <= pos.sl) or
+                                 (pos.direction == "SHORT" and ltp >= pos.sl)
+                            ):
+                                exit_triggered = True
+                                _ts = getattr(pos, 'trail_step', 0)
+                                exit_reason = f"TRAIL_S{_ts}" if _ts > 0 else "SL_HIT"
+                                exit_price = pos.sl
+                            # 3. Model exit signal (SIG_EXIT — same name as backtest)
+                            elif sig.get("instrument") == pos.instrument and (
+                                 (pos.direction == "LONG" and sig.get("signal") == "LONG_EXIT") or
+                                 (pos.direction == "SHORT" and sig.get("signal") == "SHORT_EXIT")
+                            ):
+                                exit_triggered = True
+                                exit_reason = "SIG_EXIT"
+                            # 4. Time limit exit
+                            else:
+                                try:
+                                    entry_dt = datetime.fromisoformat(pos.entry_time)
+                                    if entry_dt.tzinfo is None:
+                                        entry_dt = pytz.timezone("Asia/Kolkata").localize(entry_dt)
+                                    now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+                                    duration_mins = (now_ist - entry_dt).total_seconds() / 60
+                                    if duration_mins >= (cfg.max_hold_bars * 5):
+                                        exit_triggered = True
+                                        exit_reason = "TIME_EXIT"
+                                except Exception as e:
+                                    logger.error(f"Error checking time exit: {e}")
+
+                        # Log LONG_EXIT / SHORT_EXIT model signal to history exactly ONCE per position.
+                        # _exit_signal_logged_for_position tracks the order_id so even if the bar
+                        # timestamp changes across polls we never write a second entry.
+                        if sig.get("signal") in ("LONG_EXIT", "SHORT_EXIT"):
+                            if _exit_signal_logged_for_position != pos.order_id:
+                                try:
+                                    model_exit_sig = {
+                                        "signal": sig.get("signal"),
+                                        "time": sig.get("time", datetime.now(_IST).isoformat()),
+                                        "entry": opt_ltp,
+                                        "close": opt_ltp,
+                                        "reason": "SIG_EXIT",
+                                        "reasons": sig.get("reasons", ["Model exit signal"])
+                                    }
+                                    _add_signal_to_history(model_exit_sig)
+                                    signal_journal_manager.close_entry(
+                                        model_exit_sig, cfg.instrument, "SIG_EXIT", index_price=ltp
+                                    )
+                                    _exit_signal_logged_for_position = pos.order_id
+                                except Exception as ex_err:
+                                    logger.error(f"Failed to log model exit signal: {ex_err}")
+
+                        if exit_triggered:
+                            # Only place real broker exit order in live auto-trade mode
+                            if cfg.auto_trade and not pos.order_id.startswith("PAPER_") and exit_reason != "BROKER_SL_HIT":
+                                if getattr(pos, "sl_order_id", None):
+                                    try:
+                                        broker.cancel_broker_sl(pos.sl_order_id)
+                                    except Exception as sl_cancel_err:
+                                        logger.warning(f"Could not cancel broker SL: {sl_cancel_err}")
+                                    pos.sl_order_id = None
+                                broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                            elif getattr(pos, "sl_order_id", None):
+                                pos.sl_order_id = None
+                            elif pos.order_id.startswith("DHAN_SYNC_") and not cfg.auto_trade:
+                                # DHAN_SYNC position hit SL/target but auto_trade is OFF — alert user
+                                logger.warning(f"DHAN_SYNC position {exit_reason} but auto_trade=OFF — user must exit manually on Dhan!")
+                                try:
+                                    _send_telegram_alert_wrapper(
+                                        f"\u26a0\ufe0f MANUAL EXIT NEEDED\n"
+                                        f"{pos.direction} {pos.symbol}\n"
+                                        f"Reason: {exit_reason} (LTP: {ltp})\n"
+                                        f"Auto-trade is OFF — please exit on Dhan manually!",
+                                        cfg.telegram_bot_token, cfg.telegram_chat_id
+                                    )
+                                except Exception:
+                                    pass
+
+                            # Prevent immediate Dhan re-import for 5 minutes
+                            _recently_closed_symbols[pos.symbol] = datetime.now(_IST)
+                            _exit_signal_logged_for_position = ""
+                            _exit_telegram_sent_for_position = ""
+
+                            # PnL calculated on option premium (not index price)
+                            rec = tm.close_position(pnl_price, exit_reason)
+                            if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
+                                get_capital_tracker().record_trade_pnl(rec.get("pnl", 0.0))
+                            if cfg.strategy == "multi_agent" and rec.get("pnl", 0.0) <= 0.0:
+                                record_cooldown_loss(pos.direction)
+
+                            # Log exit fill slippage
+                            # For SL/T2 hits: expected = the SL/T2 level, actual = ltp at exit
+                            _expected_exit = exit_price  # index-level SL/T2 hit price
+                            if exit_reason == "SL_HIT" and pos.sl > 0:
+                                _expected_exit = pos.sl
+                            elif exit_reason == "T2_HIT" and pos.target2 > 0:
+                                _expected_exit = pos.target2
+                            slippage_tracker.log_exit_fill(
+                                symbol=pos.symbol,
+                                direction=pos.direction,
+                                expected_price=_expected_exit,
+                                actual_price=pnl_price,
+                                qty=pos.qty,
+                                order_id=pos.order_id,
+                                exit_reason=exit_reason,
+                                trade_mode=pos.trade_mode,
+                                instrument=pos.instrument,
+                            )
+
+                            _active_trade_signal = {}
+
+                            # Log to history only for non-SIG_EXIT (SIG_EXIT already logged above)
+                            if exit_reason != "SIG_EXIT":
+                                try:
+                                    exit_sig = {
+                                        "signal": "LONG_EXIT" if pos.direction == "LONG" else "SHORT_EXIT",
+                                        "time": sig.get("time", datetime.now(_IST).isoformat()),
+                                        "entry": pnl_price,
+                                        "close": pnl_price,
+                                        "strategy": getattr(pos, "strategy", cfg.strategy),
+                                        "reason": exit_reason,
+                                        "reasons": [f"Exit triggered: {exit_reason}"]
+                                    }
+                                    _add_signal_to_history(exit_sig)
+                                    signal_journal_manager.close_entry(
+                                        exit_sig, cfg.instrument, exit_reason, index_price=exit_price
+                                    )
+                                except Exception as ex_err:
+                                    logger.error(f"Failed to log exit signal: {ex_err}")
+
+                            # Update Trading Journal (only for real broker trades, not paper)
+                            if not pos.order_id.startswith("PAPER_"):
+                                try:
+                                    from journal_manager import close_journal_entry
+                                    close_journal_entry(
+                                        symbol=pos.symbol,
+                                        exit_price=exit_price,   # INDEX level (ltp or SL/T2 hit level)
+                                        exit_time=datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S"),
+                                        exit_reason=exit_reason,
+                                        pnl=rec.get("pnl", 0.0),
+                                        order_id=pos.order_id
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Failed to close journal entry: {e}")
+
+                            # Send Telegram exit alert (index exit price shown, option premium for PnL context)
+                            try:
+                                send_telegram_exit_alert(pos, pnl_price, exit_reason, rec.get("pnl", 0.0), index_exit_price=exit_price)
+                            except Exception as e:
+                                logger.warning(f"Telegram exit alert failed: {e}")
+
+                            await ws_manager.broadcast({"type": "trade_closed", "data": rec})
+                        else:
+                            # T1 hit check (only if not exited)
+                            if not pos.t1_hit and pos.target1 > 0:
+                                if (pos.direction == "LONG" and ltp >= pos.target1) or \
+                                   (pos.direction == "SHORT" and ltp <= pos.target1):
+                                    tm.mark_t1_hit()
+
+                await ws_manager.broadcast({"type": "state", "data": tm.get_state()})
+        except Exception as e:
+            logger.error(f"Polling loop error: {e}")
+
+
+# ── Capital Tracker API ───────────────────────────────────────────────────────
+
+@app.get("/api/capital")
+async def get_capital_state():
+    cfg = get_settings()
+    ct = get_capital_tracker()
+    state = ct.get_state()
+    
+    # 1. Fetch real-time equity (current capital) from Dhan if connected
+    equity = state["current_equity"]
+    if broker.is_connected():
+        try:
+            dhan_bal = broker.get_balance()
+            if dhan_bal > 0 and cfg.auto_trade:
+                equity = dhan_bal
+                # Update capital tracker in-memory and on-disk
+                ct.current_equity = equity
+                if ct.current_equity > ct.peak_equity:
+                    ct.peak_equity = ct.current_equity
+                ct._check_breach()
+                ct._save()
+        except Exception as _bal_err:
+            logger.warning(f"Failed to fetch real-time balance for capital protection: {_bal_err}")
+
+    # 2. Get today's P&L (realized + unrealized) from Dhan if connected
+    today_pnl = 0.0
+    if broker.is_connected():
+        try:
+            today_pnl = broker.get_today_pnl()
+        except Exception as _pnl_err:
+            logger.warning(f"Failed to fetch real-time today's pnl from Dhan: {_pnl_err}")
+            # Fallback to local calculation if Dhan call fails
+            realized_pnl = 0.0
+            try:
+                from journal_manager import get_today_journal_stats
+                journal_stats = get_today_journal_stats(cfg.instrument)
+                realized_pnl = journal_stats.get("gross_pnl", 0.0)
+            except Exception:
+                pass
+            tm = get_trade_manager()
+            unrealized_pnl = 0.0
+            if tm.position and tm.position.instrument == cfg.instrument and not tm.position.order_id.startswith("PAPER_"):
+                unrealized_pnl = tm.position.current_pnl
+            today_pnl = realized_pnl + unrealized_pnl
+    else:
+        # Paper/offline mode fallback
+        realized_pnl = 0.0
+        try:
+            from journal_manager import get_today_journal_stats
+            journal_stats = get_today_journal_stats(cfg.instrument)
+            realized_pnl = journal_stats.get("gross_pnl", 0.0)
+        except Exception:
+            pass
+        tm = get_trade_manager()
+        unrealized_pnl = 0.0
+        if tm.position and tm.position.instrument == cfg.instrument:
+            unrealized_pnl = tm.position.current_pnl
+        today_pnl = realized_pnl + unrealized_pnl
+
+    # 3. Calculate peak, drawdown, and limit
+    if today_pnl < 0:
+        # Loss scenario: Peak = Equity + Loss
+        loss = abs(today_pnl)
+        peak = equity + loss
+        drawdown = loss
+        drawdown_pct = (drawdown / peak) * 100 if peak > 0 else 0.0
+    else:
+        # Profit scenario: Peak = Equity
+        peak = equity
+        drawdown = 0.0
+        drawdown_pct = 0.0
+
+    limit = peak * 0.10
+
+    return {
+        "starting_capital": float(state["starting_capital"]),
+        "peak_equity": round(float(peak), 2),
+        "current_equity": round(float(equity), 2),
+        "max_drawdown_pct": 10.0,
+        "drawdown_limit": round(float(limit), 2),
+        "current_drawdown": round(float(drawdown), 2),
+        "current_drawdown_pct": round(float(drawdown_pct), 2),
+        "drawdown_breached": bool(state["drawdown_breached"]),
+        "last_updated": state["last_updated"],
+        "today_pnl": round(float(today_pnl), 2),
+        "is_profit": bool(today_pnl >= 0)
+    }
+
+
+@app.post("/api/capital/reset-breach")
+async def reset_capital_breach():
+    ct = get_capital_tracker()
+    ct.reset_breach()
+    return {"success": True, "state": ct.get_state()}
+
+
+@app.post("/api/capital/reset-all")
+async def reset_capital_all():
+    cfg = get_settings()
+    ct = get_capital_tracker()
+    ct.reset_all(cfg.starting_capital)
+    return {"success": True, "state": ct.get_state()}
+
+
+# ── Data Health API ───────────────────────────────────────────────────────────
+
+@app.get("/api/data-health")
+async def get_data_health():
+    return _data_health_state
+
+
+@app.get("/api/slippage")
+async def get_slippage():
+    return slippage_tracker.get_slippage_stats()
+
+
+@app.get("/api/performance")
+async def get_performance():
+    return performance_tracker.compute_metrics()
+
+
+@app.post("/api/performance/snapshot")
+async def log_performance_snapshot():
+    cfg = get_settings()
+    performance_tracker.log_daily_snapshot(cfg.starting_capital)
+    return {"success": True}
+
+
+@app.get("/api/system-health")
+async def get_system_health():
+    """Return heartbeat, app state, and uptime info for the system health UI card."""
+    from watchdog import HEARTBEAT_FILE, STATE_FILE
+
+    result = {
+        "heartbeat_ok": False,
+        "heartbeat_age_seconds": None,
+        "app_state": "UNKNOWN",
+        "app_state_time": None,
+        "watchdog_active": False,
+        "uptime_seconds": None,
+        "pid": os.getpid(),
+    }
+
+    # Read heartbeat
+    if HEARTBEAT_FILE.exists():
+        try:
+            hb = json.loads(HEARTBEAT_FILE.read_text(encoding="utf-8"))
+            last_beat = datetime.fromisoformat(hb["time"])
+            if last_beat.tzinfo is None:
+                last_beat = _IST.localize(last_beat)
+            age = (datetime.now(_IST) - last_beat).total_seconds()
+            result["heartbeat_ok"] = age < 120
+            result["heartbeat_age_seconds"] = round(age, 1)
+            if "uptime_seconds" in hb:
+                result["watchdog_active"] = True
+        except Exception as e:
+            logger.warning(f"Error checking heartbeat in status API: {e}")
+
+    # Read app state
+    if STATE_FILE.exists():
+        try:
+            st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            result["app_state"] = st.get("state", "UNKNOWN")
+            result["app_state_time"] = st.get("time")
+            if "watchdog" in st.get("details", "").lower():
+                result["watchdog_active"] = True
+        except Exception:
+            pass
+
+    # Compute uptime from app state time
+    if result["app_state"] == "RUNNING" and result["app_state_time"]:
+        try:
+            start = datetime.fromisoformat(result["app_state_time"])
+            if start.tzinfo is None:
+                start = _IST.localize(start)
+            result["uptime_seconds"] = round((datetime.now(_IST) - start).total_seconds(), 0)
+        except Exception:
+            pass
+
+    return result
+
+
+@app.get("/api/download/performance-log")
+async def download_performance_log():
+    """Download the performance_log.csv file."""
+    from starlette.responses import FileResponse
+    csv_path = Path(get_settings().data_dir) / "performance_log.csv"
+    if not csv_path.exists():
+        return {"error": "No performance log yet"}
+    return FileResponse(str(csv_path), media_type="text/csv", filename="performance_log.csv")
+
+
+@app.get("/api/download/slippage-log")
+async def download_slippage_log():
+    """Download the slippage_log.csv file."""
+    from starlette.responses import FileResponse
+    csv_path = Path(get_settings().data_dir) / "slippage_log.csv"
+    if not csv_path.exists():
+        return {"error": "No slippage log yet"}
+    return FileResponse(str(csv_path), media_type="text/csv", filename="slippage_log.csv")
+
+
+# ── Global Market Context ────────────────────────────────────────────────────
+
+@app.get("/api/global-markets")
+async def get_global_markets():
+    """Global indices and futures data (cached 5 min)."""
+    from global_markets import fetch_global_markets
+    return fetch_global_markets()
+
+@app.get("/api/market-context")
+async def get_market_context():
+    """Combined: global markets + bias + sentiment + fear & greed + VIX + expiry + composite."""
+    from global_markets import get_market_context
+    return get_market_context()
+
+@app.post("/api/market-context/refresh")
+async def refresh_market_context():
+    """Clear all market context caches and re-fetch fresh data."""
+    from global_markets import clear_all_cache, get_market_context
+    clear_all_cache()
+    return get_market_context()
+
+@app.get("/api/india-vix")
+async def get_india_vix():
+    """India VIX from Dhan API."""
+    from global_markets import fetch_india_vix
+    return fetch_india_vix()
+
+@app.get("/api/expiry-today")
+async def get_expiry_today():
+    """Check which instruments have expiry today."""
+    from global_markets import fetch_expiry_today
+    return fetch_expiry_today()
+
+@app.get("/api/oi-analysis")
+async def get_oi_analysis(instrument: str = "BANKNIFTY", expiry: str = None):
+    """Open Interest analysis from Dhan option chain."""
+    from global_markets import fetch_oi_analysis
+    return fetch_oi_analysis(instrument, expiry)
+
+@app.get("/api/oi-expiry-list")
+async def get_oi_expiry_list(instrument: str = "BANKNIFTY"):
+    """Get available option expiry dates for an instrument."""
+    from global_markets import fetch_oi_expiry_list
+    return fetch_oi_expiry_list(instrument)
+
+@app.get("/api/options-context")
+async def get_options_context(instrument: str = "BANKNIFTY", expiry: str = None, direction: str = None):
+    """Options awareness context for Live Trading — strike recommendations, Greeks, IV, theta decay."""
+    from global_markets import fetch_options_context
+    return fetch_options_context(instrument, expiry, direction)
+
+
+# ── Research Pipeline API ────────────────────────────────────────────────────
+
+_research_pull_task = None  # Background task reference for Phase 1 data pull
+_research_pull_progress = {}  # Shared progress dict for Phase 1
+
+@app.get("/api/research/status")
+async def get_research_status():
+    """Return pipeline status (which phases are complete)."""
+    status_path = Path(__file__).parent.parent / "Research" / "pipeline_status.json"
+    if not status_path.exists():
+        return {"error": "Pipeline not initialized. Run scaffold first."}
+    with open(status_path, "r") as f:
+        return json.load(f)
+
+@app.post("/api/research/scaffold")
+async def scaffold_research():
+    """Create Phase 0 folder structure + config files if not already present."""
+    research_root = Path(__file__).parent.parent / "Research"
+    dirs = [
+        "config", "src/data", "src/analysis", "src/features",
+        "data/raw", "data/clean", "data/meta", "reports"
+    ]
+    created = []
+    for d in dirs:
+        p = research_root / d
+        if not p.exists():
+            p.mkdir(parents=True, exist_ok=True)
+            created.append(str(d))
+    
+    # Update pipeline status
+    status_path = research_root / "pipeline_status.json"
+    if status_path.exists():
+        with open(status_path, "r") as f:
+            status = json.load(f)
+        phase0 = status.get("phases", {}).get("phase_0", {})
+        phase0["status"] = "complete"
+        steps = phase0.get("steps", {})
+        steps["folder_structure"] = True
+        if (research_root / "config" / "universe.yaml").exists():
+            steps["universe_yaml"] = True
+        if (research_root / "config" / "splits.yaml").exists():
+            steps["splits_yaml"] = True
+        steps["python_env"] = True  # Already set up
+        steps["dhan_client_wrapper"] = (research_root / "src" / "data" / "dhan_research_client.py").exists()
+        phase0["steps"] = steps
+        status["phases"]["phase_0"] = phase0
+        status["last_updated"] = datetime.now(_IST).isoformat()
+        with open(status_path, "w") as f:
+            json.dump(status, f, indent=2)
+    
+    return {"success": True, "dirs_created": created, "message": "Phase 0 scaffolding complete"}
+
+@app.post("/api/research/run/phase1")
+async def run_research_phase1(background_tasks=None):
+    """
+    Trigger Phase 1 data acquisition for all constituents.
+    Runs as a background task because it takes minutes (Dhan rate limits).
+    """
+    global _research_pull_task, _research_pull_progress
+    
+    if not broker.is_connected():
+        return {"error": "Broker not connected. Connect to Dhan first."}
+    
+    if _research_pull_task and not _research_pull_task.done():
+        return {"error": "Phase 1 pull already in progress.", "progress": _research_pull_progress}
+    
+    import asyncio
+    
+    _research_pull_progress = {"status": "starting", "symbols_done": 0, "total": 0, "current": "", "errors": []}
+    
+    async def _run_pull():
+        global _research_pull_progress
+        import sys
+        research_root = Path(__file__).parent.parent / "Research"
+        sys.path.insert(0, str(research_root / "src"))
+        
+        try:
+            from data.dhan_research_client import ResearchDataClient
+            client = ResearchDataClient()
+            _research_pull_progress["total"] = client._count_total_symbols()
+            _research_pull_progress["status"] = "pulling"
+            
+            def on_symbol_done(symbol, result):
+                _research_pull_progress["symbols_done"] += 1
+                _research_pull_progress["current"] = symbol
+                success = any(result.values()) if isinstance(result, dict) else False
+                if not success:
+                    _research_pull_progress["errors"].append(symbol)
+                logger.info(f"Research pull: {symbol} done ({_research_pull_progress['symbols_done']}/{_research_pull_progress['total']})")
+            
+            # Run synchronously in thread to avoid blocking event loop
+            import concurrent.futures
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                results = await loop.run_in_executor(pool, lambda: client.pull_all(callback=on_symbol_done))
+            
+            _research_pull_progress["status"] = "complete"
+            _research_pull_progress["results"] = {
+                k: {tf: ok for tf, ok in v.items()} 
+                for k, v in results.items() 
+                if isinstance(v, dict)
+            }
+            
+            # Run corporate action check
+            _research_pull_progress["status"] = "checking_corporate_actions"
+            from data.corporate_actions import run_corporate_action_check
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                ca_results = await loop.run_in_executor(pool, run_corporate_action_check)
+            _research_pull_progress["corporate_actions"] = ca_results
+            
+            # Run data quality report
+            _research_pull_progress["status"] = "generating_quality_report"
+            from data.data_quality import generate_data_quality_report
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                dq_results = await loop.run_in_executor(pool, generate_data_quality_report)
+            _research_pull_progress["data_quality"] = dq_results.get("summary", {})
+            
+            # Clean and align data (Phase 1 Steps 4-7)
+            _research_pull_progress["status"] = "cleaning_and_aligning"
+            from data.clean_data import run_cleaning_pipeline
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                clean_results = await loop.run_in_executor(pool, run_cleaning_pipeline)
+            _research_pull_progress["clean_data"] = clean_results
+            
+            _research_pull_progress["status"] = "done"
+            logger.info("Research Phase 1 complete!")
+            
+        except Exception as e:
+            logger.error(f"Research Phase 1 error: {e}", exc_info=True)
+            _research_pull_progress["status"] = "error"
+            _research_pull_progress["error_message"] = str(e)
+    
+    _research_pull_task = asyncio.create_task(_run_pull())
+    
+    return {"success": True, "message": "Phase 1 data pull started in background."}
+
+@app.get("/api/research/phase1/status")
+async def get_research_phase1_status():
+    """Get current progress of Phase 1 data pull."""
+    global _research_pull_progress
+    return _research_pull_progress or {"status": "not_started"}
+
+@app.get("/api/research/phase1/quality")
+async def get_research_data_quality():
+    """Get data quality report."""
+    report_path = Path(__file__).parent.parent / "Research" / "reports" / "data_quality_report.json"
+    if not report_path.exists():
+        return {"error": "No data quality report yet. Run Phase 1 first."}
+    with open(report_path, "r") as f:
+        return json.load(f)
+
+@app.get("/api/research/inventory")
+async def get_research_data_inventory():
+    """Get inventory of all downloaded research data files."""
+    raw_dir = Path(__file__).parent.parent / "Research" / "data" / "raw"
+    if not raw_dir.exists():
+        return {"files": [], "total_size_mb": 0}
+    
+    files = []
+    total_size = 0
+    for f in sorted(raw_dir.glob("*.parquet")):
+        size = f.stat().st_size
+        total_size += size
+        parts = f.stem.split("_")
+        files.append({
+            "name": f.name,
+            "symbol": parts[0].upper() if parts else f.stem,
+            "timeframe": parts[1] if len(parts) > 1 else "unknown",
+            "size_kb": round(size / 1024, 1),
+        })
+    
+    return {"files": files, "total_size_mb": round(total_size / (1024*1024), 2)}
+
+@app.get("/api/research/notes")
+async def get_research_notes():
+    """Get research notes."""
+    notes_path = Path(__file__).parent.parent / "Research" / "NOTES.md"
+    if not notes_path.exists():
+        return {"content": ""}
+    return {"content": notes_path.read_text(encoding="utf-8")}
+
+@app.post("/api/research/notes")
+async def save_research_notes(req: dict):
+    """Save research notes."""
+    notes_path = Path(__file__).parent.parent / "Research" / "NOTES.md"
+    content = req.get("content", "")
+    notes_path.write_text(content, encoding="utf-8")
+    return {"success": True}
+
+@app.post("/api/research/pipeline/update")
+async def update_pipeline_step(req: dict):
+    """Update a specific pipeline phase/step status."""
+    status_path = Path(__file__).parent.parent / "Research" / "pipeline_status.json"
+    if not status_path.exists():
+        return {"error": "Pipeline not initialized"}
+    
+    with open(status_path, "r") as f:
+        status = json.load(f)
+    
+    phase_id = req.get("phase")  # e.g. "phase_1"
+    step_id = req.get("step")    # e.g. "pull_banknifty_index"
+    value = req.get("value", True)
+    
+    if phase_id and phase_id in status.get("phases", {}):
+        phase = status["phases"][phase_id]
+        if step_id and step_id in phase.get("steps", {}):
+            phase["steps"][step_id] = value
+        
+        # Auto-update phase status based on steps
+        steps = phase.get("steps", {})
+        if all(steps.values()):
+            phase["status"] = "complete"
+        elif any(steps.values()):
+            phase["status"] = "in_progress"
+        else:
+            phase["status"] = "not_started"
+        
+        status["phases"][phase_id] = phase
+        status["last_updated"] = datetime.now(_IST).isoformat()
+        
+        with open(status_path, "w") as f:
+            json.dump(status, f, indent=2)
+        
+        return {"success": True, "phase": phase_id, "status": phase["status"]}
+    
+    return {"error": f"Phase '{phase_id}' not found"}
+
+
+@app.post("/api/research/run/phase2")
+async def run_research_phase2():
+    """Trigger Phase 2 exploratory analysis."""
+    import sys
+    import concurrent.futures
+    research_root = Path(__file__).parent.parent / "Research"
+    sys.path.insert(0, str(research_root / "src"))
+    try:
+        from analysis.phase2_exploration import run_exploratory_analysis
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            results = await loop.run_in_executor(pool, run_exploratory_analysis)
+        if "error" in results:
+            return {"success": False, "error": results["error"]}
+        return {"success": True, "data": results}
+    except Exception as e:
+        logger.error(f"Research Phase 2 error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/research/phase2/data")
+async def get_research_phase2_data():
+    """Get Phase 2 exploration data for visualization."""
+    report_path = Path(__file__).parent.parent / "Research" / "reports" / "phase2_exploration.json"
+    if not report_path.exists():
+        return {"error": "No Phase 2 data yet. Run Phase 2 first."}
+    try:
+        with open(report_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        return {"error": f"Failed to load Phase 2 data: {e}"}
+
+
+@app.post("/api/research/run/phase3")
+async def run_research_phase3():
+    """Trigger Phase 3 PCA factor analysis."""
+    import sys
+    import concurrent.futures
+    research_root = Path(__file__).parent.parent / "Research"
+    sys.path.insert(0, str(research_root / "src"))
+    try:
+        from analysis.phase3_pca import run_pca_pipeline
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            results = await loop.run_in_executor(pool, run_pca_pipeline)
+        if "error" in results:
+            return {"success": False, "error": results["error"]}
+        return {"success": True, "data": results}
+    except Exception as e:
+        logger.error(f"Research Phase 3 error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/research/phase3/data")
+async def get_research_phase3_data():
+    """Get Phase 3 PCA data for visualization."""
+    report_path = Path(__file__).parent.parent / "Research" / "reports" / "phase3_pca.json"
+    if not report_path.exists():
+        return {"error": "No Phase 3 data yet. Run Phase 3 first."}
+    try:
+        with open(report_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        return {"error": f"Failed to load Phase 3 data: {e}"}
+
+
+@app.post("/api/research/run/phase4")
+async def run_research_phase4():
+    """Trigger Phase 4 RMT analysis."""
+    import sys
+    import concurrent.futures
+    research_root = Path(__file__).parent.parent / "Research"
+    sys.path.insert(0, str(research_root / "src"))
+    try:
+        from analysis.phase4_rmt import run_rmt_analysis
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            results = await loop.run_in_executor(pool, run_rmt_analysis)
+        if "error" in results:
+            return {"success": False, "error": results["error"]}
+        return {"success": True, "data": results}
+    except Exception as e:
+        logger.error(f"Research Phase 4 error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/research/phase4/data")
+async def get_research_phase4_data():
+    """Get Phase 4 RMT data for visualization."""
+    report_path = Path(__file__).parent.parent / "Research" / "reports" / "phase4_rmt.json"
+    if not report_path.exists():
+        return {"error": "No Phase 4 data yet. Run Phase 4 first."}
+    try:
+        with open(report_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        return {"error": f"Failed to load Phase 4 data: {e}"}
+
+
+@app.post("/api/research/run/phase5")
+async def run_research_phase5():
+    """Trigger Phase 5 residual analysis."""
+    import sys
+    import concurrent.futures
+    research_root = Path(__file__).parent.parent / "Research"
+    sys.path.insert(0, str(research_root / "src"))
+    try:
+        from analysis.phase5_residuals import run_residuals_analysis
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            results = await loop.run_in_executor(pool, run_residuals_analysis)
+        if "error" in results:
+            return {"success": False, "error": results["error"]}
+        return {"success": True, "data": results}
+    except Exception as e:
+        logger.error(f"Research Phase 5 error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/research/phase5/data")
+async def get_research_phase5_data():
+    """Get Phase 5 residual data for visualization."""
+    report_path = Path(__file__).parent.parent / "Research" / "reports" / "phase5_residuals.json"
+    if not report_path.exists():
+        return {"error": "No Phase 5 data yet. Run Phase 5 first."}
+    try:
+        with open(report_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        return {"error": f"Failed to load Phase 5 data: {e}"}
+
+
+@app.post("/api/research/run/phase6")
+async def run_research_phase6():
+    """Trigger Phase 6 baseline analysis."""
+    import sys
+    import concurrent.futures
+    research_root = Path(__file__).parent.parent / "Research"
+    sys.path.insert(0, str(research_root / "src"))
+    try:
+        from analysis.phase6_baseline import run_baseline_pipeline
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            results = await loop.run_in_executor(pool, run_baseline_pipeline)
+        if "error" in results:
+            return {"success": False, "error": results["error"]}
+        return {"success": True, "data": results}
+    except Exception as e:
+        logger.error(f"Research Phase 6 error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/research/phase6/data")
+async def get_research_phase6_data():
+    """Get Phase 6 baseline data for visualization."""
+    report_path = Path(__file__).parent.parent / "Research" / "reports" / "phase6_baseline.json"
+    if not report_path.exists():
+        return {"error": "No Phase 6 data yet. Run Phase 6 first."}
+    try:
+        with open(report_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        return {"error": f"Failed to load Phase 6 data: {e}"}
+
+
+@app.post("/api/research/run/phase7")
+async def run_research_phase7():
+    """Trigger Phase 7 feature engineering."""
+    import sys
+    import concurrent.futures
+    research_root = Path(__file__).parent.parent / "Research"
+    sys.path.insert(0, str(research_root / "src"))
+    try:
+        from features.build_features import build_feature_matrix
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            results = await loop.run_in_executor(pool, build_feature_matrix)
+        if "error" in results:
+            return {"success": False, "error": results["error"]}
+        return {"success": True, "data": results}
+    except Exception as e:
+        logger.error(f"Research Phase 7 error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/research/phase7/data")
+async def get_research_phase7_data():
+    """Get Phase 7 features status/preview."""
+    train_path = Path(__file__).parent.parent / "Research" / "data" / "clean" / "features_train.parquet"
+    val_path = Path(__file__).parent.parent / "Research" / "data" / "clean" / "features_val.parquet"
+    test_path = Path(__file__).parent.parent / "Research" / "data" / "clean" / "features_test.parquet"
+    
+    if not train_path.exists():
+        return {"error": "No Phase 7 feature data yet. Run Phase 7 first."}
+    try:
+        df_preview = pd.read_parquet(train_path).head(5)
+        columns = list(df_preview.columns)
+        
+        # Load only 'symbol' column for counting rows to optimize memory and speed
+        df_train = pd.read_parquet(train_path, columns=["symbol"])
+        df_val = pd.read_parquet(val_path, columns=["symbol"])
+        df_test = pd.read_parquet(test_path, columns=["symbol"])
+        
+        return {
+            "train_rows": len(df_train),
+            "val_rows": len(df_val),
+            "test_rows": len(df_test),
+            "columns": columns,
+            "preview": df_preview.fillna("").to_dict("records")
+        }
+    except Exception as e:
+        return {"error": f"Failed to load Phase 7 data: {e}"}
+
+
+@app.post("/api/research/run/phase8")
+async def run_research_phase8():
+    """Trigger Phase 8 ML training and evaluation."""
+    import sys
+    import concurrent.futures
+    research_root = Path(__file__).parent.parent / "Research"
+    sys.path.insert(0, str(research_root / "src"))
+    try:
+        from analysis.phase8_ml import run_ml_comparison
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            results = await loop.run_in_executor(pool, run_ml_comparison)
+        if "error" in results:
+            return {"success": False, "error": results["error"]}
+        return {"success": True, "data": results}
+    except Exception as e:
+        logger.error(f"Research Phase 8 error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/research/phase8/data")
+async def get_research_phase8_data():
+    """Get Phase 8 ML comparison results for visualization."""
+    report_path = Path(__file__).parent.parent / "Research" / "reports" / "phase8_ml_comparison.json"
+    if not report_path.exists():
+        return {"error": "No Phase 8 data yet. Run Phase 8 first."}
+    try:
+        with open(report_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        return {"error": f"Failed to load Phase 8 data: {e}"}
+
+
+@app.post("/api/research/run/phase9")
+async def run_research_phase9():
+    """Trigger Phase 9 Walk-Forward Backtesting."""
+    import sys
+    import concurrent.futures
+    research_root = Path(__file__).parent.parent / "Research"
+    sys.path.insert(0, str(research_root / "src"))
+    try:
+        from analysis.phase9_walkforward import run_walkforward_backtest
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            results = await loop.run_in_executor(pool, run_walkforward_backtest)
+        if "error" in results:
+            return {"success": False, "error": results["error"]}
+        return {"success": True, "data": results}
+    except Exception as e:
+        logger.error(f"Research Phase 9 error: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/research/phase9/data")
+async def get_research_phase9_data():
+    """Get Phase 9 Walk-Forward Backtesting results for visualization."""
+    report_path = Path(__file__).parent.parent / "Research" / "reports" / "phase9_walkforward.json"
+    if not report_path.exists():
+        return {"error": "No Phase 9 data yet. Run Phase 9 first."}
+    try:
+        with open(report_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        return {"error": f"Failed to load Phase 9 data: {e}"}
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _send_telegram_direct(message: str, bot_token: str, chat_id: str):
+    """Send a Telegram message directly using HTTP POST, allowing custom API URL override."""
+    import os
+    import requests
+    
+    api_url = os.environ.get("TELEGRAM_API_URL", "https://api.telegram.org").strip().rstrip("/")
+    url = f"{api_url}/bot{bot_token}/sendMessage"
+    
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+    }
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    resp = requests.post(url, json=payload, headers=headers, timeout=10)
+    resp.raise_for_status()
+
+
+def _send_telegram_alert_wrapper(message: str, bot_token: str, chat_id: str):
+    """Sends a Telegram alert. Uses proxy direct path if TELEGRAM_API_URL is configured,
+    otherwise falls back to Tradehull's send_telegram_alert, with a final fallback
+    to direct HTTP POST.
+    """
+    import os
+    # 1. Check if a proxy is configured (e.g. on Hugging Face Spaces)
+    if os.environ.get("TELEGRAM_API_URL"):
+        try:
+            _send_telegram_direct(message, bot_token, chat_id)
+            return
+        except Exception as e:
+            logger.warning(f"Telegram direct send failed: {e}")
+        
+    # 2. Try the normal Tradehull connection (standard local desktop behavior)
+    try:
+        if broker.is_connected():
+            broker.get_tsl().send_telegram_alert(
+                message=message,
+                receiver_chat_id=chat_id,
+                bot_token=bot_token,
+            )
+            return
+    except Exception as e:
+        logger.warning(f"Tradehull telegram alert failed, trying direct HTTP fallback: {e}")
+        
+    # 3. Fallback to direct HTTP POST to api.telegram.org
+    _send_telegram_direct(message, bot_token, chat_id)
+
+
+def send_telegram_entry_alert(sig: dict, result: dict):
+    """Send a detailed styled Telegram message for entry orders matching the screenshot design."""
+    cfg = get_settings()
+    if not (cfg.telegram_bot_token and cfg.telegram_chat_id):
+        return
+        
+    direction = result["direction"]
+    symbol = result["symbol"]
+    qty = result["qty"]
+    trade_mode = cfg.trade_mode
+    instrument = cfg.instrument
+    
+    # Parse options strike from symbol, with fallback to sig-level override
+    from journal_manager import parse_option_symbol
+    strike, opt_type = parse_option_symbol(symbol)
+    
+    # Fallback: use explicit strike info from signal dict (e.g. from test alert or live order)
+    if not strike and sig.get("opt_strike"):
+        strike = sig["opt_strike"]
+        opt_type = sig.get("opt_type", "CE" if direction == "LONG" else "PE")
+    # Last fallback: infer option type from direction if symbol clearly is an option
+    if not opt_type and trade_mode == "OPTIONS":
+        opt_type = "CE" if direction == "LONG" else "PE"
+    
+    # Header tag matching screenshot format
+    scalp_type = "OPTIONS" if trade_mode == "OPTIONS" else "INDEX"
+    msg_type = "PAPER" if not cfg.auto_trade else "LIVE"
+    
+    # Option supplementary info
+    opt_premium = sig.get("opt_premium", 0.0)
+    opt_symbol  = sig.get("opt_symbol", symbol)
+    option_line = ""
+    if trade_mode == "OPTIONS":
+        prem_str = f" | Premium: Rs.{opt_premium:,.2f}" if opt_premium > 0 else ""
+        sym_display = opt_symbol or symbol
+        option_line = f"Option: {sym_display}{prem_str}\n"
+    strike_str = f"Strike: {strike} {opt_type}\n" if strike else ""
+
+    # Confidence score breakdown matching screenshot style
+    score_val = int(sig.get("weighted_score", 0.0) * 15)
+    score_str = f"Score: {score_val}/15"
+
+    # Score breakdown details
+    breakdown_parts = []
+    if sig.get("macro_bias"):
+        breakdown_parts.append(f"Macro Bias ({int(cfg.agent_weight_macro*100)}%): {sig['macro_bias']}")
+    if sig.get("structure_confidence") is not None:
+        breakdown_parts.append(f"Structure ({int(cfg.agent_weight_structure*100)}%): {int(sig['structure_confidence']*100)}%")
+    if sig.get("momentum_confidence") is not None:
+        breakdown_parts.append(f"Momentum ({int(cfg.agent_weight_momentum*100)}%): {int(sig['momentum_confidence']*100)}%")
+    if sig.get("trigger_quality") is not None:
+        breakdown_parts.append(f"Trigger Timing ({int(cfg.agent_weight_trigger*100)}%): {int(sig['trigger_quality']*100)}%")
+    if sig.get("volume_confirms") is not None:
+        breakdown_parts.append(f"Volume Confirm ({int(cfg.agent_weight_volume*100)}%): {'YES' if sig['volume_confirms'] else 'NO'}")
+    if sig.get("memory_win_rate") is not None:
+        breakdown_parts.append(f"Memory Win Rate ({int(cfg.agent_weight_memory*100)}%): {int(sig['memory_win_rate']*100)}%")
+
+    breakdown_str = "\n".join(f"• {p}" for p in breakdown_parts)
+
+    # Detailed reasons from agents
+    reasons_parts = []
+    if sig.get("reasons"):
+        reasons_parts = [f"• {r}" for r in sig["reasons"][:5]]
+    reasons_str = "\n".join(reasons_parts) if reasons_parts else "• No detailed reasons provided."
+
+    # Build Markdown message — index prices as main, option info as supplementary
+    msg = (
+        f"⚡📝 {msg_type} — {instrument} {direction} {scalp_type}\n"
+        f"Time: {datetime.now(_IST).strftime('%H:%M:%S')} IST | {score_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{strike_str}"
+        f"{option_line}"
+        f"Index Entry: Rs.{sig.get('entry', 0.0):,.2f} | Qty: {qty}\n"
+        f"SL: Rs.{sig.get('sl', 0.0):,.2f}\n"
+        f"Target 1: Rs.{sig.get('target1', 0.0):,.2f} (Breakeven Trail)\n"
+        f"Target 2: Rs.{sig.get('target2', 0.0):,.2f}\n\n"
+        f"📈 *Consensus Breakdown:*\n"
+        f"{breakdown_str}\n\n"
+        f"🤖 *Agent Reasons:*\n"
+        f"{reasons_str}\n\n"
+        f"• ML Prob: {int(sig.get('ml_prob', 0.0)*100)}% (Threshold: {cfg.ml_threshold:.2f})\n"
+        f"• Entry Slippage: Rs.{result.get('entry_slippage', 0.0):,.2f}"
+    )
+    
+    try:
+        _send_telegram_alert_wrapper(
+            message=msg,
+            bot_token=cfg.telegram_bot_token,
+            chat_id=cfg.telegram_chat_id,
+        )
+    except Exception as e:
+        logger.error(f"Telegram entry alert failed: {e}", exc_info=True)
+
+
+def send_telegram_exit_alert(pos, exit_price: float, reason: str, pnl: float, index_exit_price: float = 0.0):
+    """Send Telegram exit alert. index_exit_price is the INDEX level; exit_price may be option premium for PnL context."""
+    cfg = get_settings()
+    if not (cfg.telegram_bot_token and cfg.telegram_chat_id):
+        return
+
+    # Use index prices for display; option premium only for PnL% calculation
+    idx_entry = getattr(pos, 'index_entry_price', 0.0) or pos.entry_price
+    idx_exit  = index_exit_price if index_exit_price > 0 else exit_price
+
+    pnl_percent = (pnl / (pos.entry_price * pos.qty)) * 100 if pos.entry_price > 0 else 0.0
+    pnl_sign  = "+" if pnl >= 0 else ""
+    pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+    msg_type  = "PAPER" if not cfg.auto_trade else "LIVE"
+
+    # Option premium line (supplementary)
+    opt_prem_line = ""
+    if pos.trade_mode == "OPTIONS" and exit_price != idx_exit:
+        opt_prem_line = f"Option Premium: Entry Rs.{pos.entry_price:,.2f} -> Exit Rs.{exit_price:,.2f}\n"
+
+    tm = get_trade_manager()
+    today_gross = tm.day_stats.gross_pnl
+
+    msg = (
+        f"🚪 {pnl_emoji} {msg_type} — EXIT {pos.instrument} {pos.direction}\n"
+        f"Time: {datetime.now(_IST).strftime('%H:%M:%S')} IST\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Contract: `{pos.symbol}`\n"
+        f"Index: Entry Rs.{idx_entry:,.2f} -> Exit Rs.{idx_exit:,.2f}\n"
+        f"{opt_prem_line}"
+        f"Quantity: {pos.qty} | Reason: `{reason}`\n\n"
+        f"💰 *PnL Realized:*\n"
+        f"• Net Trade PnL: *{pnl_sign}Rs.{pnl:,.2f}* ({pnl_sign}{pnl_percent:.2f}%)\n"
+        f"• Today's Gross PnL: *Rs.{today_gross:,.2f}*\n"
+        f"• Entry Slippage: Rs.{getattr(pos, 'entry_slippage', 0.0):,.2f}\n"
+    )
+    
+    try:
+        _send_telegram_alert_wrapper(
+            message=msg,
+            bot_token=cfg.telegram_bot_token,
+            chat_id=cfg.telegram_chat_id,
+        )
+    except Exception as e:
+        logger.error(f"Telegram exit alert failed: {e}", exc_info=True)
+
+
+def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
+    """
+    Synchronize the TradeManager's active position with the broker's actual positions.
+    - If TradeManager has no position, but Dhan has an open position, we import it.
+    - If TradeManager has a live position (starts with DHAN_SYNC_, SIG_, or TEST_), but Dhan has no matching open position, we close it.
+    """
+    if not broker.is_connected():
+        return
+
+    try:
+        df = broker.get_positions()
+        
+        # Find open positions in Dhan (netQty != 0)
+        open_rows = []
+        if df is not None and not df.empty:
+            net_qty_col = None
+            for col in ['netQty', 'net_qty', 'netQtyValue']:
+                if col in df.columns:
+                    net_qty_col = col
+                    break
+            if net_qty_col:
+                df[net_qty_col] = pd.to_numeric(df[net_qty_col], errors='coerce').fillna(0)
+                open_rows = df[df[net_qty_col] != 0].to_dict(orient="records")
+
+        # 1. No position tracked locally, but Dhan has an open position -> Import it
+        if tm.position is None:
+            # Filter open rows to only those matching cfg.instrument
+            matching_rows = []
+            for row in open_rows:
+                sym = row.get('tradingSymbol', '')
+                inst = cfg.instrument
+                for possible_inst in ("BANKNIFTY", "NIFTY", "SENSEX", "CRUDEOIL"):
+                    if possible_inst in sym.upper():
+                        inst = possible_inst
+                        break
+                if inst == cfg.instrument:
+                    matching_rows.append(row)
+
+            if matching_rows:
+                row = matching_rows[0]
+                symbol = row['tradingSymbol']
+
+                # Skip re-import if this symbol was closed locally within the last 5 minutes
+                # (prevents re-import loop while Dhan still shows the position as open)
+                global _recently_closed_symbols
+                if symbol in _recently_closed_symbols:
+                    age_secs = (datetime.now(_IST) - _recently_closed_symbols[symbol]).total_seconds()
+                    if age_secs < 300:
+                        return
+                    else:
+                        del _recently_closed_symbols[symbol]
+
+                net_qty = int(row[net_qty_col])
+                qty = abs(net_qty)
+                entry_price = float(row.get('buyAvg', 0.0) or row.get('costPrice', 0.0) or 0.0)
+                if entry_price == 0.0:
+                    entry_price = float(row.get('sellAvg', 0.0) or 0.0)
+
+                is_option = any(term in symbol.upper() for term in ('-CE', '-PE', ' CALL', ' PUT'))
+                trade_mode = "OPTIONS" if is_option else "INDEX"
+
+                # For options: determine market direction from CE/PE, not raw net_qty sign
+                # (buying PE = bearish SHORT on underlying, even though net_qty is positive)
+                if is_option:
+                    direction = "LONG" if ('-CE' in symbol.upper() or 'CALL' in symbol.upper()) else "SHORT"
+                else:
+                    direction = "LONG" if net_qty > 0 else "SHORT"
+
+                # Resolve instrument
+                instrument = cfg.instrument
+                for inst in ("BANKNIFTY", "NIFTY", "SENSEX", "CRUDEOIL"):
+                    if inst in symbol.upper():
+                        instrument = inst
+                        break
+
+                # Compute SL/T1/T2 from index LTP + ATR at import time
+                index_ltp = broker.get_ltp(instrument) or entry_price
+                atr = _last_signal.get("atr_5m", index_ltp * 0.003) if _last_signal else index_ltp * 0.003
+                sl_mult  = cfg.atr_sl_mult
+                t1_mult  = cfg.atr_t1_mult
+                t2_mult  = cfg.atr_t2_mult
+                if direction == "LONG":
+                    sl_price  = round(index_ltp - atr * sl_mult, 2)
+                    t1_price  = round(index_ltp + atr * t1_mult, 2)
+                    t2_price  = round(index_ltp + atr * t2_mult, 2)
+                else:
+                    sl_price  = round(index_ltp + atr * sl_mult, 2)
+                    t1_price  = round(index_ltp - atr * t1_mult, 2)
+                    t2_price  = round(index_ltp - atr * t2_mult, 2)
+
+                pos = ActivePosition(
+                    instrument        = instrument,
+                    symbol            = symbol,
+                    exchange          = row.get('exchangeSegment', 'NSE_FNO'),
+                    direction         = direction,
+                    entry_price       = entry_price,
+                    sl                = sl_price,
+                    target1           = t1_price,
+                    target2           = t2_price,
+                    qty               = qty,
+                    order_id          = "DHAN_SYNC_" + symbol,
+                    entry_time        = datetime.now(_IST).isoformat(),
+                    trade_mode        = trade_mode,
+                    index_entry_price = index_ltp,
+                    highest_since_entry = index_ltp,
+                    lowest_since_entry = index_ltp,
+                    entry_atr         = atr,
+                    strategy          = "broker_sync",
+                )
+                tm.open_position(pos)
+                logger.info(f"Imported open position from Dhan: {direction} {symbol} qty={qty} SL={sl_price} T1={t1_price} T2={t2_price}")
+                
+        # 2. Position is tracked locally, but it's a live position and Dhan has no open position -> Close it
+        elif tm.position:
+            pos = tm.position
+            # Only sync live/Dhan positions (exclude paper trades)
+            if not pos.order_id.startswith("PAPER_"):
+                dhan_open = False
+                dhan_row = None
+                for row in open_rows:
+                    if row['tradingSymbol'] == pos.symbol:
+                        dhan_open = True
+                        dhan_row = row
+                        break
+                        
+                if not dhan_open:
+                    # Sync close — Dhan confirms position is gone, close locally
+                    realized_pnl = 0.0
+                    if df is not None and not df.empty:
+                        matched_rows = df[df['tradingSymbol'] == pos.symbol].to_dict(orient="records")
+                        if matched_rows:
+                            matched_row = matched_rows[0]
+                            realized_pnl = float(matched_row.get('realizedProfit', 0.0) or matched_row.get('realisedProfit', 0.0) or 0.0)
+
+                    # Save index LTP first (for journal/display), then override with option premium for PnL
+                    index_exit_ltp = broker.get_ltp(pos.instrument) or pos.index_entry_price or pos.entry_price
+                    exit_ltp = index_exit_ltp  # start with index; override for OPTIONS PnL
+                    if pos.trade_mode == "OPTIONS" and pos.symbol and not pos.symbol.endswith("INDEX"):
+                        try:
+                            fetched = broker.get_option_ltp(pos.symbol)
+                            if fetched > 0:
+                                exit_ltp = fetched  # option premium used for PnL calc
+                        except Exception:
+                            pass
+
+                    global _active_trade_signal, _exit_signal_logged_for_position, _exit_telegram_sent_for_position
+                    _recently_closed_symbols[pos.symbol] = datetime.now(_IST)
+                    _exit_signal_logged_for_position = ""
+                    _exit_telegram_sent_for_position = ""
+                    rec = tm.close_position(exit_ltp, "DHAN_SYNC_EXIT", pnl_override=realized_pnl)
+                    if cfg.strategy == "multi_agent" and rec.get("pnl", 0.0) <= 0.0:
+                        record_cooldown_loss(pos.direction)
+                    _active_trade_signal = {}
+
+                    # Log exit signal to history log (use current IST time as the dedup key here
+                    # since this is a broker-confirmed event, not a model signal)
+                    try:
+                        exit_sig = {
+                            "signal": "LONG_EXIT" if pos.direction == "LONG" else "SHORT_EXIT",
+                            "time": _format_ist_timestamp(latest_candle_ts),
+                            "entry": exit_ltp,
+                            "close": exit_ltp,
+                            "strategy": getattr(pos, "strategy", cfg.strategy),
+                            "reason": "DHAN_SYNC_EXIT",
+                            "reasons": ["Exit synchronized from Dhan broker portal"]
+                        }
+                        _add_signal_to_history(exit_sig, source="broker_sync")
+                        signal_journal_manager.close_entry(
+                            exit_sig, pos.instrument or cfg.instrument,
+                            "DHAN_SYNC_EXIT", index_price=index_exit_ltp
+                        )
+                    except Exception as ex_err:
+                        logger.error(f"Failed to log sync exit signal: {ex_err}")
+                    
+                    # Update Trading Journal (index_exit_ltp for display consistency)
+                    try:
+                        import pytz
+                        from journal_manager import close_journal_entry
+                        
+                        exit_time_dt = datetime.now(_IST)
+                        if latest_candle_ts:
+                            try:
+                                parsed = pd.to_datetime(latest_candle_ts)
+                                exit_time_dt = parsed.to_pydatetime()
+                                if exit_time_dt.tzinfo is None:
+                                    exit_time_dt = _IST.localize(exit_time_dt)
+                                else:
+                                    exit_time_dt = exit_time_dt.astimezone(_IST)
+                            except Exception:
+                                pass
+
+                        close_journal_entry(
+                            symbol=pos.symbol,
+                            exit_price=index_exit_ltp if index_exit_ltp > 0 else exit_ltp,
+                            exit_time=exit_time_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                            exit_reason="DHAN_SYNC_EXIT",
+                            pnl=realized_pnl,
+                            order_id=pos.order_id
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to close journal entry on sync exit: {e}")
+
+                    logger.info(f"Closed local position {pos.symbol} because it was exited on Dhan.")
+                else:
+                    # Update current P&L directly from Dhan's actual unrealized profit (very accurate!)
+                    unrealized_profit = float(dhan_row.get('unrealizedProfit', 0.0) or dhan_row.get('unrealisedProfit', 0.0) or 0.0)
+                    pos.current_pnl = unrealized_profit
+
+    except Exception as e:
+        logger.error(f"Error synchronizing Dhan positions: {e}", exc_info=True)
+
+
+def _build_alert_sig(sig: dict, cfg, symbol: str, direction: str) -> dict:
+    """Build alert signal dict. Index prices are kept as-is; option premium added as supplementary field."""
+    alert_sig = sig.copy()
+
+    if cfg.trade_mode == "OPTIONS":
+        # Fetch live option premium — stored as supplementary info, NOT replacing index prices
+        opt_premium = 0.0
+        if broker.is_connected() and symbol:
+            try:
+                opt_premium = broker.get_option_ltp(symbol)
+            except Exception as e:
+                logger.warning(f"Could not fetch option LTP for alert: {e}")
+
+        if opt_premium > 0:
+            alert_sig["opt_premium"] = opt_premium
+
+        alert_sig["opt_symbol"] = symbol
+
+        from journal_manager import parse_option_symbol
+        strike, opt_type = parse_option_symbol(symbol)
+        alert_sig["opt_strike"] = strike
+        alert_sig["opt_type"] = opt_type
+        # Index prices (entry/sl/target1/target2) remain unchanged — they are the index levels
+
+    return alert_sig
+
+def _check_data_staleness(frames: dict, cfg) -> None:
+    """Check if candle data is stale and update health state."""
+    global _data_health_state
+    import pytz
+    now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+    _data_health_state["last_check_time"] = now_ist.isoformat()
+
+    # Bypassed if threshold is <= 0 (e.g. for testing outside of market hours)
+    if cfg.data_stale_threshold_min <= 0:
+        _data_health_state["is_stale"] = False
+        _data_health_state["broker_failures"] = 0
+        return
+
+    if not frames:
+        _data_health_state["broker_failures"] += 1
+        if _data_health_state["broker_failures"] >= 3:
+            if not _data_health_state["is_stale"]:
+                logger.error("DATA STALE: No frames returned for 3+ consecutive polls")
+                _data_health_state["is_stale"] = True
+                try:
+                    _send_telegram_alert_wrapper(
+                        "\u26a0\ufe0f DATA STALE: No market data received for 3+ polls. Trading paused.",
+                        cfg.telegram_bot_token, cfg.telegram_chat_id
+                    )
+                except Exception:
+                    pass
+        return
+
+    # Reset broker failure count on successful fetch
+    _data_health_state["broker_failures"] = 0
+
+    # Check the 5-min candle (primary trading timeframe)
+    df_5 = frames.get("5")
+    if df_5 is not None and len(df_5) > 0:
+        last_ts = df_5["timestamp"].iloc[-1]
+        if hasattr(last_ts, "tzinfo") and last_ts.tzinfo is not None:
+            last_candle_ist = last_ts.astimezone(pytz.timezone("Asia/Kolkata"))
+        else:
+            # The last candle timestamp is already naive IST
+            last_candle_ist = pytz.timezone("Asia/Kolkata").localize(
+                pd.Timestamp(last_ts).to_pydatetime()
+            )
+        staleness_sec = (now_ist - last_candle_ist).total_seconds()
+        threshold_sec = cfg.data_stale_threshold_min * 60
+
+        _data_health_state["last_candle_time"] = last_candle_ist.isoformat()
+        _data_health_state["staleness_seconds"] = int(staleness_sec)
+
+        was_stale = _data_health_state["is_stale"]
+        if staleness_sec > threshold_sec:
+            _data_health_state["is_stale"] = True
+            if not was_stale:
+                logger.warning(
+                    f"DATA STALE: Last 5min candle is {staleness_sec/60:.1f} min old "
+                    f"(threshold: {cfg.data_stale_threshold_min} min). "
+                    "To disable this check for off-hours testing, set data_stale_threshold_min to 0 in settings."
+                )
+                try:
+                    _send_telegram_alert_wrapper(
+                        f"\u26a0\ufe0f DATA STALE: Last candle {staleness_sec/60:.1f} min old. Check broker connection.",
+                        cfg.telegram_bot_token, cfg.telegram_chat_id
+                    )
+                except Exception:
+                    pass
+        else:
+            _data_health_state["is_stale"] = False
+            if was_stale:
+                logger.info("Data freshness restored")
+
+
+def _fetch_all_frames(instrument: str) -> dict:
+    """Fetch all timeframes needed for the strategy."""
+    import time
+    import pytz
+    kolkata_tz = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(kolkata_tz)
+    today = (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    frames = {}
+    specs = [
+        ("1D", 1000), ("60", 120), ("15", 60), ("5", 30), ("1", 5)
+    ]
+    for tf_key, days in specs:
+        tf_dhan = "DAY" if tf_key == "1D" else tf_key
+        from_d  = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
+        df = broker.get_historical_data(instrument, tf_dhan, from_d, today)
+        if df is not None and len(df) >= 30:
+            frames[tf_key] = df
+        time.sleep(2.5)  # Throttling to avoid Dhan rate limit (DH-904)
+    return frames
+
+
+def _fetch_frames_range(instrument: str, from_date: str, to_date: str) -> dict:
+    """Fetch multi-TF data for backtest date range."""
+    import time
+    from datetime import datetime, timedelta
+    frames = {}
+    
+    # Add 1 day to to_date because Dhan's historical API is exclusive of the end date
+    try:
+        to_dt = datetime.strptime(to_date, "%Y-%m-%d")
+        to_date_inclusive = (to_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    except Exception:
+        to_date_inclusive = to_date
+
+    # Calculate daily warm-up date (1000 calendar days before from_date) to ensure
+    # weekly resampled indicators (like MACD, ADX, rolling swing high/low) have enough data to calculate correctly.
+    try:
+        from_dt = datetime.strptime(from_date, "%Y-%m-%d")
+        daily_from_date = (from_dt - timedelta(days=1000)).strftime("%Y-%m-%d")
+    except Exception:
+        daily_from_date = from_date
+
+    for tf_key, tf_dhan in [("1D","DAY"),("60","60"),("15","15"),("5","5"),("1","1")]:
+        query_from = daily_from_date if tf_key == "1D" else from_date
+        logger.info(f"[Backtest] Fetching {tf_key} data: {query_from} -> {to_date_inclusive}")
+        df = broker.get_historical_data(instrument, tf_dhan, query_from, to_date_inclusive)
+        if df is not None and len(df) >= 30:
+            frames[tf_key] = df
+            logger.info(f"[Backtest] {tf_key}: {len(df)} rows, {df['timestamp'].min()} -> {df['timestamp'].max()}")
+        else:
+            logger.warning(f"[Backtest] {tf_key}: got {len(df) if df is not None else 0} rows (skipped)")
+        time.sleep(2.5)  # Throttling to avoid Dhan rate limit (DH-904)
+    return frames
+
+
+def _sync_broker_sl(pos, cfg):
+    """Update the Stop Loss order trigger price on Dhan when a trailing event occurs."""
+    if cfg.auto_trade and broker.is_connected() and getattr(pos, "sl_order_id", None):
+        try:
+            if pos.trade_mode == "OPTIONS":
+                new_sl_trigger = broker.calculate_option_sl_price(
+                    pos.direction, pos.entry_price, pos.index_entry_price, pos.sl, pos.symbol
+                )
+            else:
+                new_sl_trigger = pos.sl
+            broker.modify_broker_sl(pos.sl_order_id, pos.qty, new_sl_trigger)
+        except Exception as err:
+            logger.error(f"Failed to modify broker-side Stop Loss for {pos.symbol}: {err}")
+
+
+def _execute_order(sig: dict, cfg, direction: str) -> dict:
+    """Execute an order (live or paper depending on auto_trade setting) based on signal levels."""
+    tm = get_trade_manager()
+    meta = INSTRUMENT_META[cfg.instrument]
+    
+    if cfg.auto_trade:
+        # Live order execution via Dhan
+        result = broker.place_entry_order(
+            instrument    = cfg.instrument,
+            direction     = direction,
+            trade_mode    = cfg.trade_mode,
+            expiry        = cfg.index_expiry if cfg.trade_mode=="INDEX" else cfg.options_expiry,
+            strike_type   = cfg.strike_type,
+            strike_offset = cfg.strike_offset,
+            lot_multiplier= cfg.lot_multiplier,
+            sl_price      = sig.get("sl", 0),
+            t1_price      = sig.get("target1", 0),
+            t2_price      = sig.get("target2", 0),
+        )
+    else:
+        # Paper order simulation
+        lot_size = broker.get_lot_size(cfg.instrument) if broker.is_connected() else INSTRUMENT_META.get(cfg.instrument, {}).get("lot_size", 15)
+        qty = lot_size * cfg.lot_multiplier
+        
+        # Resolve symbol name for option/index
+        symbol = ""
+        exchange = ""
+        if cfg.trade_mode == "OPTIONS" and broker.is_connected():
+            try:
+                opt_symbol, opt_strike = broker.get_option_symbol(
+                    cfg.instrument, direction, cfg.options_expiry, cfg.strike_type, cfg.strike_offset
+                )
+                symbol = opt_symbol
+                exchange = meta["exchange_opt"]
+            except Exception:
+                pass
+        
+        if not symbol:
+            if cfg.trade_mode == "OPTIONS":
+                symbol = f"{cfg.instrument} OPTION"
+                exchange = meta["exchange_opt"]
+            else:
+                symbol = f"{cfg.instrument} INDEX"
+                exchange = "INDEX"
+                
+        # Resolve simulated entry price (current LTP of index/option)
+        entry_price = 0.0
+        if cfg.trade_mode == "OPTIONS" and broker.is_connected() and symbol:
+            try:
+                entry_price = broker.get_option_ltp(symbol)
+            except Exception as e:
+                logger.warning(f"Could not fetch option LTP for paper entry: {e}")
+        
+        if entry_price == 0.0:
+            entry_price = sig.get("entry", 0.0)
+        if entry_price == 0.0:
+            entry_price = broker.get_ltp(cfg.instrument) or 0.0
+            
+        # For OPTIONS: convert index-level SL/T1/T2 from the signal into option-premium levels.
+        # The polling loop compares INDEX LTP vs pos.sl/target1/target2 for hit detection,
+        # so we store index levels for INDEX mode; for OPTIONS we store index levels too
+        # (allows identical hit-detection code), but use option LTP for P&L at close time.
+        # SL/T1/T2 displayed in UI will be index levels which tell the user WHERE the
+        # underlying needs to reach — useful context for manual traders.
+        result = {
+            "success": True,
+            "order_id": "PAPER_" + datetime.now(_IST).strftime("%H%M%S"),
+            "symbol": symbol,
+            "exchange": exchange,
+            "direction": direction,
+            "qty": qty,
+            "sl": sig.get("sl", 0),
+            "t1": sig.get("target1", 0),
+            "t2": sig.get("target2", 0),
+            "entry_price": entry_price,
+        }
+
+    if result.get("success"):
+        # Use simulated entry price if present
+        entry_price = result.get("entry_price", sig.get("entry", 0))
+        # Index-level entry price from strategy signal — used for display/journal
+        index_entry_price = sig.get("entry", 0.0)
+
+        pos = ActivePosition(
+            instrument        = cfg.instrument,
+            symbol            = result["symbol"],
+            exchange          = result["exchange"],
+            direction         = direction,
+            entry_price       = entry_price,
+            sl                = result["sl"],
+            target1           = result["t1"],
+            target2           = result["t2"],
+            qty               = result["qty"],
+            order_id          = result["order_id"],
+            entry_time        = datetime.now(_IST).isoformat(),
+            trade_mode        = cfg.trade_mode,
+            index_entry_price = index_entry_price,
+            highest_since_entry = index_entry_price if index_entry_price else entry_price,
+            lowest_since_entry = index_entry_price if index_entry_price else entry_price,
+            expected_entry_price = result.get("expected_price", index_entry_price),
+            entry_slippage = result.get("entry_slippage", 0.0),
+            entry_atr      = sig.get("atr_5m", 0.0),
+            strategy       = sig.get("strategy", cfg.strategy),
+        )
+
+
+        if cfg.auto_trade and broker.is_connected() and not result["order_id"].startswith("PAPER_"):
+            try:
+                if cfg.trade_mode == "OPTIONS":
+                    initial_sl_trigger = broker.calculate_option_sl_price(
+                        direction, entry_price, index_entry_price, result["sl"], result["symbol"]
+                    )
+                else:
+                    initial_sl_trigger = result["sl"]
+                sl_order_id = broker.place_broker_sl(
+                    symbol=result["symbol"],
+                    exchange=result["exchange"],
+                    direction=direction,
+                    quantity=result["qty"],
+                    trigger_price=initial_sl_trigger
+                )
+                pos.sl_order_id = sl_order_id
+            except Exception as sl_err:
+                logger.error(f"Failed to place broker-side Stop Loss: {sl_err}")
+
+        tm.open_position(pos)
+
+        # Log entry fill slippage
+        slippage_tracker.log_entry_fill(
+            symbol=result["symbol"],
+            direction=direction,
+            expected_price=result.get("expected_price", sig.get("entry", 0)),
+            actual_price=entry_price,
+            qty=result["qty"],
+            order_id=result["order_id"],
+            trade_mode=cfg.trade_mode,
+            instrument=cfg.instrument,
+        )
+
+        # Persist the entry signal so the UI can show SL/T1/T2 while in trade
+        global _active_trade_signal
+        _active_trade_signal = {**sig, "recorded_at": datetime.now(_IST).isoformat()}
+
+        # Log entry signal to chart history
+        _add_signal_to_history(sig)
+
+        # Log to signal journal (tracks strategy P&L independently of Dhan trades)
+        try:
+            lot_size = INSTRUMENT_META.get(cfg.instrument, {}).get("lot_size", 1)
+            signal_journal_manager.open_entry(sig, cfg.instrument, lot_size)
+        except Exception as _sj_err:
+            logger.error(f"Signal journal open failed: {_sj_err}")
+
+        # Add to Trading Journal (only for real broker trades, not paper trades)
+        if not result["order_id"].startswith("PAPER_"):
+            try:
+                from journal_manager import add_journal_entry
+                add_journal_entry(pos, sig)
+            except Exception as e:
+                logger.error(f"Failed to record journal entry: {e}")
+
+        # Send Telegram alert
+        try:
+            alert_sig = _build_alert_sig(sig, cfg, result["symbol"], direction)
+            send_telegram_entry_alert(alert_sig, result)
+        except Exception as e:
+            logger.warning(f"Telegram alert failed: {e}")
+
+    return result
