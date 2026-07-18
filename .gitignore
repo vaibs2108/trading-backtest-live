@@ -27,8 +27,8 @@ training/
 pinescript/
 *.pine
 *.md
-!README.md       # Keep README.md
-!DEPLOY*.md      # Optional: Keep if you need deployment docs
+!README.md
+!DEPLOY*.md
 
 # ── Exclude Diagnostic/Optimization Scripts ───────────────────────────────────
 backtest_optimization.py
