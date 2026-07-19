@@ -11,7 +11,7 @@ RUN npm run build
 # ── Stage 2: Python Backend ───────────────────────────────────────────────────
 FROM python:3.12-slim
 
-# System dependencies for numpy, scikit-learn, faiss-cpu, and process management
+# System dependencies for numpy and process management
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libgomp1 curl && \
     rm -rf /var/lib/apt/lists/*
@@ -41,9 +41,8 @@ RUN useradd --create-home --shell /bin/bash appuser && \
 USER appuser
 
 # ── Port configuration ──────────────────────────────────────────────────────
-# Default: 7860 for Hugging Face Spaces / Docker deployments
-# Override with: docker run -e PORT=8000 ...
-ENV PORT=7860
+# Default: 8000 for DigitalOcean / Docker deployments
+ENV PORT=8000
 EXPOSE ${PORT}
 
 # ── Healthcheck ──────────────────────────────────────────────────────────────

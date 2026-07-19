@@ -32,6 +32,16 @@ function useTheme() {
   return { theme, setTheme, toggle }
 }
 
+function useIsMobile(breakpoint = 768) {
+  const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth < breakpoint)
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth < breakpoint)
+    window.addEventListener('resize', handler)
+    return () => window.removeEventListener('resize', handler)
+  }, [breakpoint])
+  return isMobile
+}
+
 // chart-aware colors (lightweight-charts needs hex)
 const chartColors = (theme) => theme === 'dark' ? {
   bg: '#111525', text: '#636882', grid: '#1e2235',
@@ -111,7 +121,7 @@ function MetricBox({ label, value, color, sub }) {
 }
 
 // ── Sidebar ──────────────────────────────────────────────────────────────────
-function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, connected, collapsed, setCollapsed }) {
+function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, connected, collapsed, setCollapsed, isMobile, mobileOpen, setMobileOpen }) {
   const navItems = [
     { id:'dashboard',    icon:<LayoutDashboard size={18}/>, label:'Dashboard' },
     { id:'market_ctx',   icon:<Globe size={18}/>,           label:'Market Context' },
@@ -127,11 +137,16 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
   const sideW = collapsed ? 64 : 240
 
   return (
+    <>
+    {isMobile && mobileOpen && <div onClick={() => setMobileOpen(false)} style={{
+      position:'fixed', inset:0, background:'rgba(0,0,0,0.5)', zIndex:19,
+    }} />}
     <div style={{
-      width: sideW, minHeight:'100vh', background: V('sidebar-bg'),
+      width: isMobile ? 260 : sideW, minHeight:'100vh', background: V('sidebar-bg'),
       borderRight:`1px solid ${V('sidebar-border')}`, display:'flex', flexDirection:'column',
-      position:'fixed', left:0, top:0, zIndex:20, transition:'width 0.25s ease',
+      position:'fixed', left:0, top:0, zIndex:20, transition: isMobile ? 'transform 0.3s ease' : 'width 0.25s ease',
       overflow:'hidden',
+      transform: isMobile ? (mobileOpen ? 'translateX(0)' : 'translateX(-100%)') : 'none',
     }}>
       {/* Brand */}
       <div style={{
@@ -146,7 +161,7 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
         }}>
           <Zap size={16} color="#fff" />
         </div>
-        {!collapsed && <div>
+        {(!collapsed || isMobile) && <div>
           <div style={{ color:'#fff', fontWeight:800, fontSize:15, lineHeight:1.2 }}>AlgoTrader</div>
           <div style={{ color: V('sidebar-text'), fontSize:10, fontWeight:500 }}>Pro Platform</div>
         </div>}
@@ -157,7 +172,7 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
         {navItems.map(item => {
           const active = tab === item.id
           return (
-            <button key={item.id} onClick={() => setTab(item.id)} title={collapsed ? item.label : undefined} style={{
+            <button key={item.id} onClick={() => { setTab(item.id); if (isMobile) setMobileOpen(false) }} title={collapsed ? item.label : undefined} style={{
               display:'flex', alignItems:'center', gap:12,
               padding: collapsed ? '10px 0' : '10px 14px',
               justifyContent: collapsed ? 'center' : 'flex-start',
@@ -171,7 +186,7 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
             onMouseLeave={e => { if(!active) e.currentTarget.style.background = 'transparent' }}
             >
               {item.icon}
-              {!collapsed && <span>{item.label}</span>}
+              {(!collapsed || isMobile) && <span>{item.label}</span>}
             </button>
           )
         })}
@@ -188,7 +203,7 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
           color: connected ? V('green') : V('red'), cursor:'pointer', fontSize:12, width:'100%',
         }}>
           {connected ? <Wifi size={16}/> : <WifiOff size={16}/>}
-          {!collapsed && <span style={{fontWeight:500}}>{connected ? 'Connected' : 'Disconnected'}</span>}
+          {(!collapsed || isMobile) && <span style={{fontWeight:500}}>{connected ? 'Connected' : 'Disconnected'}</span>}
         </button>
 
         {/* Settings */}
@@ -199,7 +214,7 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
           background:'transparent', color:V('sidebar-text'), border:'none',
           borderRadius: V('radius-sm'), cursor:'pointer', fontSize:13, width:'100%',
         }}>
-          <Settings size={16}/> {!collapsed && <span>Settings</span>}
+          <Settings size={16}/> {(!collapsed || isMobile) && <span>Settings</span>}
         </button>
 
         {/* Theme toggle */}
@@ -211,18 +226,43 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
           borderRadius: V('radius-sm'), cursor:'pointer', fontSize:13, width:'100%',
         }}>
           {theme === 'dark' ? <Sun size={16}/> : <Moon size={16}/>}
-          {!collapsed && <span>{theme === 'dark' ? 'Light Mode' : 'Dark Mode'}</span>}
+          {(!collapsed || isMobile) && <span>{theme === 'dark' ? 'Light Mode' : 'Dark Mode'}</span>}
         </button>
 
         {/* Collapse toggle */}
-        <button onClick={() => setCollapsed(!collapsed)} style={{
+        {!isMobile && <button onClick={() => setCollapsed(!collapsed)} style={{
           display:'flex', alignItems:'center', justifyContent:'center',
           padding:'8px 0', background:'transparent', color:V('sidebar-text'),
           border:'none', borderRadius: V('radius-sm'), cursor:'pointer', width:'100%',
         }}>
           {collapsed ? <ChevronRight size={16}/> : <ChevronLeft size={16}/>}
-        </button>
+        </button>}
       </div>
+    </div>
+    </>
+  )
+}
+
+function MobileTopBar({ onMenuClick, title }) {
+  return (
+    <div style={{
+      position:'fixed', top:0, left:0, right:0, height:52, zIndex:30,
+      background: V('sidebar-bg'), borderBottom:`1px solid ${V('sidebar-border')}`,
+      display:'flex', alignItems:'center', padding:'0 16px', gap:12,
+    }}>
+      <button onClick={onMenuClick} style={{
+        background:'none', border:'none', color:'#fff', cursor:'pointer', padding:4,
+      }}>
+        <Menu size={22}/>
+      </button>
+      <div style={{
+        width:28, height:28, borderRadius:6,
+        background:'linear-gradient(135deg, #4f6ef7, #8b5cf6)',
+        display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0,
+      }}>
+        <Zap size={14} color="#fff" />
+      </div>
+      <div style={{ color:'#fff', fontWeight:700, fontSize:14 }}>AlgoTrader</div>
     </div>
   )
 }
@@ -340,7 +380,7 @@ function LiveChart({ instrument, timeframe, signals, strategy, refreshChart, the
       rightPriceScale: { borderColor: cc.grid },
       timeScale:   { borderColor: cc.grid, timeVisible: true, secondsVisible: false },
       width:  chartRef.current.offsetWidth,
-      height: 520,
+      height: window.innerWidth < 768 ? 320 : 520,
     })
     candleSer.current = chart.addCandlestickSeries({
       upColor: cc.up, downColor: cc.down,
@@ -386,6 +426,7 @@ function LiveChart({ instrument, timeframe, signals, strategy, refreshChart, the
 
 // ── Signal Panel (Regime-aware) ─────────────────────────────────────────────
 function SignalPanel({ signal, onManualTrade, position, connected, ltp, lastEntry }) {
+  const m = window.innerWidth < 768
   if (!signal || !signal.signal) return null
   const sig = signal.signal
   const isEntry = sig === 'LONG' || sig === 'SHORT'
@@ -425,7 +466,7 @@ function SignalPanel({ signal, onManualTrade, position, connected, ltp, lastEntr
         const d = showActiveEntry ? (lastEntry || {}) : signal
         const labelPrefix = (sig === 'HOLD' && signal.entry > 0) ? 'Possible ' : ''
         return (
-        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8, marginTop:12 }}>
+        <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1fr', gap:8, marginTop:12 }}>
           {showActiveEntry && <div style={{ gridColumn:'1/-1', color:V('text-muted'), fontSize:9, textTransform:'uppercase', fontWeight:500 }}>Active {lastEntry.signal} entry:</div>}
           {(sig === 'HOLD' && signal.entry > 0) && <div style={{ gridColumn:'1/-1', color:V('text-muted'), fontSize:9, textTransform:'uppercase', fontWeight:500 }}>Candidate Setup:</div>}
           <div style={{ background:V('bg-tertiary'), borderRadius:V('radius-sm'), padding:'8px 12px' }}>
@@ -488,6 +529,7 @@ function SignalPanel({ signal, onManualTrade, position, connected, ltp, lastEntr
 
 // ── Compact Signal Panel ────────────────────────────────────────────────────
 function CompactSignalPanel({ signal, strategyLabel, ltp, lastEntry }) {
+  const m = window.innerWidth < 768
   if (!signal || !signal.signal) return null
   const sig = signal.signal
   const isRegime = signal.strategy === 'regime_trend_range'
@@ -531,7 +573,7 @@ function CompactSignalPanel({ signal, strategyLabel, ltp, lastEntry }) {
         const d = showActiveEntry ? lastEntry : signal
         const labelPrefix = (sig === 'HOLD' && signal.entry > 0) ? 'Possible ' : ''
         return (
-        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:6, marginTop:10 }}>
+        <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1fr', gap:6, marginTop:10 }}>
           {showActiveEntry && <div style={{ gridColumn:'1/-1', color:V('text-muted'), fontSize:9, textTransform:'uppercase' }}>Active {lastEntry.signal} entry:</div>}
           {(sig === 'HOLD' && signal.entry > 0) && <div style={{ gridColumn:'1/-1', color:V('text-muted'), fontSize:9, textTransform:'uppercase' }}>Candidate Setup:</div>}
           <div style={{ background:V('bg-tertiary'), borderRadius:V('radius-sm'), padding:'6px 10px' }}>
@@ -590,6 +632,7 @@ function CompactSignalPanel({ signal, strategyLabel, ltp, lastEntry }) {
 
 // ── Position Panel ──────────────────────────────────────────────────────────
 function PositionPanel({ state }) {
+  const m = window.innerWidth < 768
   if (!state?.position) return (
     <Card>
       <div style={{ color:V('text-muted'), textAlign:'center', padding:'20px 0', fontSize:13 }}>No open position</div>
@@ -606,7 +649,7 @@ function PositionPanel({ state }) {
         </div>
         <div style={{ color:pnlColor, fontWeight:700, fontFamily:"'JetBrains Mono', monospace", fontSize:16 }}>{fmtPnl(p.current_pnl)}</div>
       </div>
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:6 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(3,1fr)', gap:6 }}>
         {[['Entry', p.entry_price, V('text-primary')], ['SL', p.sl, V('red')], ['T1', p.target1, V('green')], ['T2', p.target2, V('cyan')], ['Qty', p.qty, V('text-primary')], ['Mode', p.trade_mode, V('purple')]].map(([l,v,c])=>(
           <div key={l} style={{ background:V('bg-tertiary'), borderRadius:V('radius-sm'), padding:'6px 10px' }}>
             <div style={{ color:V('text-muted'), fontSize:9, textTransform:'uppercase' }}>{l}</div>
@@ -694,10 +737,11 @@ function DhanTradePanel({ position, tradeSignal, onExit, ltp, instrument }) {
 
 // ── Day Stats ───────────────────────────────────────────────────────────────
 function DayStats({ state, balance, livePnl, todayPnl, lotSize }) {
+  const m = window.innerWidth < 768
   const d = state?.day_stats
   const displayPnl = todayPnl != null && todayPnl !== 0 ? todayPnl : d?.gross_pnl
   return (
-    <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10 }}>
+    <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
       <MetricBox label="Balance" value={`₹${fmt(balance)}`} color={V('accent')} />
       <MetricBox label="Live P&L" value={fmtPnl(livePnl)} color={clr(livePnl)} />
       <MetricBox label="Today's P&L" value={fmtPnl(displayPnl)} color={clr(displayPnl)} sub={`${d?.total_trades||0} trades`} />
@@ -889,6 +933,7 @@ function SettingsPanel({ onSaved }) {
 
 // ── Backtest Panel ──────────────────────────────────────────────────────────
 function BacktestPanel({ connected }) {
+  const m = window.innerWidth < 768
   const [form, setForm] = useState({ instrument:'BANKNIFTY', from_date:'', to_date:'', initial_capital:500000, lot_multiplier:1, strategy:'multi_agent' })
   const [result, setResult] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -961,7 +1006,7 @@ function BacktestPanel({ connected }) {
       {result?.stats && (
         <Card>
           <div style={{ color:V('text-primary'), fontWeight:700, marginBottom:14, fontSize:15 }}>Backtest Results</div>
-          <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8, marginBottom:14 }}>
+          <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:8, marginBottom:14 }}>
             <MetricBox label="Total Trades" value={result.stats.total_trades} />
             <MetricBox label="Win Rate" value={`${result.stats.win_rate_pct}%`} color={V('green')} />
             <MetricBox label="Profit Factor" value={result.stats.profit_factor} color={result.stats.profit_factor>1?V('green'):V('red')} />
@@ -1082,6 +1127,7 @@ function ConnectModal({ onClose, onConnected }) {
 
 // ── Signal Journal Panel ────────────────────────────────────────────────────
 function SignalJournalPanel({ entries, onRefresh }) {
+  const m = window.innerWidth < 768
   const [strategyFilter, setStrategyFilter] = React.useState('ALL')
   const [instrumentFilter, setInstrumentFilter] = React.useState('ALL')
   const [fromDate, setFromDate] = React.useState(() => {
@@ -1149,7 +1195,7 @@ function SignalJournalPanel({ entries, onRefresh }) {
 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:8 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(5,1fr)', gap:8 }}>
         <MetricBox label="Total Signals" value={filteredEntries.length} color={V('accent')} />
         <MetricBox label="Win Rate" value={`${winRate}%`} color={V('green')} sub={`${wins}W / ${losses}L`} />
         <MetricBox label="Total P&L (pts)" value={totalPts >= 0 ? `+${totalPts.toFixed(0)}` : totalPts.toFixed(0)} color={clr(totalPts)} />
@@ -1302,6 +1348,7 @@ function SignalJournalPanel({ entries, onRefresh }) {
 
 // ── Trading Journal Panel ───────────────────────────────────────────────────
 function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, onToDateChange }) {
+  const m = window.innerWidth < 768
   const [selectedTrade, setSelectedTrade] = useState(null)
   const closedTrades = journal.filter(t => t.status === 'CLOSED')
   const totalTrades = closedTrades.length
@@ -1315,7 +1362,7 @@ function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, 
 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:8 }}>
         <MetricBox label="Journal Trades" value={totalTrades} sub={`Wins: ${wins} | Losses: ${losses}`} />
         <MetricBox label="Win Rate" value={`${winRate.toFixed(1)}%`} color={winRate >= 50 ? V('green') : V('yellow')} />
         <MetricBox label="Profit Factor" value={profitFactor.toFixed(2)} color={profitFactor >= 1.0 ? V('green') : V('red')} />
@@ -1827,6 +1874,7 @@ function Phase3Detail({ actionLoading, setActionLoading, fetchAll }) {
 
 // ── Phase 4 Detail Component ────────────────────────────────────────────────
 function Phase4Detail({ actionLoading, setActionLoading, fetchAll }) {
+  const m = window.innerWidth < 768
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -1891,7 +1939,7 @@ function Phase4Detail({ actionLoading, setActionLoading, fetchAll }) {
       {data && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 8 }}>
           {/* Theoretical Bounds */}
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1fr', gap: 8 }}>
             <MetricBox label="Noise Cutoff (λ+)" value={data.lambda_plus} color={V('red')} />
             <MetricBox label="Noise Floor (λ-)" value={data.lambda_minus} color={V('green')} />
             <MetricBox label="Significant Factors" value={data.retained_factors} color={V('cyan')} />
@@ -2265,6 +2313,7 @@ function Phase6Detail({ actionLoading, setActionLoading, fetchAll }) {
 
 // ── Phase 7 Detail Component ────────────────────────────────────────────────
 function Phase7Detail({ actionLoading, setActionLoading, fetchAll }) {
+  const m = window.innerWidth < 768
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -2329,7 +2378,7 @@ function Phase7Detail({ actionLoading, setActionLoading, fetchAll }) {
       {data && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 8 }}>
           {/* Data Set Sizes Grid */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: m ? '1fr' : 'repeat(3, 1fr)', gap: 8 }}>
             <div style={{ background: V('bg-primary'), padding: '6px 10px', borderRadius: V('radius-sm'), border: `1px solid ${V('border-light')}` }}>
               <div style={{ fontSize: 9, color: V('text-muted') }}>TRAINING SPLIT ROWS</div>
               <div style={{ fontSize: 13, fontWeight: 700, color: V('text-primary'), marginTop: 2, fontFamily: "'JetBrains Mono', monospace" }}>{data.train_rows?.toLocaleString() || 0}</div>
@@ -2836,6 +2885,7 @@ function Phase9Detail({ actionLoading, setActionLoading, fetchAll }) {
 
 // ── Research Pipeline Panel ─────────────────────────────────────────────────
 function ResearchPanel() {
+  const m = window.innerWidth < 768
   const [pipelineStatus, setPipelineStatus] = useState(null)
   const [pullProgress, setPullProgress] = useState(null)
   const [inventory, setInventory] = useState(null)
@@ -3228,7 +3278,7 @@ function ResearchPanel() {
             )}
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1fr', gap: 10, marginBottom: 12 }}>
             <MetricBox label="Files Analyzed" value={qualityReport.summary?.total_files || 0} />
             <MetricBox label="Total Rows" value={(qualityReport.summary?.total_rows || 0).toLocaleString()} />
             <MetricBox
@@ -3380,6 +3430,7 @@ function ResearchPanel() {
 // ── Performance Analytics Panel ─────────────────────────────────────────────
 
 function PerformancePanel({ theme }) {
+  const m = window.innerWidth < 768
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
 
@@ -3442,19 +3493,19 @@ function PerformancePanel({ theme }) {
         <SystemHealthCard />
       </div>
 
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:8 }}>
         <MetricBox label="Total Trades" value={s.total_trades} sub={`W:${s.wins} | L:${s.losses}`} />
         <MetricBox label="Win Rate" value={`${s.win_rate}%`} color={s.win_rate >= 50 ? V('green') : V('yellow')} />
         <MetricBox label="Profit Factor" value={s.profit_factor} color={s.profit_factor >= 1.0 ? V('green') : V('red')} />
         <MetricBox label="Net PnL" value={fmtPnl(s.net_pnl)} color={clr(s.net_pnl)} />
       </div>
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:8 }}>
         <MetricBox label="Avg Win" value={fmtPnl(s.avg_win)} color={V('green')} />
         <MetricBox label="Avg Loss" value={fmtPnl(s.avg_loss)} color={V('red')} />
         <MetricBox label="Sharpe Ratio" value={s.sharpe_ratio} color={s.sharpe_ratio >= 1 ? V('green') : s.sharpe_ratio >= 0 ? V('yellow') : V('red')} />
         <MetricBox label="Max Drawdown" value={fmtPnl(-s.max_drawdown)} color={V('red')} sub={`${s.max_drawdown_pct}% of capital`} />
       </div>
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:8 }}>
         <MetricBox label="Expectancy" value={fmtPnl(s.expectancy)} color={clr(s.expectancy)} sub="per trade" />
         <MetricBox label="Consec Wins" value={s.max_consec_wins} color={V('green')} />
         <MetricBox label="Consec Losses" value={s.max_consec_losses} color={V('red')} />
@@ -3580,6 +3631,7 @@ function PerformancePanel({ theme }) {
 
 // ── Dashboard Page ──────────────────────────────────────────────────────────
 function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, todayPnl, lotSize, tradeState, signal, strategy, instrument, ltp, capitalState, dataHealth, toggleAppRunning, allSignals, lastEntries, telegramConfigured, refreshSettings, maxDailyLoss, maxDailyProfit }) {
+  const m = window.innerWidth < 768
   const d = tradeState?.day_stats
   const displayPnl = todayPnl != null && todayPnl !== 0 ? todayPnl : d?.gross_pnl
 
@@ -3757,7 +3809,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
       </div>
 
       {/* Top Config Row: Instrument, Strategy, Daily Risk Budget */}
-      <div style={{ display:'grid', gridTemplateColumns:'1.2fr 1fr 1.2fr', gap:10 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1.2fr 1fr 1.2fr', gap:10 }}>
         {/* Instrument Selector + Sparkline */}
         <Card style={{ padding:14, display:'flex', alignItems:'center', gap:12 }}>
           <div>
@@ -3866,7 +3918,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
       </div>
 
       {/* Status indicators — 4 columns: Broker, Engine (clickable), Telegram, Auto Trade (clickable toggle) */}
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
         <Card style={{ display:'flex', alignItems:'center', gap:14, padding:12 }}>
           <div style={{ width:36, height:36, borderRadius:8, background: connected ? V('green-bg') : V('red-bg'), display:'flex', alignItems:'center', justifyContent:'center' }}>
             {connected ? <Wifi size={16} style={{color:V('green')}}/> : <WifiOff size={16} style={{color:V('red')}}/>}
@@ -3924,7 +3976,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
       </div>
 
       {/* Key metrics */}
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
         <MetricBox label="Balance" value={`₹${fmt(balance)}`} color={V('accent')} />
         <MetricBox label="Live P&L" value={fmtPnl(livePnl)} color={clr(livePnl)} />
         <MetricBox label="Today's P&L" value={fmtPnl(displayPnl)} color={clr(displayPnl)} sub={`${d?.total_trades||0} trades`} />
@@ -3932,7 +3984,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
       </div>
 
       {/* Dual strategy signals + Active Position — 3 columns */}
-      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1.2fr', gap:10 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1.2fr', gap:10 }}>
         {renderSignalCard(maSignal, 'Multi-Agent Signal')}
         {renderSignalCard(rtrSignal, 'Regime T/R Signal')}
 
@@ -4016,6 +4068,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
 
 // ── Auto Trade Monitor Page ─────────────────────────────────────────────────
 function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals, capitalState, tradeState, strategy, signal }) {
+  const m = window.innerWidth < 768
   const strategyLabels = { multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized' }
 
   // ── Inactive state ──
@@ -4117,7 +4170,7 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
     <div className="fade-in" style={{ display:'flex', flexDirection:'column', gap:16 }}>
 
       {/* Top row: Confidence Score + Strategy Agreement + Capital Utilization */}
-      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:12 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1fr', gap:12 }}>
 
         {/* Confidence Score */}
         <Card style={{ padding:20, textAlign:'center' }}>
@@ -4305,7 +4358,7 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
         {closedTrades.length === 0 ? (
           <div style={{ color:V('text-muted'), fontSize:13, textAlign:'center', padding:30 }}>Not enough trade data to show heatmap.</div>
         ) : (
-          <div style={{ display:'grid', gridTemplateColumns:'repeat(7, 1fr)', gap:6 }}>
+          <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(4, 1fr)' : 'repeat(7, 1fr)', gap:6 }}>
             {heatmapData.map(h => {
               const total = h.wins + h.losses
               const wr = total > 0 ? h.wins / total : 0
@@ -4341,6 +4394,7 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
 
 // ── Market Context Page ─────────────────────────────────────────────────────
 function MarketContextPage() {
+  const m = window.innerWidth < 768
   const [ctx, setCtx] = useState(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -4598,7 +4652,7 @@ function MarketContextPage() {
             </div>
           </div>
           {bias.details && (
-            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:6, marginBottom:10 }}>
+            <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1fr', gap:6, marginBottom:10 }}>
               {[
                 { label:'US', val: bias.details.us_avg },
                 { label:'Asia', val: bias.details.asia_avg },
@@ -4643,7 +4697,7 @@ function MarketContextPage() {
                     </div>
                   </div>
                 </div>
-                <div style={{ display:'grid', gridTemplateColumns:'repeat(5, 1fr)', gap:2, fontSize:8 }}>
+                <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(5, 1fr)', gap:2, fontSize:8 }}>
                   {[
                     { label:'<12', color:V('green'), text:'Calm' },
                     { label:'12-20', color:V('yellow'), text:'Normal' },
@@ -5048,7 +5102,7 @@ function MarketContextPage() {
             )}
 
             {/* Row 1: PCR + Max Pain + ATM Straddle + IV Skew */}
-            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr 1fr', gap:10, marginBottom:14 }}>
+            <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : '1fr 1fr 1fr 1fr', gap:10, marginBottom:14 }}>
               {/* PCR — with rationale */}
               <div style={{ background:V('bg-tertiary'), borderRadius:V('radius-md'), padding:12 }}>
                 <div style={{ fontSize:9, color:V('text-muted'), textTransform:'uppercase', marginBottom:6 }}>Put-Call Ratio (OI)</div>
@@ -5145,7 +5199,7 @@ function MarketContextPage() {
             </div>
 
             {/* Row 2: Support/Resistance + OI Change + Signals */}
-            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10, marginBottom:14 }}>
+            <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1fr', gap:10, marginBottom:14 }}>
               {/* Support Levels */}
               <div style={{ background:V('bg-tertiary'), borderRadius:V('radius-md'), padding:12 }}>
                 <div style={{ fontSize:10, fontWeight:600, color:V('green'), textTransform:'uppercase', marginBottom:8 }}>
@@ -5804,6 +5858,7 @@ function GreeksDecayDashboard({ data, loading }) {
 }
 
 function PositionGreeksPanel({ data, tradeState, loading }) {
+  const m = window.innerWidth < 768
   const hasPosition = tradeState?.position && !tradeState.position.order_id?.startsWith('PAPER_')
   const optData = data?.status === 'ok' ? data : null
 
@@ -5858,7 +5913,7 @@ function PositionGreeksPanel({ data, tradeState, loading }) {
         <Badge label={`${direction} × ${lots}`} color={isCall ? V('green') : V('red')} />
       </div>
 
-      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:8 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1fr', gap:8 }}>
         <div style={{ background:V('bg-tertiary'), borderRadius:V('radius-sm'), padding:'8px 10px' }}>
           <div style={{ color:V('text-muted'), fontSize:10 }}>P&L / Index Pt</div>
           <div style={{ color:V('green'), fontSize:15, fontFamily:"'JetBrains Mono',monospace", fontWeight:700 }}>
@@ -5898,6 +5953,7 @@ function PositionGreeksPanel({ data, tradeState, loading }) {
 }
 
 function LiveOiAnalysisPanel({ data, loading }) {
+  const m = window.innerWidth < 768
   if (!data || data.status !== 'ok') return (
     <Card style={{ minHeight:120 }}>
       <div style={{ color:V('text-muted'), fontSize:11, textTransform:'uppercase', fontWeight:600, marginBottom:8, letterSpacing:1 }}>OI Analysis</div>
@@ -5924,7 +5980,7 @@ function LiveOiAnalysisPanel({ data, loading }) {
         <Badge label={oi.verdict_text || 'N/A'} color={verdictColor} />
       </div>
 
-      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr 1fr', gap:8 }}>
+      <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : '1fr 1fr 1fr 1fr', gap:8 }}>
         {/* PCR */}
         <div style={{ background:V('bg-tertiary'), borderRadius:V('radius-sm'), padding:'8px 10px' }}>
           <div style={{ color:V('text-muted'), fontSize:10, marginBottom:2 }}>PCR</div>
@@ -6031,6 +6087,8 @@ export default function App() {
   const [dataHealth, setDataHealth] = useState(null)
   const [telegramConfigured, setTelegramConfigured] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const isMobile = useIsMobile()
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [maxDailyLoss, setMaxDailyLoss] = useState(0)
   const [maxDailyProfit, setMaxDailyProfit] = useState(0)
   const [optCtx, setOptCtx] = useState(null)
@@ -6360,15 +6418,20 @@ export default function App() {
       <Sidebar
         tab={tab} setTab={setTab}
         theme={theme} toggleTheme={toggleTheme}
-        onSettings={() => setTab('settings')}
+        onSettings={() => { setTab('settings'); if (isMobile) setMobileMenuOpen(false) }}
         onConnect={() => connected ? null : setShowConnect(true)}
         connected={connected}
         collapsed={sidebarCollapsed}
         setCollapsed={setSidebarCollapsed}
+        isMobile={isMobile}
+        mobileOpen={mobileMenuOpen}
+        setMobileOpen={setMobileMenuOpen}
       />
 
+      {isMobile && <MobileTopBar onMenuClick={() => setMobileMenuOpen(true)} />}
+
       {/* Main content */}
-      <div style={{ marginLeft: sideW, transition:'margin-left 0.25s ease', minHeight:'100vh' }}>
+      <div style={{ marginLeft: isMobile ? 0 : sideW, transition:'margin-left 0.25s ease', minHeight:'100vh', paddingTop: isMobile ? 52 : 0 }}>
         {/* Auto-trade banner */}
         {autoTrade && (
           <div style={{
@@ -6402,7 +6465,7 @@ export default function App() {
         )}
 
         {/* Page content */}
-        <div style={{ padding:'24px 28px', maxWidth:1400 }}>
+        <div style={{ padding: isMobile ? '16px 12px' : '24px 28px', maxWidth:1400 }}>
           {/* Page header */}
           {tab !== 'live' && (
             <PageHeader title={pageTitles[tab]?.[0] || ''} subtitle={pageTitles[tab]?.[1] || ''} />
@@ -6518,7 +6581,7 @@ export default function App() {
                 </div>
 
                 {/* Bottom: 3-Column Grid for Signals & Option Analysis */}
-                <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1.2fr', gap:14 }}>
+                <div style={{ display:'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr 1.2fr', gap: isMobile ? 10 : 14 }}>
                   {/* Col 1: Active Strategy Signal */}
                   <ErrorBoundary>
                     <SignalPanel signal={signal} onManualTrade={handleManualTrade} position={tradeState?.position} connected={connected} ltp={ltp} lastEntry={lastEntries[strategy]} />
