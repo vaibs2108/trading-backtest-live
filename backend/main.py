@@ -965,11 +965,11 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
     cfg = get_settings()
     strat = strategy or cfg.strategy
 
-    # Check backtest result cache first (valid for 2 min)
+    # Check backtest result cache first (valid for 30s — kept short so new signals appear fast)
     import time as _t
     _now = _t.time()
     _bt_cache = _chart_signals_cache.get(strat)
-    if _bt_cache and (_now - _bt_cache["ts"]) < 60:
+    if _bt_cache and (_now - _bt_cache["ts"]) < 30:
         logger.info(f"chart_signals: returning cached result for {strat} ({_now - _bt_cache['ts']:.0f}s old)")
         return _bt_cache["result"]
 
@@ -2010,11 +2010,15 @@ async def _signal_polling_loop():
 
                             if _live_sig.signal_type == "ENTRY":
                                 _add_signal_to_history(sig_dict)
+                                # Invalidate chart cache so next fetch gets fresh backtest with this signal
+                                _chart_signals_cache.clear()
                                 add_activity_log(f"[{_strat_id.upper()}] Processor Entry: {_live_sig.signal} @ {_live_sig.entry_price}")
                                 logger.info(f"[{_strat_id}] Processor Entry: {_live_sig.signal} @ {_live_sig.entry_price} SL={_live_sig.sl}")
-                                # Only send Telegram for the actively selected strategy
+                                # Notify frontend instantly so it re-fetches chart signals
+                                await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": _strat_id, "signal": _live_sig.signal}})
+                                # Send Telegram in background (non-blocking) for active strategy
                                 if _strat_id == cfg.strategy:
-                                    send_strat_telegram_alert(_strat_id, sig_dict)
+                                    asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
 
                                 # Always open journal entry for virtual tracking
                                 try:
@@ -2024,10 +2028,14 @@ async def _signal_polling_loop():
 
                             elif _live_sig.signal_type == "EXIT":
                                 _add_signal_to_history(sig_dict)
+                                # Invalidate chart cache so next fetch gets fresh backtest with this signal
+                                _chart_signals_cache.clear()
                                 logger.info(f"[{_strat_id}] Processor Exit: {_live_sig.signal} ({_live_sig.exit_reason}) @ {_live_sig.exit_price}")
-                                # Only send Telegram for the actively selected strategy
+                                # Notify frontend instantly so it re-fetches chart signals
+                                await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": _strat_id, "signal": _live_sig.signal}})
+                                # Send Telegram in background (non-blocking) for active strategy
                                 if _strat_id == cfg.strategy:
-                                    send_strat_telegram_alert(_strat_id, sig_dict)
+                                    asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
 
                                 # Always close journal entry for virtual tracking
                                 try:

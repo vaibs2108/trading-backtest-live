@@ -6098,6 +6098,7 @@ export default function App() {
   const [optCtxExpiries, setOptCtxExpiries] = useState([])
   const wsRef = useRef(null)
   const instrumentRef = useRef('BANKNIFTY')
+  const fetchChartSignalsRef = useRef(null) // populated later, used by WS handler for instant chart refresh
 
   useEffect(() => { instrumentRef.current = instrument }, [instrument])
 
@@ -6138,8 +6139,9 @@ export default function App() {
               setSignal(msg.data)
           }
           if (msg.type === 'state')        setTradeState(msg.data)
-          if (msg.type === 'trade_opened') setRefreshChart(r=>r+1)
-          if (msg.type === 'trade_closed') setRefreshChart(r=>r+1)
+          if (msg.type === 'trade_opened') { setRefreshChart(r=>r+1); if (fetchChartSignalsRef.current) fetchChartSignalsRef.current() }
+          if (msg.type === 'trade_closed') { setRefreshChart(r=>r+1); if (fetchChartSignalsRef.current) fetchChartSignalsRef.current() }
+          if (msg.type === 'chart_signals_updated') { if (fetchChartSignalsRef.current) fetchChartSignalsRef.current() }
           if (msg.type === 'init') {
             setConnected(msg.data.connected)
             if (msg.data.signal && (!msg.data.signal.instrument || msg.data.signal.instrument === instrumentRef.current))
@@ -6254,10 +6256,13 @@ export default function App() {
     finally { setChartSignalsLoading(false) }
   }, [strategy])
 
+  // Keep ref in sync so WebSocket handler (created earlier) can call fetchChartSignals
+  useEffect(() => { fetchChartSignalsRef.current = fetchChartSignals }, [fetchChartSignals])
+
   useEffect(() => {
     if (tab === 'live') {
       fetchChartSignals()
-      const id = setInterval(fetchChartSignals, 90000) // auto-refresh every 90s
+      const id = setInterval(fetchChartSignals, 30000) // auto-refresh every 30s
       return () => clearInterval(id)
     }
   }, [strategy, instrument, tab, fetchChartSignals])
@@ -6708,7 +6713,7 @@ export default function App() {
               journal={journal} 
               onRefresh={fetchJournal} 
               fromDate={journalFromDate}
-              toDate={journalToDate}
+                         toDate={journalToDate}
               onFromDateChange={setJournalFromDate}
               onToDateChange={setJournalToDate}
             />

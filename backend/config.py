@@ -17,15 +17,15 @@ class Settings(BaseSettings):
     dhan_access_token: str = ""
 
     # ── Strategy Selection ─────────────────────────────────────────────────
-    strategy: str = "multi_agent"          # multi_agent | regime_trend_range
+    strategy: str = "regime_trend_range"    # multi_agent | regime_trend_range
 
     # ── Instrument Settings ────────────────────────────────────────────────
     instrument: str = "BANKNIFTY"          # NIFTY | BANKNIFTY | SENSEX
-    trade_mode: str = "INDEX"              # INDEX | OPTIONS
+    trade_mode: str = "OPTIONS"            # INDEX | OPTIONS
     index_expiry: int = 0                  # 0=current, 1=next, 2=far
     options_expiry: int = 0
-    strike_type: str = "ATM"              # ATM | ITM | OTM
-    strike_offset: int = 0               # +N for OTM, -N for ITM (from ATM)
+    strike_type: str = "ITM"              # ATM | ITM | OTM
+    strike_offset: int = -4              # +N for OTM, -N for ITM (from ATM)
 
     # ── Trading Parameters ─────────────────────────────────────────────────
     lot_multiplier: int = 1              # how many lots to trade
