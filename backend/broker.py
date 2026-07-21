@@ -1058,7 +1058,21 @@ def get_order_details(order_id: str) -> dict:
         }
 
 
-def sync_position_from_broker(instrument: str) -> dict:
+def sync_position_from_broker(instrument: str, tracked_symbol: str = None) -> dict:
+    """Check if a specific position still exists at the broker.
+
+    Args:
+        instrument: e.g. "BANKNIFTY" — used as fallback filter.
+        tracked_symbol: the EXACT symbol the app is tracking (e.g.
+            "BANKNIFTY 28 JUL 58300 PUT").  When provided, the function
+            looks for THIS symbol only.  This prevents false
+            BROKER_SL_HIT when the user has other positions on the
+            same underlying.
+
+    Returns:
+        dict with has_position, direction, symbol, qty, entry_price, exchange
+        or {} if position not found.
+    """
     try:
         pos_df = get_positions()
         if pos_df is None or pos_df.empty:
@@ -1081,43 +1095,65 @@ def sync_position_from_broker(instrument: str) -> dict:
         if qty_col is None:
             return {}
 
-        mask = filtered[sym_col].str.contains(instrument, case=False, na=False)
-        filtered = filtered[mask]
-
         filtered[qty_col] = pd.to_numeric(filtered[qty_col], errors="coerce")
         filtered = filtered[filtered[qty_col] != 0]
 
         if filtered.empty:
             return {}
 
+        # Priority 1: match by exact tracked symbol
+        if tracked_symbol:
+            exact = filtered[filtered[sym_col].str.strip() == tracked_symbol.strip()]
+            if not exact.empty:
+                row = exact.iloc[0]
+                net_qty = int(float(row[qty_col]))
+                return {
+                    "has_position": True,
+                    "direction": "LONG" if net_qty > 0 else "SHORT",
+                    "symbol": str(row[sym_col]).strip(),
+                    "qty": abs(net_qty),
+                    "entry_price": _extract_entry_price(row),
+                    "exchange": _extract_exchange(row),
+                }
+            # Exact symbol not found — position was closed at broker
+            return {}
+
+        # Priority 2 (legacy fallback): broad instrument match
+        mask = filtered[sym_col].str.contains(instrument, case=False, na=False)
+        filtered = filtered[mask]
+        if filtered.empty:
+            return {}
+
         row = filtered.iloc[0]
         net_qty = int(float(row[qty_col]))
-        direction = "LONG" if net_qty > 0 else "SHORT"
-        abs_qty = abs(net_qty)
-
-        entry_price = 0.0
-        for col in ["buyAvg", "buy_avg", "averagePrice", "average_price"]:
-            if col in row.index and row[col]:
-                entry_price = float(row[col])
-                break
-
-        exchange = ""
-        for col in ["exchangeSegment", "exchange_segment", "exchange"]:
-            if col in row.index and row[col]:
-                exchange = str(row[col])
-                break
-
         return {
             "has_position": True,
-            "direction": direction,
-            "symbol": str(row[sym_col]),
-            "qty": abs_qty,
-            "entry_price": entry_price,
-            "exchange": exchange,
+            "direction": "LONG" if net_qty > 0 else "SHORT",
+            "symbol": str(row[sym_col]).strip(),
+            "qty": abs(net_qty),
+            "entry_price": _extract_entry_price(row),
+            "exchange": _extract_exchange(row),
         }
     except Exception as e:
         logger.error(f"sync_position_from_broker error: {e}")
         return {}
+
+
+def _extract_entry_price(row) -> float:
+    for col in ["buyAvg", "buy_avg", "averagePrice", "average_price"]:
+        if col in row.index and row[col]:
+            try:
+                return float(row[col])
+            except (ValueError, TypeError):
+                pass
+    return 0.0
+
+
+def _extract_exchange(row) -> str:
+    for col in ["exchangeSegment", "exchange_segment", "exchange"]:
+        if col in row.index and row[col]:
+            return str(row[col])
+    return ""
 
 
 def get_positions() -> pd.DataFrame:
@@ -1336,22 +1372,6 @@ def get_order_list() -> list:
         return []
 
 
-def get_trade_book() -> list:
-    """
-    Fetch all trade executions for the current day from Dhan API.
-    """
-    if not _connected or _dhan_client is None:
-        return []
-    try:
-        res = _dhan_client.get_trade_book()
-        if isinstance(res, dict) and "data" in res:
-            return res["data"] if isinstance(res["data"], list) else []
-        return []
-    except Exception as e:
-        logger.error(f"Error fetching trade book from Dhan: {e}")
-        return []
-
-
 def get_trade_history(from_date: str, to_date: str) -> list:
     """
     Fetch trade history for a given date range (YYYY-MM-DD) from Dhan API.
@@ -1364,6 +1384,19 @@ def get_trade_history(from_date: str, to_date: str) -> list:
         for page in range(5):
             res = _dhan_client.get_trade_history(from_date=from_date, to_date=to_date, page_number=page)
             if isinstance(res, dict) and res.get("status") == "success" and "data" in res:
+                data = res["data"]
+                if not data or not isinstance(data, list):
+                    break
+                all_trades.extend(data)
+                if len(data) < 100: # assuming max page size is 100
+                    break
+            else:
+                break
+        return all_trades
+    except Exception as e:
+        logger.error(f"Error fetching trade history from Dhan: {e}")
+        return []
+ res.get("status") == "success" and "data" in res:
                 data = res["data"]
                 if not data or not isinstance(data, list):
                     break

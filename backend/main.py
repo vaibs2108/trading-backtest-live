@@ -2203,6 +2203,17 @@ async def _signal_polling_loop():
                                     ct_ok, ct_reason = get_capital_tracker().can_trade()
                                     if not ct_ok:
                                         ok, reason = False, ct_reason
+                                # Safety: verify no same-instrument position already open at broker
+                                # Prevents duplicate entries if local state got out of sync
+                                if ok and broker.is_connected():
+                                    try:
+                                        bp = broker.sync_position_from_broker(cfg.instrument)
+                                        if bp and bp.get("has_position"):
+                                            ok = False
+                                            reason = f"Broker already has open position: {bp.get('symbol')} qty={bp.get('qty')}"
+                                            logger.warning(f"Entry blocked — {reason}")
+                                    except Exception:
+                                        pass  # don't block entry if check fails
                             if ok:
                                 cooldown_bars = getattr(cfg, 'cooldown_bars', 0) if cfg.strategy == "multi_agent" else 0
                                 if cooldown_bars > 0 and _last_loss_direction == sig_direction and _last_loss_time:
@@ -2256,8 +2267,11 @@ async def _signal_polling_loop():
                         # Verify if position was closed at broker (e.g. SL trigger)
                         if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
                             try:
-                                bp = broker.sync_position_from_broker(pos.instrument)
-                                if not bp or not bp.get("has_position") or bp.get("symbol") != pos.symbol:
+                                bp = broker.sync_position_from_broker(
+                                    pos.instrument,
+                                    tracked_symbol=pos.symbol  # exact match — avoids false close from user's other positions
+                                )
+                                if not bp or not bp.get("has_position"):
                                     logger.warning(f"Active position {pos.symbol} was closed at broker. Closing locally.")
                                     exit_triggered = True
                                     exit_reason = "BROKER_SL_HIT"
@@ -2444,7 +2458,21 @@ async def _signal_polling_loop():
                                     except Exception as sl_cancel_err:
                                         logger.warning(f"Could not cancel broker SL: {sl_cancel_err}")
                                     pos.sl_order_id = None
-                                broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                                exit_result = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                                if not exit_result.get("success"):
+                                    # Exit order FAILED — do NOT close position locally
+                                    logger.error(f"Exit order FAILED for {pos.symbol}: {exit_result.get('error')}. Position kept open.")
+                                    try:
+                                        _send_telegram_alert_wrapper(
+                                            f"EXIT ORDER FAILED\n"
+                                            f"{pos.direction} {pos.symbol}\n"
+                                            f"Reason: {exit_result.get('error')}\n"
+                                            f"Position still open — manual exit may be needed!",
+                                            cfg.telegram_bot_token, cfg.telegram_chat_id
+                                        )
+                                    except Exception:
+                                        pass
+                                    continue  # skip local close — position still exists at broker
                             elif getattr(pos, "sl_order_id", None):
                                 pos.sl_order_id = None
                             elif pos.order_id.startswith("DHAN_SYNC_") and not cfg.auto_trade:
