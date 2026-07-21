@@ -66,6 +66,7 @@ from pydantic import BaseModel
 
 import broker
 import strategy
+from live_feed import get_live_feed
 import strategy_router
 import signal_journal_manager
 from config import get_settings, save_settings, INSTRUMENT_META, TIMEFRAME_LABELS, MARKET_HOURS
@@ -955,6 +956,12 @@ async def clear_signal_history():
     return {"success": True, "message": "Signal history cleared"}
 
 
+@app.get("/api/live-feed-status")
+async def get_live_feed_status():
+    """Return live market feed connection status and candle counts."""
+    return get_live_feed().get_status()
+
+
 @app.get("/api/chart_signals")
 async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
     """Run backtest for the selected strategy and return entry/exit markers for chart overlay.
@@ -1533,7 +1540,37 @@ async def startup_event():
         else:
             logger.warning(f"Dhan auto-connection failed: {msg}")
             add_activity_log(f"Dhan auto-connection failed: {msg}")
-            
+
+    # Start live market feed for near-instant signal processing
+    if broker.is_connected():
+        try:
+            _feed = get_live_feed()
+            _sec_id = broker.get_index_security_id(cfg.instrument) or "25"
+            _feed.configure(
+                instrument=cfg.instrument,
+                security_id=_sec_id,
+                exchange_segment="IDX_I",
+                loop=asyncio.get_event_loop(),
+            )
+            # Seed with historical candles so indicators work from first tick
+            try:
+                import time as _seed_time
+                _hist_5m = broker.get_historical_data(cfg.instrument, "5",
+                    (datetime.now(_IST) - timedelta(days=30)).strftime("%Y-%m-%d"),
+                    (datetime.now(_IST) + timedelta(days=1)).strftime("%Y-%m-%d"))
+                _hist_1m = broker.get_historical_data(cfg.instrument, "1",
+                    (datetime.now(_IST) - timedelta(days=5)).strftime("%Y-%m-%d"),
+                    (datetime.now(_IST) + timedelta(days=1)).strftime("%Y-%m-%d"))
+                _seed_time.sleep(1)
+                _feed.seed_candles(_hist_5m, _hist_1m)
+            except Exception as _seed_err:
+                logger.warning(f"Could not seed live feed candles: {_seed_err}")
+            _feed.start(cfg.dhan_client_code, cfg.dhan_access_token)
+            add_activity_log(f"Live market feed started for {cfg.instrument}")
+        except Exception as _feed_err:
+            logger.warning(f"Could not start live feed: {_feed_err}")
+            add_activity_log(f"Live feed start failed: {_feed_err}")
+
     # Sync position from broker on startup if auto_trade is enabled
     if cfg.auto_trade and broker.is_connected():
         logger.info("Auto-trade ON: syncing position from broker...")
@@ -1572,6 +1609,11 @@ async def startup_event():
 async def shutdown_event():
     """Graceful shutdown: save state, log daily performance snapshot."""
     logger.info("Shutting down gracefully...")
+    # Stop live feed
+    try:
+        get_live_feed().stop()
+    except Exception:
+        pass
     try:
         save_app_state("STOPPED", "Graceful shutdown")
     except Exception:
@@ -1852,9 +1894,20 @@ def _check_virtual_exits(ltp: float, cfg, frames=None, latest_candle_ts: str = N
 
 
 async def _signal_polling_loop():
-    """Poll for new signals every 15 seconds when connected and market is open."""
+    """Poll for new signals — driven by live feed candle events (1-2s latency)
+    with 15s fallback if live feed is not connected."""
     while True:
-        await asyncio.sleep(15)
+        # Wait for candle close event from live feed, or fall back to 15s polling
+        _feed = get_live_feed()
+        if _feed.is_running and _feed.candle_event:
+            try:
+                await asyncio.wait_for(_feed.candle_event.wait(), timeout=15)
+                _feed.candle_event.clear()
+                logger.debug("Signal loop triggered by live feed candle close")
+            except asyncio.TimeoutError:
+                pass  # No candle event — proceed with normal poll
+        else:
+            await asyncio.sleep(15)
         try:
             # Application-level pause: skip all work when stopped
             if not _app_running:
@@ -3908,13 +3961,40 @@ def _fetch_all_frames(instrument: str) -> dict:
         # Reuse cached HTF data
         frames.update(_htf_cache.get(instrument, {}))
 
-    # Fast timeframes: always fetch fresh (these are what signals depend on)
-    for tf_key, days in [("5", 30), ("1", 5)]:
-        from_d = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
-        df = broker.get_historical_data(instrument, tf_key, from_d, today)
-        if df is not None and len(df) >= 30:
-            frames[tf_key] = df
-        _time_mod.sleep(0.3)
+    # Fast timeframes: prefer live feed candles (near-instant) with historical API fallback
+    _feed = get_live_feed()
+    if _feed.is_running and len(_feed.candle_5m.candles) >= 50:
+        # Use live feed candles — already up-to-date from WebSocket ticks
+        live_5m = _feed.get_live_candles("5")
+        if live_5m is not None and len(live_5m) >= 50:
+            frames["5"] = live_5m
+            logger.debug(f"Using live feed 5m candles ({len(live_5m)} bars)")
+        else:
+            # Fallback to historical API
+            from_d = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
+            df = broker.get_historical_data(instrument, "5", from_d, today)
+            if df is not None and len(df) >= 30:
+                frames["5"] = df
+            _time_mod.sleep(0.3)
+
+        live_1m = _feed.get_live_candles("1")
+        if live_1m is not None and len(live_1m) >= 30:
+            frames["1"] = live_1m
+            logger.debug(f"Using live feed 1m candles ({len(live_1m)} bars)")
+        else:
+            from_d = (now_ist - timedelta(days=5)).strftime("%Y-%m-%d")
+            df = broker.get_historical_data(instrument, "1", from_d, today)
+            if df is not None and len(df) >= 30:
+                frames["1"] = df
+            _time_mod.sleep(0.3)
+    else:
+        # No live feed — fetch from historical API (original behavior)
+        for tf_key, days in [("5", 30), ("1", 5)]:
+            from_d = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
+            df = broker.get_historical_data(instrument, tf_key, from_d, today)
+            if df is not None and len(df) >= 30:
+                frames[tf_key] = df
+            _time_mod.sleep(0.3)
 
     return frames
 
