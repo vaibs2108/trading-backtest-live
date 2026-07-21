@@ -965,11 +965,12 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
     cfg = get_settings()
     strat = strategy or cfg.strategy
 
-    # Check backtest result cache first (valid for 30s — kept short so new signals appear fast)
+    # Check backtest result cache first (valid for 120s — backtest is expensive on 1-vCPU)
+    # Cache is cleared when new signals are generated, so fresh data still appears quickly
     import time as _t
     _now = _t.time()
     _bt_cache = _chart_signals_cache.get(strat)
-    if _bt_cache and (_now - _bt_cache["ts"]) < 30:
+    if _bt_cache and (_now - _bt_cache["ts"]) < 120:
         logger.info(f"chart_signals: returning cached result for {strat} ({_now - _bt_cache['ts']:.0f}s old)")
         return _bt_cache["result"]
 
@@ -2086,7 +2087,20 @@ async def _signal_polling_loop():
                         logger.info(f"Auto square-off: {_mins_to_close:.0f} mins to close, squaring off position")
                         pos = tm.position
                         if not pos.order_id.startswith("PAPER_"):
-                            broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                            _sq_exit = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                            if not _sq_exit.get("success"):
+                                logger.error(f"Auto-squareoff exit FAILED: {_sq_exit.get('error')}. Position kept open.")
+                                try:
+                                    _send_telegram_alert_wrapper(
+                                        f"AUTO-SQUAREOFF EXIT FAILED\n"
+                                        f"{pos.direction} {pos.symbol}\n"
+                                        f"Reason: {_sq_exit.get('error')}\n"
+                                        f"URGENT: Market closing — manual exit needed!",
+                                        cfg.telegram_bot_token, cfg.telegram_chat_id
+                                    )
+                                except Exception:
+                                    pass
+                                continue  # skip local close — position still at broker
                         ltp = broker.get_ltp(pos.instrument) or 0
                         _pnl_exit = _safe_pnl_exit_price(pos, ltp)
                         rec = tm.close_position(_pnl_exit, "AUTO_SQUAREOFF")
@@ -2143,7 +2157,22 @@ async def _signal_polling_loop():
                         pos = tm.position
                         logger.info(f"Opposite signal ({sig_direction}) while in {pos.direction} — exiting only (no auto-flip)")
                         if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
-                            broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                            _opp_exit = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                            if not _opp_exit.get("success"):
+                                logger.error(f"Opposite-signal exit FAILED: {_opp_exit.get('error')}. Position kept open.")
+                                try:
+                                    _send_telegram_alert_wrapper(
+                                        f"EXIT ORDER FAILED (opposite signal)\n"
+                                        f"{pos.direction} {pos.symbol}\n"
+                                        f"Reason: {_opp_exit.get('error')}\n"
+                                        f"Position still open — manual exit needed!",
+                                        cfg.telegram_bot_token, cfg.telegram_chat_id
+                                    )
+                                except Exception:
+                                    pass
+                                _pending_telegram_signal = sig
+                                _last_telegram_signal_key = ("", "")
+                                continue  # skip local close
                         ltp = broker.get_ltp(pos.instrument) or 0
                         exit_reason = f"OPPOSITE_SIGNAL_{sig_direction}"
                         _pnl_exit = _safe_pnl_exit_price(pos, ltp)
@@ -3872,7 +3901,7 @@ def _fetch_all_frames(instrument: str) -> dict:
             df = broker.get_historical_data(instrument, tf_dhan, from_d, today)
             if df is not None and len(df) >= 30:
                 frames[tf_key] = df
-            _time_mod.sleep(1.0)  # 1s throttle (Dhan allows ~10 req/s, retry handles DH-904)
+            _time_mod.sleep(0.3)  # 0.3s throttle (Dhan allows ~10 req/s, retry handles DH-904)
         _htf_cache[instrument] = {k: v for k, v in frames.items() if k in ("1D", "60", "15")}
         _htf_cache_ts = _time_mod.time()
     else:
@@ -3885,7 +3914,7 @@ def _fetch_all_frames(instrument: str) -> dict:
         df = broker.get_historical_data(instrument, tf_key, from_d, today)
         if df is not None and len(df) >= 30:
             frames[tf_key] = df
-        _time_mod.sleep(1.0)
+        _time_mod.sleep(0.3)
 
     return frames
 
@@ -4061,10 +4090,46 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
                     trigger_price=initial_sl_trigger
                 )
                 pos.sl_order_id = sl_order_id
+                logger.info(f"Broker SL placed: order_id={sl_order_id}, trigger={initial_sl_trigger}")
             except Exception as sl_err:
                 logger.error(f"Failed to place broker-side Stop Loss: {sl_err}")
+                # Alert user that SL was NOT placed at broker
+                try:
+                    _send_telegram_alert_wrapper(
+                        f"SL ORDER NOT PLACED\n"
+                        f"{direction} {result['symbol']}\n"
+                        f"Trigger: {initial_sl_trigger}\n"
+                        f"Error: {sl_err}\n"
+                        f"Position has NO broker SL — monitor manually!",
+                        cfg.telegram_bot_token, cfg.telegram_chat_id
+                    )
+                except Exception:
+                    pass
 
         tm.open_position(pos)
+
+        # Post-entry verification: confirm position exists at broker
+        if cfg.auto_trade and broker.is_connected() and not result["order_id"].startswith("PAPER_"):
+            try:
+                import time as _verify_time
+                _verify_time.sleep(1)  # brief wait for broker to register
+                bp = broker.sync_position_from_broker(cfg.instrument, tracked_symbol=result["symbol"])
+                if bp and bp.get("has_position"):
+                    logger.info(f"Post-entry verified: {bp.get('symbol')} qty={bp.get('qty')} at broker")
+                else:
+                    logger.warning(f"Post-entry check: position {result['symbol']} NOT found at broker — may need manual verification")
+                    try:
+                        _send_telegram_alert_wrapper(
+                            f"ENTRY VERIFICATION WARNING\n"
+                            f"{direction} {result['symbol']}\n"
+                            f"Order filled but position NOT confirmed at broker\n"
+                            f"Please verify manually!",
+                            cfg.telegram_bot_token, cfg.telegram_chat_id
+                        )
+                    except Exception:
+                        pass
+            except Exception as _verify_err:
+                logger.debug(f"Post-entry verification failed: {_verify_err}")
 
         # Log entry fill slippage
         slippage_tracker.log_entry_fill(

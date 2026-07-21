@@ -1396,18 +1396,3 @@ def get_trade_history(from_date: str, to_date: str) -> list:
     except Exception as e:
         logger.error(f"Error fetching trade history from Dhan: {e}")
         return []
- res.get("status") == "success" and "data" in res:
-                data = res["data"]
-                if not data or not isinstance(data, list):
-                    break
-                all_trades.extend(data)
-                if len(data) < 100: # assuming max page size is 100
-                    break
-            else:
-                break
-        return all_trades
-    except Exception as e:
-        logger.error(f"Error fetching trade history from Dhan: {e}")
-        return []
-
-
