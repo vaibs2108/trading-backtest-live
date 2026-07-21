@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     auto_kill_switch_max_failures: int = 3  # failures before kill switch triggers
 
     # ── Capital Protection ────────────────────────────────────────────────
-    starting_capital: float = 50000.0    # total account capital (Rs.)
+    starting_capital: float = 30000.0    # total account capital (Rs.)
     data_stale_threshold_min: int = 10   # minutes after which candle data is considered stale
 
     # ── Regime Strategy Parameters ──────────────────────────────────────────

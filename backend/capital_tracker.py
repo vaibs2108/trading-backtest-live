@@ -38,9 +38,9 @@ class CapitalTracker:
     """
 
     def __init__(self):
-        self.starting_capital: float = 50000.0
-        self.peak_equity: float = 50000.0
-        self.current_equity: float = 50000.0
+        self.starting_capital: float = 30000.0
+        self.peak_equity: float = 30000.0
+        self.current_equity: float = 30000.0
         self.max_drawdown_pct: float = 10.0   # default 10%
         self.drawdown_breached: bool = False
         self.last_updated: str = _ist_today()
@@ -82,13 +82,19 @@ class CapitalTracker:
     # -- Configuration ---------------------------------------------------------
 
     def update_config(self, starting_capital: float, max_drawdown_pct: float = None):
-        """Called when settings change. Updates capital and recalculates."""
+        """Called when settings change. Updates capital and recalculates.
+
+        When starting_capital changes, fully reset equity tracking to avoid
+        false drawdown breaches from stale data.
+        """
         changed = False
         if starting_capital != self.starting_capital:
             self.starting_capital = starting_capital
-            if self.current_equity == 0:
-                self.current_equity = starting_capital
-                self.peak_equity = starting_capital
+            # Full reset: align equity to new capital so stale data doesn't
+            # trigger a false drawdown breach.
+            self.current_equity = starting_capital
+            self.peak_equity = starting_capital
+            self.drawdown_breached = False
             changed = True
         if max_drawdown_pct is not None and max_drawdown_pct != self.max_drawdown_pct:
             self.max_drawdown_pct = max_drawdown_pct
@@ -134,12 +140,14 @@ class CapitalTracker:
     def _check_breach(self):
         """Check if drawdown limit has been breached."""
         if self.current_drawdown_pct >= self.max_drawdown_pct:
+            if not self.drawdown_breached:
+                # Log only once when breach first occurs (not every cycle)
+                logger.critical(
+                    f"DRAWDOWN BREACH! Peak Equity={self.peak_equity:,.2f}, "
+                    f"Current Equity={self.current_equity:,.2f}, "
+                    f"Drawdown={self.current_drawdown:,.2f} ({self.current_drawdown_pct:.2f}% >= {self.max_drawdown_pct:.2f}%)"
+                )
             self.drawdown_breached = True
-            logger.critical(
-                f"DRAWDOWN BREACH! Peak Equity={self.peak_equity:,.2f}, "
-                f"Current Equity={self.current_equity:,.2f}, "
-                f"Drawdown={self.current_drawdown:,.2f} ({self.current_drawdown_pct:.2f}% >= {self.max_drawdown_pct:.2f}%)"
-            )
 
     def can_trade(self) -> tuple[bool, str]:
         """Check if overall capital drawdown allows trading."""
