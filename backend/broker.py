@@ -844,7 +844,7 @@ def place_exit_order(symbol: str, exchange: str, direction: str, qty: int) -> di
         return {"success": False, "error": "Not connected to Dhan broker"}
 
     import re
-    is_option = bool(re.search(r'\d+\s*(CE|PE)', symbol, re.IGNORECASE))
+    is_option = bool(re.search(r'\d+\s*(CE|PE)', symbol, re.IGNORECASE)) or any(x in symbol.upper() for x in ['-CE', '-PE', ' CALL', ' PUT', ' OPTION'])
     if is_option:
         # Options are always SOLD to close
         transaction = "SELL"
@@ -920,7 +920,15 @@ def place_broker_sl(symbol: str, exchange: str, direction: str, quantity: int, t
     if not _connected or _dhan_client is None:
         raise RuntimeError("Not connected to Dhan broker")
 
-    transaction = "SELL" if direction == "LONG" else "BUY"
+    import re
+    is_option = bool(re.search(r'\d+\s*(CE|PE)', symbol, re.IGNORECASE)) or any(x in symbol.upper() for x in ['-CE', '-PE', ' CALL', ' PUT'])
+    if is_option:
+        # Options are always bought on entry, so SL order MUST be SELL
+        transaction = "SELL"
+    else:
+        # Futures/Index: reverse original direction
+        transaction = "SELL" if direction == "LONG" else "BUY"
+
     logger.info(f"Placing broker-side SL order for {symbol} qty={quantity} trigger={trigger_price} (txn={transaction})")
 
     try:
@@ -957,14 +965,29 @@ def place_broker_sl(symbol: str, exchange: str, direction: str, quantity: int, t
         # Round trigger price to 1 decimal place to align with ticks
         rounded_trigger = round(float(trigger_price), 1)
 
+        # NSE & Dhan API v2 Rule: Options segment prohibits STOP_LOSS_MARKET (STOPMARKET).
+        # For Options, order_type MUST be "SL" (Stop Loss Limit) with both trigger_price and price set.
+        if is_option:
+            order_type_str = "SL"
+            # Limit price set 2 points below trigger price (min 0.05) to ensure execution without wide slippage
+            limit_price = max(0.05, round(rounded_trigger - 2.0, 1))
+        else:
+            order_type_str = "STOPMARKET"
+            limit_price = 0.0
+
+        logger.info(
+            f"Placing broker-side SL order ({order_type_str}): {symbol} qty={quantity} "
+            f"trigger={rounded_trigger} price={limit_price} (txn={transaction})"
+        )
+
         res = _dhan_client.place_order(
             security_id=security_id,
             exchange_segment=exch_seg,
             transaction_type=transaction,
             quantity=int(quantity),
-            order_type="STOPMARKET",
+            order_type=order_type_str,
             product_type=dhan_product_type,
-            price=0.0,
+            price=limit_price,
             trigger_price=rounded_trigger
         )
 
@@ -973,28 +996,35 @@ def place_broker_sl(symbol: str, exchange: str, direction: str, quantity: int, t
             raise RuntimeError(f"Dhan SL placement failed: {remarks}")
 
         order_id = str(res["data"]["orderId"])
-        logger.info(f"Broker-side SL order placed. Order ID: {order_id}, trigger: {rounded_trigger}")
+        logger.info(f"Broker-side SL order placed. Order ID: {order_id}, trigger: {rounded_trigger}, price: {limit_price}")
         return order_id
     except Exception as e:
         logger.error(f"Error placing broker-side SL order: {e}")
         raise
 
 
-def modify_broker_sl(order_id: str, quantity: int, new_trigger_price: float) -> str:
-    """Modify the trigger price of a pending STOPMARKET SL order at Dhan."""
+def modify_broker_sl(order_id: str, quantity: int, new_trigger_price: float, is_option: bool = True) -> str:
+    """Modify the trigger price of a pending SL order at Dhan."""
     if not _connected or _dhan_client is None:
         raise RuntimeError("Not connected to Dhan broker")
 
     rounded_trigger = round(float(new_trigger_price), 1)
-    logger.info(f"Modifying broker-side SL order {order_id} to new trigger: {rounded_trigger}")
+    if is_option:
+        order_type_str = "SL"
+        limit_price = max(0.05, round(rounded_trigger - 2.0, 1))
+    else:
+        order_type_str = "STOPMARKET"
+        limit_price = 0.0
+
+    logger.info(f"Modifying broker-side SL order {order_id} ({order_type_str}) trigger: {rounded_trigger}, price: {limit_price}")
 
     try:
         res = _dhan_client.modify_order(
             order_id=order_id,
-            order_type="STOPMARKET",
+            order_type=order_type_str,
             leg_name=None,
             quantity=int(quantity),
-            price=0.0,
+            price=limit_price,
             trigger_price=rounded_trigger,
             disclosed_quantity=0,
             validity="DAY"

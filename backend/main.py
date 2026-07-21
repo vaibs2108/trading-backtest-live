@@ -972,86 +972,85 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
     cfg = get_settings()
     strat = strategy or cfg.strategy
 
-    # Check backtest result cache first (valid for 120s — backtest is expensive on 1-vCPU)
-    # Cache is cleared when new signals are generated, so fresh data still appears quickly
+    # 1. Fetch real-time live signals from history (instant O(1) memory lookup)
+    today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+    live_signals = [
+        s for s in _signal_history
+        if (s.get("strategy") == strat or not s.get("strategy")) and
+           (s.get("instrument") == cfg.instrument or not s.get("instrument"))
+    ]
+
+    # 2. Check backtest result cache first (valid for 120s — backtest is expensive on 1-vCPU)
     import time as _t
     _now = _t.time()
     _bt_cache = _chart_signals_cache.get(strat)
-    if _bt_cache and (_now - _bt_cache["ts"]) < 120:
-        logger.info(f"chart_signals: returning cached result for {strat} ({_now - _bt_cache['ts']:.0f}s old)")
-        return _bt_cache["result"]
-
-    # Use cached frames from the polling loop if available and fresh (< 3 min)
-    _cache_age = _now - _cached_frames_ts
-    if _cached_frames and _cached_frames_instrument == cfg.instrument and _cache_age < 180:
-        frames = _cached_frames
-        logger.info(f"chart_signals: using cached frames ({_cache_age:.0f}s old)")
-    else:
-        frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument)
-    if not frames:
-        return {"signals": [], "strategy": strat}
-
-    def _run_bt():
-        try:
-            if strat == "regime_trend_range":
-                from strategies.regime_strategy import run_backtest
-            else:
-                from strategy import run_backtest
-            return run_backtest(frames)
-        except Exception as e:
-            logger.error(f"chart_signals backtest error ({strat}): {e}", exc_info=True)
-            return None
-
-    result = await asyncio.to_thread(_run_bt)
-    if not result:
-        return {"signals": [], "strategy": strat}
-
-    raw_trades = result.get("trades", [])
-
-    cutoff_date = (datetime.now(_IST) - timedelta(days=days)).date()
-
+    
     signals = []
-    for t in raw_trades:
-        entry_time = str(t.get("entry_time", ""))
-        exit_time = str(t.get("exit_time", ""))
-        direction = t.get("direction", "")
+    if _bt_cache and (_now - _bt_cache["ts"]) < 120:
+        signals = list(_bt_cache["result"].get("signals", []))
+    else:
+        # Use cached frames from the polling loop if available and fresh (< 3 min)
+        _cache_age = _now - _cached_frames_ts
+        if _cached_frames and _cached_frames_instrument == cfg.instrument and _cache_age < 180:
+            frames = _cached_frames
+        else:
+            frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument)
 
-        # Filter by days
-        try:
-            if pd.to_datetime(entry_time).date() < cutoff_date:
-                continue
-        except Exception:
-            continue
+        if frames:
+            def _run_bt():
+                try:
+                    if strat == "regime_trend_range":
+                        from strategies.regime_strategy import run_backtest
+                    else:
+                        from strategy import run_backtest
+                    return run_backtest(frames)
+                except Exception as e:
+                    logger.error(f"chart_signals backtest error ({strat}): {e}")
+                    return None
 
-        # Entry marker
-        signals.append({
-            "signal": direction,
-            "time": entry_time,
-            "entry": t.get("entry_price", 0),
-            "sl": t.get("sl", 0),
-            "target1": t.get("target1", 0),
-            "target2": t.get("target2", 0),
-            "strategy": strat,
-        })
+            result = await asyncio.to_thread(_run_bt)
+            if result:
+                raw_trades = result.get("trades", [])
+                cutoff_date = (datetime.now(_IST) - timedelta(days=days)).date()
+                for t in raw_trades:
+                    entry_time = str(t.get("entry_time", ""))
+                    exit_time = str(t.get("exit_time", ""))
+                    direction = t.get("direction", "")
+                    try:
+                        if pd.to_datetime(entry_time).date() < cutoff_date:
+                            continue
+                    except Exception:
+                        continue
+                    signals.append({
+                        "signal": direction, "time": entry_time,
+                        "entry": t.get("entry_price", 0), "sl": t.get("sl", 0),
+                        "target1": t.get("target1", 0), "target2": t.get("target2", 0),
+                        "strategy": strat,
+                    })
+                    if exit_time:
+                        signals.append({
+                            "signal": f"{direction}_EXIT", "time": exit_time,
+                            "entry": t.get("exit_price", 0), "close": t.get("exit_price", 0),
+                            "exit_price": t.get("exit_price", 0), "reason": t.get("exit_reason", ""),
+                            "pnl": t.get("pnl", 0), "pnl_pts": t.get("pnl_pts", 0),
+                            "strategy": strat,
+                        })
+                _chart_signals_cache[strat] = {"result": {"signals": signals, "strategy": strat}, "ts": _now}
 
-        # Exit marker
-        if exit_time:
-            signals.append({
-                "signal": f"{direction}_EXIT",
-                "time": exit_time,
-                "entry": t.get("exit_price", 0),
-                "close": t.get("exit_price", 0),
-                "exit_price": t.get("exit_price", 0),
-                "reason": t.get("exit_reason", ""),
-                "pnl": t.get("pnl", 0),
-                "pnl_pts": t.get("pnl_pts", 0),
-                "strategy": strat,
-            })
+    # 3. Merge real-time live signals so any today-signal shows INSTANTLY on the chart
+    existing_keys = {(s.get("signal"), s.get("time")) for s in signals}
+    for ls in live_signals:
+        key = (ls.get("signal"), ls.get("time"))
+        if key not in existing_keys:
+            signals.append(ls)
 
-    response = {"signals": signals, "strategy": strat, "trades": len(raw_trades)}
-    # Cache the result for 2 minutes
-    _chart_signals_cache[strat] = {"result": response, "ts": _t.time()}
-    return response
+    # Sort all markers chronologically by timestamp
+    try:
+        signals.sort(key=lambda s: str(s.get("time", "")))
+    except Exception:
+        pass
+
+    return {"signals": signals, "strategy": strat, "count": len(signals)}
 
 
 @app.get("/api/signal_journal")
@@ -2074,6 +2073,41 @@ async def _signal_polling_loop():
                                 if _strat_id == cfg.strategy:
                                     asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
 
+                                # Instant order execution for active strategy (1-2s latency matching backtest)
+                                if _strat_id == cfg.strategy and (not tm.position or tm.position.instrument != cfg.instrument):
+                                    ok, reason = True, "OK"
+                                    if cfg.auto_trade:
+                                        ok, reason = tm.can_trade
+                                        if ok:
+                                            ct_ok, ct_reason = get_capital_tracker().can_trade()
+                                            if not ct_ok:
+                                                ok, reason = False, ct_reason
+                                        if ok and broker.is_connected():
+                                            try:
+                                                bp = broker.sync_position_from_broker(cfg.instrument)
+                                                if bp and bp.get("has_position"):
+                                                    ok, reason = False, f"Broker already has open position: {bp.get('symbol')}"
+                                            except Exception:
+                                                pass
+                                    if ok:
+                                        cooldown_bars = getattr(cfg, 'cooldown_bars', 0) if cfg.strategy == "multi_agent" else 0
+                                        if cooldown_bars > 0 and _last_loss_direction == _live_sig.signal and _last_loss_time:
+                                            elapsed_mins = (datetime.now(_IST) - _last_loss_time).total_seconds() / 60.0
+                                            cooldown_mins = cooldown_bars * 5
+                                            if elapsed_mins < cooldown_mins:
+                                                ok, reason = False, f"Cooldown active for {cooldown_mins - elapsed_mins:.1f} mins"
+                                    if ok:
+                                        result = _execute_order(sig_dict, cfg, _live_sig.signal)
+                                        if result.get("success"):
+                                            tm.reset_order_failures()
+                                            await ws_manager.broadcast({"type": "trade_opened", "data": result})
+                                            logger.info(f"Instant trade executed: {_live_sig.signal} {cfg.instrument}")
+                                        else:
+                                            tm.record_order_failure()
+                                            logger.error(f"Trade execution failed: {result.get('error')}")
+                                    else:
+                                        logger.info(f"Instant trade blocked: {reason}")
+
                                 # Always open journal entry for virtual tracking
                                 try:
                                     signal_journal_manager.open_entry(sig_dict, cfg.instrument, _qty)
@@ -2090,6 +2124,65 @@ async def _signal_polling_loop():
                                 # Send Telegram in background (non-blocking) for active strategy
                                 if _strat_id == cfg.strategy:
                                     asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
+
+                                # Execute broker exit for active strategy trade if open
+                                if _strat_id == cfg.strategy and tm.position and tm.position.instrument == cfg.instrument:
+                                    pos = tm.position
+                                    logger.info(f"Processor EXIT ({_live_sig.signal}) for active strategy — closing position {pos.symbol}")
+                                    if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
+                                        if getattr(pos, "sl_order_id", None):
+                                            try:
+                                                broker.cancel_broker_sl(pos.sl_order_id)
+                                            except Exception as _sl_c_err:
+                                                logger.warning(f"Could not cancel broker SL on processor exit: {_sl_c_err}")
+                                            pos.sl_order_id = None
+                                        exit_success = False
+                                        for attempt in range(1, 4):
+                                            _proc_exit = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                                            if _proc_exit.get("success"):
+                                                import time as _v_time
+                                                _v_time.sleep(1)
+                                                bp = broker.sync_position_from_broker(pos.instrument, tracked_symbol=pos.symbol)
+                                                if not (bp and bp.get("has_position")):
+                                                    exit_success = True
+                                                    logger.info(f"Post-exit verified: {pos.symbol} closed on attempt {attempt}")
+                                                    break
+                                                else:
+                                                    logger.warning(f"Post-exit check: {pos.symbol} STILL OPEN after exit attempt {attempt}/3!")
+                                            else:
+                                                logger.warning(f"Processor EXIT attempt {attempt}/3 FAILED: {_proc_exit.get('error')}")
+                                            import time as _t_ex
+                                            _t_ex.sleep(1)
+
+                                        if not exit_success:
+                                            logger.critical(f"CRITICAL SYSTEM FAILURE: Could not exit {pos.symbol} after 3 attempts! Activating Emergency Kill Switch.")
+                                            save_settings({"auto_trade": False})
+                                            try:
+                                                _send_telegram_alert_wrapper(
+                                                    f"\U0001f6a8 EMERGENCY KILL-SWITCH ACTIVATED\n"
+                                                    f"{pos.direction} {pos.symbol}\n"
+                                                    f"EXIT FAILED 3 TIMES AT BROKER!\n"
+                                                    f"Auto-trade has been DISABLED to protect capital.\n"
+                                                    f"PLEASE EXIT MANUALLY ON DHAN IMMEDIATELY!",
+                                                    cfg.telegram_bot_token, cfg.telegram_chat_id
+                                                )
+                                            except Exception:
+                                                pass
+                                            continue  # skip local position close — broker position still open!
+                                        else:
+                                            ltp_idx = broker.get_ltp(pos.instrument) or _live_sig.exit_price
+                                            pnl_exit_price = _safe_pnl_exit_price(pos, ltp_idx)
+                                            _recently_closed_symbols[pos.symbol] = datetime.now(_IST)
+                                            rec = tm.close_position(pnl_exit_price, _live_sig.exit_reason)
+                                            if cfg.auto_trade:
+                                                get_capital_tracker().record_trade_pnl(rec.get("pnl", 0.0))
+                                            await ws_manager.broadcast({"type": "trade_closed", "data": rec})
+                                    else:
+                                        ltp_idx = broker.get_ltp(pos.instrument) or _live_sig.exit_price
+                                        pnl_exit_price = _safe_pnl_exit_price(pos, ltp_idx)
+                                        _recently_closed_symbols[pos.symbol] = datetime.now(_IST)
+                                        rec = tm.close_position(pnl_exit_price, _live_sig.exit_reason)
+                                        await ws_manager.broadcast({"type": "trade_closed", "data": rec})
 
                                 # Always close journal entry for virtual tracking
                                 try:
@@ -2540,21 +2633,55 @@ async def _signal_polling_loop():
                                     except Exception as sl_cancel_err:
                                         logger.warning(f"Could not cancel broker SL: {sl_cancel_err}")
                                     pos.sl_order_id = None
-                                exit_result = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
-                                if not exit_result.get("success"):
-                                    # Exit order FAILED — do NOT close position locally
-                                    logger.error(f"Exit order FAILED for {pos.symbol}: {exit_result.get('error')}. Position kept open.")
+                                
+                                exit_success = False
+                                for attempt in range(1, 4):
+                                    exit_result = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                                    if exit_result.get("success"):
+                                        import time as _v_time
+                                        _v_time.sleep(1)
+                                        bp = broker.sync_position_from_broker(pos.instrument, tracked_symbol=pos.symbol)
+                                        if not (bp and bp.get("has_position")):
+                                            exit_success = True
+                                            logger.info(f"Post-exit verified: {pos.symbol} closed on attempt {attempt}")
+                                            break
+                                        else:
+                                            logger.warning(f"Post-exit check: {pos.symbol} STILL OPEN after exit attempt {attempt}/3!")
+                                    else:
+                                        logger.warning(f"Exit attempt {attempt}/3 FAILED for {pos.symbol}: {exit_result.get('error')}")
+                                    import time as _t_ex
+                                    _t_ex.sleep(1)
+
+                                if not exit_success:
+                                    logger.critical(f"CRITICAL SYSTEM FAILURE: Could not exit {pos.symbol} after 3 attempts! Activating Emergency Kill Switch.")
+                                    save_settings({"auto_trade": False})
                                     try:
                                         _send_telegram_alert_wrapper(
-                                            f"EXIT ORDER FAILED\n"
+                                            f"\U0001f6a8 EMERGENCY KILL-SWITCH ACTIVATED\n"
                                             f"{pos.direction} {pos.symbol}\n"
-                                            f"Reason: {exit_result.get('error')}\n"
-                                            f"Position still open — manual exit may be needed!",
+                                            f"EXIT FAILED 3 TIMES AT BROKER!\n"
+                                            f"Auto-trade has been DISABLED to protect capital.\n"
+                                            f"PLEASE EXIT MANUALLY ON DHAN IMMEDIATELY!",
                                             cfg.telegram_bot_token, cfg.telegram_chat_id
                                         )
                                     except Exception:
                                         pass
-                                    continue  # skip local close — position still exists at broker
+                                        import time as _v_time
+                                        _v_time.sleep(1)
+                                        bp = broker.sync_position_from_broker(pos.instrument, tracked_symbol=pos.symbol)
+                                        if bp and bp.get("has_position"):
+                                            logger.warning(f"Post-exit check: position {pos.symbol} STILL OPEN at broker!")
+                                            _send_telegram_alert_wrapper(
+                                                f"\u26a0\ufe0f EXIT VERIFICATION WARNING\n"
+                                                f"{pos.direction} {pos.symbol}\n"
+                                                f"Exit order sent but position STILL OPEN at broker\n"
+                                                f"Please verify manually on Dhan!",
+                                                cfg.telegram_bot_token, cfg.telegram_chat_id
+                                            )
+                                        else:
+                                            logger.info(f"Post-exit verified: {pos.symbol} position closed at broker")
+                                    except Exception as _ve_err:
+                                        logger.debug(f"Post-exit verification error: {_ve_err}")
                             elif getattr(pos, "sl_order_id", None):
                                 pos.sl_order_id = None
                             elif pos.order_id.startswith("DHAN_SYNC_") and not cfg.auto_trade:
@@ -3661,7 +3788,7 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                 global _recently_closed_symbols
                 if symbol in _recently_closed_symbols:
                     age_secs = (datetime.now(_IST) - _recently_closed_symbols[symbol]).total_seconds()
-                    if age_secs < 300:
+                    if age_secs < 30:
                         return
                     else:
                         del _recently_closed_symbols[symbol]
@@ -4037,13 +4164,14 @@ def _sync_broker_sl(pos, cfg):
     """Update the Stop Loss order trigger price on Dhan when a trailing event occurs."""
     if cfg.auto_trade and broker.is_connected() and getattr(pos, "sl_order_id", None):
         try:
-            if pos.trade_mode == "OPTIONS":
+            is_opt = pos.trade_mode == "OPTIONS"
+            if is_opt:
                 new_sl_trigger = broker.calculate_option_sl_price(
                     pos.direction, pos.entry_price, pos.index_entry_price, pos.sl, pos.symbol
                 )
             else:
                 new_sl_trigger = pos.sl
-            broker.modify_broker_sl(pos.sl_order_id, pos.qty, new_sl_trigger)
+            broker.modify_broker_sl(pos.sl_order_id, pos.qty, new_sl_trigger, is_option=is_opt)
         except Exception as err:
             logger.error(f"Failed to modify broker-side Stop Loss for {pos.symbol}: {err}")
 
@@ -4155,36 +4283,54 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
 
 
         if cfg.auto_trade and broker.is_connected() and not result["order_id"].startswith("PAPER_"):
-            try:
-                if cfg.trade_mode == "OPTIONS":
-                    initial_sl_trigger = broker.calculate_option_sl_price(
-                        direction, entry_price, index_entry_price, result["sl"], result["symbol"]
-                    )
-                else:
-                    initial_sl_trigger = result["sl"]
-                sl_order_id = broker.place_broker_sl(
-                    symbol=result["symbol"],
-                    exchange=result["exchange"],
-                    direction=direction,
-                    quantity=result["qty"],
-                    trigger_price=initial_sl_trigger
+            sl_success = False
+            sl_order_id = None
+            initial_sl_trigger = 0.0
+            
+            if cfg.trade_mode == "OPTIONS":
+                initial_sl_trigger = broker.calculate_option_sl_price(
+                    direction, entry_price, index_entry_price, result["sl"], result["symbol"]
                 )
-                pos.sl_order_id = sl_order_id
-                logger.info(f"Broker SL placed: order_id={sl_order_id}, trigger={initial_sl_trigger}")
-            except Exception as sl_err:
-                logger.error(f"Failed to place broker-side Stop Loss: {sl_err}")
-                # Alert user that SL was NOT placed at broker
+            else:
+                initial_sl_trigger = result["sl"]
+
+            # Attempt up to 3 retries for broker SL placement
+            for attempt in range(1, 4):
+                try:
+                    sl_order_id = broker.place_broker_sl(
+                        symbol=result["symbol"],
+                        exchange=result["exchange"],
+                        direction=direction,
+                        quantity=result["qty"],
+                        trigger_price=initial_sl_trigger
+                    )
+                    if sl_order_id:
+                        sl_success = True
+                        pos.sl_order_id = sl_order_id
+                        logger.info(f"Broker SL placed successfully on attempt {attempt}: order_id={sl_order_id}, trigger={initial_sl_trigger}")
+                        break
+                except Exception as sl_err:
+                    logger.warning(f"Broker SL attempt {attempt}/3 failed: {sl_err}")
+                    if attempt < 3:
+                        import time as _t_sl
+                        _t_sl.sleep(1)
+
+            # AUTONOMOUS RISK ACTION: If SL placement failed after 3 attempts, market-exit immediately!
+            if not sl_success:
+                logger.critical(f"AUTONOMOUS SAFETY ACTION: SL placement failed 3 times for {result['symbol']}. Market-exiting un-hedged position immediately!")
                 try:
                     _send_telegram_alert_wrapper(
-                        f"SL ORDER NOT PLACED\n"
+                        f"\u26a0\ufe0f AUTONOMOUS SAFETY EXIT\n"
                         f"{direction} {result['symbol']}\n"
-                        f"Trigger: {initial_sl_trigger}\n"
-                        f"Error: {sl_err}\n"
-                        f"Position has NO broker SL — monitor manually!",
+                        f"Reason: Could not place Stop-Loss order at broker after 3 retries\n"
+                        f"Action: Position closed automatically to eliminate unhedged risk!",
                         cfg.telegram_bot_token, cfg.telegram_chat_id
                     )
                 except Exception:
                     pass
+                # Execute instant safety exit at broker
+                broker.place_exit_order(result["symbol"], result["exchange"], direction, result["qty"])
+                return {"success": False, "error": "Order cancelled: Failed to place broker Stop Loss after 3 retries"}
 
         tm.open_position(pos)
 
