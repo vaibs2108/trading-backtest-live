@@ -1851,9 +1851,9 @@ def _check_virtual_exits(ltp: float, cfg, frames=None, latest_candle_ts: str = N
 
 
 async def _signal_polling_loop():
-    """Poll for new signals every 60 seconds when connected and market is open."""
+    """Poll for new signals every 15 seconds when connected and market is open."""
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(15)
         try:
             # Application-level pause: skip all work when stopped
             if not _app_running:
@@ -3812,25 +3812,53 @@ def _check_data_staleness(frames: dict, cfg) -> None:
                 logger.info("Data freshness restored")
 
 
+_htf_cache = {}       # cached higher-TF frames: {instrument: {"1D": df, "60": df, "15": df}}
+_htf_cache_ts = 0.0   # last time HTF were fetched
+_htf_poll_count = 0   # cycle counter for periodic HTF refresh
+
 def _fetch_all_frames(instrument: str) -> dict:
-    """Fetch all timeframes needed for the strategy."""
-    import time
+    """Fetch all timeframes needed for the strategy.
+
+    Optimization: Daily/60m/15m data changes slowly, so we cache them and
+    only re-fetch every 5th cycle (~75s). The fast-moving 5m and 1m frames
+    are always fetched fresh.
+    """
+    import time as _time_mod
     import pytz
+    global _htf_cache, _htf_cache_ts, _htf_poll_count
+
     kolkata_tz = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(kolkata_tz)
     today = (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
-    
+
     frames = {}
-    specs = [
-        ("1D", 1000), ("60", 120), ("15", 60), ("5", 30), ("1", 5)
-    ]
-    for tf_key, days in specs:
-        tf_dhan = "DAY" if tf_key == "1D" else tf_key
-        from_d  = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
-        df = broker.get_historical_data(instrument, tf_dhan, from_d, today)
+    _htf_poll_count += 1
+
+    # Higher timeframes: refresh every 5th cycle (~75s) or on first run
+    htf_stale = (_htf_poll_count % 5 == 1) or not _htf_cache.get(instrument)
+
+    if htf_stale:
+        for tf_key, days in [("1D", 1000), ("60", 120), ("15", 60)]:
+            tf_dhan = "DAY" if tf_key == "1D" else tf_key
+            from_d = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
+            df = broker.get_historical_data(instrument, tf_dhan, from_d, today)
+            if df is not None and len(df) >= 30:
+                frames[tf_key] = df
+            _time_mod.sleep(1.0)  # 1s throttle (Dhan allows ~10 req/s, retry handles DH-904)
+        _htf_cache[instrument] = {k: v for k, v in frames.items() if k in ("1D", "60", "15")}
+        _htf_cache_ts = _time_mod.time()
+    else:
+        # Reuse cached HTF data
+        frames.update(_htf_cache.get(instrument, {}))
+
+    # Fast timeframes: always fetch fresh (these are what signals depend on)
+    for tf_key, days in [("5", 30), ("1", 5)]:
+        from_d = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
+        df = broker.get_historical_data(instrument, tf_key, from_d, today)
         if df is not None and len(df) >= 30:
             frames[tf_key] = df
-        time.sleep(2.5)  # Throttling to avoid Dhan rate limit (DH-904)
+        _time_mod.sleep(1.0)
+
     return frames
 
 
