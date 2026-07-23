@@ -967,26 +967,18 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
     """Run backtest for the selected strategy and return entry/exit markers for chart overlay.
 
     This mirrors TradingView behaviour: applying a strategy shows signals
-    over the entire available history, not just today.
+    over the entire available history, strictly matching the backtest trade log.
     """
     cfg = get_settings()
     strat = strategy or cfg.strategy
 
-    # 1. Fetch real-time live signals from history (instant O(1) memory lookup)
-    today_str = datetime.now(_IST).strftime("%Y-%m-%d")
-    live_signals = [
-        s for s in _signal_history
-        if (s.get("strategy") == strat or not s.get("strategy")) and
-           (s.get("instrument") == cfg.instrument or not s.get("instrument"))
-    ]
-
-    # 2. Check backtest result cache first (valid for 120s — backtest is expensive on 1-vCPU)
+    # Check backtest result cache first (valid for 10s so chart stays in live sync with backtest)
     import time as _t
     _now = _t.time()
     _bt_cache = _chart_signals_cache.get(strat)
     
     signals = []
-    if _bt_cache and (_now - _bt_cache["ts"]) < 120:
+    if _bt_cache and (_now - _bt_cache["ts"]) < 10:
         signals = list(_bt_cache["result"].get("signals", []))
     else:
         # Use cached frames from the polling loop if available and fresh (< 3 min)
@@ -1037,16 +1029,15 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
                         })
                 _chart_signals_cache[strat] = {"result": {"signals": signals, "strategy": strat}, "ts": _now}
 
-    # 3. Merge real-time live signals so any today-signal shows INSTANTLY on the chart
-    existing_keys = {(s.get("signal"), s.get("time")) for s in signals}
-    for ls in live_signals:
-        key = (ls.get("signal"), ls.get("time"))
-        if key not in existing_keys:
-            signals.append(ls)
-
     # Sort all markers chronologically by timestamp
+    def _norm_ts(ts_val) -> str:
+        if not ts_val:
+            return ""
+        s = str(ts_val).replace("T", " ").split("+")[0].split(".")[0].strip()
+        return s[:16] if len(s) >= 16 else s
+
     try:
-        signals.sort(key=lambda s: str(s.get("time", "")))
+        signals.sort(key=lambda s: _norm_ts(s.get("time", "")))
     except Exception:
         pass
 

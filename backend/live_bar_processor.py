@@ -137,6 +137,12 @@ class RegimeLiveProcessor:
         self._last_close = 0.0
         self._last_exit_signal: Optional[str] = None   # "LONG_EXIT" / "SHORT_EXIT" — consumed by get_ui_signal
         self._last_exit_reason: Optional[str] = None    # e.g. "REGIME_EXIT", "SL_HIT"
+        self._proc_state = {
+            "regime": "SIDEWAYS",
+            "regime_age": 0,
+            "htf_cache": None,
+            "htf_cache_hour": -1,
+        }
 
     def reset(self):
         """Reset all state — call on daily boundary or restart."""
@@ -145,6 +151,12 @@ class RegimeLiveProcessor:
         rs._prev_regime_age = 0
         rs._htf_cache = None
         rs._htf_cache_hour = -1
+        self._proc_state = {
+            "regime": "SIDEWAYS",
+            "regime_age": 0,
+            "htf_cache": None,
+            "htf_cache_hour": -1,
+        }
         self.position = "NONE"
         self.entry_price = 0.0
         self.sl = 0.0
@@ -182,6 +194,19 @@ class RegimeLiveProcessor:
             return []
 
         base = base[_session_mask(base, cfg)].copy().reset_index(drop=True)
+        if base.empty:
+            return []
+
+        # ── CRITICAL: Filter for completed bars only ─────────────────────────
+        # A 5-minute candle with timestamp T (e.g. 09:30:00) completes at 09:35:00 IST.
+        # Evaluating incomplete forming bars prematurely sets last_processed_ts and
+        # causes completed bar signals to be missed. Only evaluate closed bars!
+        import pytz
+        now_ist = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
+        ts_series = pd.to_datetime(base["timestamp"]).dt.tz_localize(None)
+        is_past_day = ts_series.dt.date < now_ist.date()
+        is_bar_closed = ts_series.apply(lambda ts: ts + timedelta(minutes=5) <= now_ist)
+        base = base[is_past_day | is_bar_closed].copy().reset_index(drop=True)
         if base.empty:
             return []
 
@@ -288,7 +313,7 @@ class RegimeLiveProcessor:
                     w_1h = df_1h[df_1h["timestamp"] <= w_ts].tail(200) if df_1h is not None else None
                     w_1d = df_1d[df_1d["timestamp"] <= w_ts].tail(200) if df_1d is not None else None
                     w_1w = df_1w[df_1w["timestamp"] <= w_ts].tail(200) if df_1w is not None else None
-                    _run_agents(w_df_slice, w_row, "NONE", cfg, w_1h, w_1d, w_1w)
+                    _run_agents(w_df_slice, w_row, "NONE", cfg, w_1h, w_1d, w_1w, _state=self._proc_state)
                 logger.info(f"[RegimeProcessor] Warm-up complete, regime state is now primed")
 
             start_idx = today_idx
@@ -339,11 +364,11 @@ class RegimeLiveProcessor:
                         if trail_sl > self.sl:
                             self.sl = trail_sl
 
-                    sig = _run_agents(df_slice, row, "LONG", cfg, df_1h_cur, df_1d_cur, df_1w_cur)
+                    sig = _run_agents(df_slice, row, "LONG", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=self._proc_state)
                     if sig.signal == "LONG_EXIT":
                         signals_out.append(self._book_exit(bc, "REGIME_EXIT", ts, base, qty))
                     elif self.position == "LONG":
-                        opp_sig = _run_agents(df_slice, row, "NONE", cfg, df_1h_cur, df_1d_cur, df_1w_cur)
+                        opp_sig = _run_agents(df_slice, row, "NONE", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=self._proc_state)
                         if opp_sig.signal == "SHORT":
                             signals_out.append(self._book_exit(bc, "OPPOSITE_SIGNAL", ts, base, qty))
 
@@ -358,11 +383,11 @@ class RegimeLiveProcessor:
                         if trail_sl < self.sl:
                             self.sl = trail_sl
 
-                    sig = _run_agents(df_slice, row, "SHORT", cfg, df_1h_cur, df_1d_cur, df_1w_cur)
+                    sig = _run_agents(df_slice, row, "SHORT", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=self._proc_state)
                     if sig.signal == "SHORT_EXIT":
                         signals_out.append(self._book_exit(bc, "REGIME_EXIT", ts, base, qty))
                     elif self.position == "SHORT":
-                        opp_sig = _run_agents(df_slice, row, "NONE", cfg, df_1h_cur, df_1d_cur, df_1w_cur)
+                        opp_sig = _run_agents(df_slice, row, "NONE", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=self._proc_state)
                         if opp_sig.signal == "LONG":
                             signals_out.append(self._book_exit(bc, "OPPOSITE_SIGNAL", ts, base, qty))
 
@@ -372,7 +397,7 @@ class RegimeLiveProcessor:
                     self.last_processed_ts = ts
                     continue
 
-                sig = _run_agents(df_slice, row, "NONE", cfg, df_1h_cur, df_1d_cur, df_1w_cur)
+                sig = _run_agents(df_slice, row, "NONE", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=self._proc_state)
 
                 if sig.signal in ("LONG", "SHORT"):
                     # Use current close — no look-ahead bias (matches backtest)
