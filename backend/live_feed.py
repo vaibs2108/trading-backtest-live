@@ -44,9 +44,12 @@ class CandleBuilder:
         self._current_slot: Optional[datetime] = None
 
     def _get_slot(self, dt: datetime) -> datetime:
-        """Round down to the start of the current candle slot."""
+        """Round down to the start of the current candle slot (timezone-naive IST)."""
         minute = (dt.minute // self.tf_minutes) * self.tf_minutes
-        return dt.replace(minute=minute, second=0, microsecond=0)
+        slot = dt.replace(minute=minute, second=0, microsecond=0)
+        if slot.tzinfo is not None:
+            slot = slot.replace(tzinfo=None)
+        return slot
 
     def on_tick(self, price: float, volume: int, tick_time: datetime) -> Optional[dict]:
         """Process a tick. Returns the completed candle dict if a new slot started."""
@@ -87,7 +90,18 @@ class CandleBuilder:
             rows.append(self._current.copy())
         if not rows:
             return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df = pd.DataFrame(rows)
+        
+        cleaned_rows = []
+        for r in rows:
+            rc = r.copy()
+            ts = rc.get("timestamp")
+            if isinstance(ts, datetime) and ts.tzinfo is not None:
+                rc["timestamp"] = ts.replace(tzinfo=None)
+            elif isinstance(ts, pd.Timestamp) and ts.tzinfo is not None:
+                rc["timestamp"] = ts.tz_localize(None)
+            cleaned_rows.append(rc)
+
+        df = pd.DataFrame(cleaned_rows)
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         return df
 
