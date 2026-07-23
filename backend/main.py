@@ -455,12 +455,34 @@ async def get_status():
     lot = broker.get_lot_size(cfg.instrument) if broker.is_connected() else INSTRUMENT_META.get(cfg.instrument, {}).get("lot_size", 15)
     ltp = broker.get_ltp(cfg.instrument) if broker.is_connected() else None
 
-    # Compute Live P&L from TradeManager's tracked position (most accurate)
+    # Compute Live P&L from TradeManager's tracked position
     live_pnl = 0.0
-    if tm.position and tm.position.instrument == cfg.instrument and ltp:
-        if tm.position.order_id.startswith("PAPER_"):
-            tm.update_pnl(ltp)
-        live_pnl = round(tm.position.current_pnl, 2)
+    if tm.position and tm.position.instrument == cfg.instrument:
+        pos = tm.position
+        if pos.order_id.startswith("PAPER_"):
+            # Paper mode: use index LTP for P&L
+            if ltp:
+                tm.update_pnl(ltp)
+            live_pnl = round(pos.current_pnl, 2)
+        elif pos.trade_mode == "OPTIONS" and broker.is_connected() and pos.symbol:
+            # Live OPTIONS: compute from actual option premium change
+            # Options are always BOUGHT (BUY PUT for SHORT, BUY CE for LONG)
+            # so P&L = (current_option_ltp - entry_option_price) * qty
+            try:
+                opt_ltp = broker.get_option_ltp(pos.symbol)
+                if opt_ltp and opt_ltp > 0 and pos.entry_price > 0:
+                    live_pnl = round((opt_ltp - pos.entry_price) * pos.qty, 2)
+                    pos.current_pnl = live_pnl  # keep in sync
+                else:
+                    live_pnl = round(pos.current_pnl, 2)  # fallback to sync value
+            except Exception as _opt_err:
+                logger.debug(f"Option LTP fetch for P&L failed: {_opt_err}")
+                live_pnl = round(pos.current_pnl, 2)
+        else:
+            # Live INDEX: use index LTP for P&L
+            if ltp:
+                tm.update_pnl(ltp)
+            live_pnl = round(pos.current_pnl, 2)
 
     # Today's P&L: use journal-derived stats as authoritative source
     try:
@@ -2068,7 +2090,20 @@ async def _signal_polling_loop():
                                 if _strat_id == cfg.strategy and (not tm.position or tm.position.instrument != cfg.instrument):
                                     ok, reason = True, "OK"
                                     if cfg.auto_trade:
-                                        ok, reason = tm.can_trade
+                                        # Signal freshness check: skip historical replay signals (>10 mins old)
+                                        try:
+                                            _parsed_sig_time = pd.to_datetime(_live_sig.time)
+                                            if hasattr(_parsed_sig_time, "tzinfo") and _parsed_sig_time.tzinfo is not None:
+                                                _parsed_sig_time = _parsed_sig_time.tz_convert("Asia/Kolkata").tz_localize(None)
+                                            _now_ist_naive = datetime.now(_IST).replace(tzinfo=None)
+                                            _sig_age = (_now_ist_naive - _parsed_sig_time).total_seconds() / 60.0
+                                            if _sig_age > 10.0:
+                                                ok, reason = False, f"Historical replay signal skipped ({_sig_age:.1f} mins old)"
+                                        except Exception as _age_err:
+                                            logger.debug(f"Signal age check error: {_age_err}")
+
+                                        if ok:
+                                            ok, reason = tm.can_trade
                                         if ok:
                                             ct_ok, ct_reason = get_capital_tracker().can_trade()
                                             if not ct_ok:
@@ -2127,47 +2162,29 @@ async def _signal_polling_loop():
                                             except Exception as _sl_c_err:
                                                 logger.warning(f"Could not cancel broker SL on processor exit: {_sl_c_err}")
                                             pos.sl_order_id = None
-                                        exit_success = False
-                                        for attempt in range(1, 4):
-                                            _proc_exit = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
-                                            if _proc_exit.get("success"):
-                                                import time as _v_time
-                                                _v_time.sleep(1)
-                                                bp = broker.sync_position_from_broker(pos.instrument, tracked_symbol=pos.symbol)
-                                                if not (bp and bp.get("has_position")):
-                                                    exit_success = True
-                                                    logger.info(f"Post-exit verified: {pos.symbol} closed on attempt {attempt}")
-                                                    break
-                                                else:
-                                                    logger.warning(f"Post-exit check: {pos.symbol} STILL OPEN after exit attempt {attempt}/3!")
-                                            else:
-                                                logger.warning(f"Processor EXIT attempt {attempt}/3 FAILED: {_proc_exit.get('error')}")
-                                            import time as _t_ex
-                                            _t_ex.sleep(1)
-
-                                        if not exit_success:
-                                            logger.critical(f"CRITICAL SYSTEM FAILURE: Could not exit {pos.symbol} after 3 attempts! Activating Emergency Kill Switch.")
-                                            save_settings({"auto_trade": False})
+                                        _proc_exit = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                                        if not _proc_exit.get("success"):
+                                            logger.error(f"Processor EXIT FAILED for {pos.symbol}: {_proc_exit.get('error')}")
                                             try:
                                                 _send_telegram_alert_wrapper(
-                                                    f"\U0001f6a8 EMERGENCY KILL-SWITCH ACTIVATED\n"
+                                                    f"EXIT ORDER FAILED (processor)\n"
                                                     f"{pos.direction} {pos.symbol}\n"
-                                                    f"EXIT FAILED 3 TIMES AT BROKER!\n"
-                                                    f"Auto-trade has been DISABLED to protect capital.\n"
-                                                    f"PLEASE EXIT MANUALLY ON DHAN IMMEDIATELY!",
+                                                    f"Reason: {_proc_exit.get('error')}\n"
+                                                    f"Position may still be open — check Dhan!",
                                                     cfg.telegram_bot_token, cfg.telegram_chat_id
                                                 )
                                             except Exception:
                                                 pass
-                                            continue  # skip local position close — broker position still open!
-                                        else:
-                                            ltp_idx = broker.get_ltp(pos.instrument) or _live_sig.exit_price
-                                            pnl_exit_price = _safe_pnl_exit_price(pos, ltp_idx)
-                                            _recently_closed_symbols[pos.symbol] = datetime.now(_IST)
-                                            rec = tm.close_position(pnl_exit_price, _live_sig.exit_reason)
-                                            if cfg.auto_trade:
-                                                get_capital_tracker().record_trade_pnl(rec.get("pnl", 0.0))
-                                            await ws_manager.broadcast({"type": "trade_closed", "data": rec})
+                                            continue  # skip local position close — broker exit failed
+                                        # Exit order succeeded — close position locally
+                                        logger.info(f"Processor EXIT order placed successfully for {pos.symbol}")
+                                        ltp_idx = broker.get_ltp(pos.instrument) or _live_sig.exit_price
+                                        pnl_exit_price = _safe_pnl_exit_price(pos, ltp_idx)
+                                        _recently_closed_symbols[pos.symbol] = datetime.now(_IST)
+                                        rec = tm.close_position(pnl_exit_price, _live_sig.exit_reason)
+                                        if cfg.auto_trade:
+                                            get_capital_tracker().record_trade_pnl(rec.get("pnl", 0.0))
+                                        await ws_manager.broadcast({"type": "trade_closed", "data": rec})
                                     else:
                                         ltp_idx = broker.get_ltp(pos.instrument) or _live_sig.exit_price
                                         pnl_exit_price = _safe_pnl_exit_price(pos, ltp_idx)
@@ -2625,54 +2642,22 @@ async def _signal_polling_loop():
                                         logger.warning(f"Could not cancel broker SL: {sl_cancel_err}")
                                     pos.sl_order_id = None
                                 
-                                exit_success = False
-                                for attempt in range(1, 4):
-                                    exit_result = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
-                                    if exit_result.get("success"):
-                                        import time as _v_time
-                                        _v_time.sleep(1)
-                                        bp = broker.sync_position_from_broker(pos.instrument, tracked_symbol=pos.symbol)
-                                        if not (bp and bp.get("has_position")):
-                                            exit_success = True
-                                            logger.info(f"Post-exit verified: {pos.symbol} closed on attempt {attempt}")
-                                            break
-                                        else:
-                                            logger.warning(f"Post-exit check: {pos.symbol} STILL OPEN after exit attempt {attempt}/3!")
-                                    else:
-                                        logger.warning(f"Exit attempt {attempt}/3 FAILED for {pos.symbol}: {exit_result.get('error')}")
-                                    import time as _t_ex
-                                    _t_ex.sleep(1)
-
-                                if not exit_success:
-                                    logger.critical(f"CRITICAL SYSTEM FAILURE: Could not exit {pos.symbol} after 3 attempts! Activating Emergency Kill Switch.")
-                                    save_settings({"auto_trade": False})
+                                exit_result = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                                if exit_result.get("success"):
+                                    logger.info(f"SL/target EXIT order placed successfully for {pos.symbol} ({exit_reason})")
+                                else:
+                                    logger.error(f"SL/target EXIT FAILED for {pos.symbol}: {exit_result.get('error')}")
                                     try:
                                         _send_telegram_alert_wrapper(
-                                            f"\U0001f6a8 EMERGENCY KILL-SWITCH ACTIVATED\n"
+                                            f"EXIT ORDER FAILED ({exit_reason})\n"
                                             f"{pos.direction} {pos.symbol}\n"
-                                            f"EXIT FAILED 3 TIMES AT BROKER!\n"
-                                            f"Auto-trade has been DISABLED to protect capital.\n"
-                                            f"PLEASE EXIT MANUALLY ON DHAN IMMEDIATELY!",
+                                            f"Reason: {exit_result.get('error')}\n"
+                                            f"Position may still be open — check Dhan!",
                                             cfg.telegram_bot_token, cfg.telegram_chat_id
                                         )
                                     except Exception:
                                         pass
-                                        import time as _v_time
-                                        _v_time.sleep(1)
-                                        bp = broker.sync_position_from_broker(pos.instrument, tracked_symbol=pos.symbol)
-                                        if bp and bp.get("has_position"):
-                                            logger.warning(f"Post-exit check: position {pos.symbol} STILL OPEN at broker!")
-                                            _send_telegram_alert_wrapper(
-                                                f"\u26a0\ufe0f EXIT VERIFICATION WARNING\n"
-                                                f"{pos.direction} {pos.symbol}\n"
-                                                f"Exit order sent but position STILL OPEN at broker\n"
-                                                f"Please verify manually on Dhan!",
-                                                cfg.telegram_bot_token, cfg.telegram_chat_id
-                                            )
-                                        else:
-                                            logger.info(f"Post-exit verified: {pos.symbol} position closed at broker")
-                                    except Exception as _ve_err:
-                                        logger.debug(f"Post-exit verification error: {_ve_err}")
+                                    continue  # skip local position close — broker exit failed
                             elif getattr(pos, "sl_order_id", None):
                                 pos.sl_order_id = None
                             elif pos.order_id.startswith("DHAN_SYNC_") and not cfg.auto_trade:
