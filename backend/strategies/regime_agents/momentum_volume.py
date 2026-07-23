@@ -61,7 +61,8 @@ class MomentumVolumeAgent:
         if vol_ratio > 1.2:
             return "RISING", min(vol_ratio / 2.0, 1.0), f"Volume rising ({vol_ratio:.1f}x prior)"
         elif vol_ratio < 0.8:
-            return "FALLING", min(1.0 / vol_ratio / 2.0, 1.0), f"Volume falling ({vol_ratio:.1f}x prior)"
+            inv = (1.0 / vol_ratio / 2.0) if vol_ratio > 0 else 1.0
+            return "FALLING", min(inv, 1.0), f"Volume falling ({vol_ratio:.1f}x prior)"
         return "NEUTRAL", 0.5, f"Volume steady ({vol_ratio:.1f}x prior)"
 
     def _rate_of_change_accel(self, closes: np.ndarray) -> tuple:

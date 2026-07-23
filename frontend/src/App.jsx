@@ -743,7 +743,7 @@ function DayStats({ state, balance, livePnl, todayPnl, lotSize }) {
   return (
     <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
       <MetricBox label="Balance" value={`₹${fmt(balance)}`} color={V('accent')} />
-      <MetricBox label="Live P&L" value={fmtPnl(livePnl)} color={clr(livePnl)} />
+      <MetricBox label="Position P&L" value={fmtPnl(livePnl)} color={clr(livePnl)} />
       <MetricBox label="Today's P&L" value={fmtPnl(displayPnl)} color={clr(displayPnl)} sub={`${d?.total_trades||0} trades`} />
       <MetricBox label="Win/Loss" value={`${d?.wins||0} / ${d?.losses||0}`} color={V('text-primary')} sub={lotSize ? `Lot: ${lotSize}` : (d?.total_trades > 0 ? `${((d?.wins/d?.total_trades)*100).toFixed(0)}% WR` : '—')} />
     </div>
@@ -3978,7 +3978,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
       {/* Key metrics */}
       <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
         <MetricBox label="Balance" value={`₹${fmt(balance)}`} color={V('accent')} />
-        <MetricBox label="Live P&L" value={fmtPnl(livePnl)} color={clr(livePnl)} />
+        <MetricBox label="Position P&L" value={fmtPnl(livePnl)} color={clr(livePnl)} />
         <MetricBox label="Today's P&L" value={fmtPnl(displayPnl)} color={clr(displayPnl)} sub={`${d?.total_trades||0} trades`} />
         <MetricBox label="Win / Loss" value={`${d?.wins||0} / ${d?.losses||0}`} color={V('text-primary')} sub={lotSize ? `Lot: ${lotSize}` : (d?.total_trades > 0 ? `${((d?.wins/d?.total_trades)*100).toFixed(0)}% WR` : '—')} />
       </div>
