@@ -1013,11 +1013,9 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
         if frames:
             def _run_bt():
                 try:
-                    if strat == "regime_trend_range":
-                        from strategies.regime_strategy import run_backtest
-                    else:
-                        from strategy import run_backtest
-                    return run_backtest(frames)
+                    from strategy_router import _get_strategy_module
+                    mod = _get_strategy_module(strat)
+                    return mod.run_backtest(frames)
                 except Exception as e:
                     logger.error(f"chart_signals backtest error ({strat}): {e}")
                     return None
@@ -2056,7 +2054,7 @@ async def _signal_polling_loop():
                 global _last_processed_candle_ts, _virtual_cooldown
                 global _all_strat_sigs_cache
 
-                from live_bar_processor import get_regime_processor, get_multi_agent_processor
+                from live_bar_processor import get_regime_processor, get_multi_agent_processor, get_regime_reversal_processor
 
                 _lot_size = broker.get_lot_size(cfg.instrument) if broker.is_connected() else INSTRUMENT_META.get(cfg.instrument, {}).get("lot_size", 15)
                 _qty = int(_lot_size * cfg.lot_multiplier)
@@ -2064,6 +2062,7 @@ async def _signal_polling_loop():
                 _all_strat_sigs = {}
 
                 for _strat_id, _processor in [
+                    ("regime_reversal", get_regime_reversal_processor()),
                     ("regime_trend_range", get_regime_processor()),
                     ("multi_agent", get_multi_agent_processor()),
                 ]:

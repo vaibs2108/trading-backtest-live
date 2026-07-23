@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     dhan_access_token: str = ""
 
     # ── Strategy Selection ─────────────────────────────────────────────────
-    strategy: str = "regime_trend_range"    # multi_agent | regime_trend_range
+    strategy: str = "regime_reversal"    # regime_reversal | regime_trend_range | multi_agent
 
     # ── Instrument Settings ────────────────────────────────────────────────
     instrument: str = "BANKNIFTY"          # NIFTY | BANKNIFTY | SENSEX

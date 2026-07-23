@@ -68,6 +68,9 @@ def main():
             reload=True,
             log_level="info",
         )
+    except KeyboardInterrupt:
+        print("\n👋 DhanML trading engine stopped cleanly.")
+        os._exit(0)
     except ImportError:
         print("ERROR: uvicorn not installed. Run: uv pip install -r requirements.txt")
         sys.exit(1)

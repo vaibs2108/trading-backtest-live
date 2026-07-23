@@ -27,10 +27,10 @@ def _get_strategy_module(strategy_name: str = None):
             import strategy as mod
         elif strategy_name == "regime_trend_range":
             from strategies import regime_strategy as mod
-        elif strategy_name == "kalman_vix":
-            from strategies import kalman_vix_strategy as mod
-        elif strategy_name == "supertrendy":
-            from strategies import supertrendy_strategy as mod
+        elif strategy_name == "trend_reversal":
+            from strategies import trend_reversal_strategy as mod
+        elif strategy_name == "regime_reversal":
+            from strategies import regime_reversal_strategy as mod
         else:
             logger.warning(f"Unknown strategy '{strategy_name}', falling back to multi_agent")
             import strategy as mod
@@ -68,7 +68,7 @@ def add_indicators(df):
 # ── Strategy registry (for UI dropdowns) ────────────────────────────────────
 
 STRATEGY_OPTIONS = {
-    "multi_agent": "Multi-Agent Optimized (6 agents + ML + Orchestrator)",
+    "regime_reversal": "Regime + Reversal Combined",
     "regime_trend_range": "Regime Trend/Range Optimized (6 agents)",
 }
 

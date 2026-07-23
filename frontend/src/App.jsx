@@ -443,7 +443,7 @@ function SignalPanel({ signal, onManualTrade, position, connected, ltp, lastEntr
     <Card style={{ borderLeft:`3px solid ${sigColor}`, height:'100%', boxSizing:'border-box', display:'flex', flexDirection:'column', justifyContent:'space-between' }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
         <div>
-          <div style={{ color:V('text-muted'), fontSize:11, marginBottom:4, fontWeight:500 }}>{signal.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : signal.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : 'Strategy Signal'}</div>
+          <div style={{ color:V('text-muted'), fontSize:11, marginBottom:4, fontWeight:500 }}>{signal.strategy === 'regime_reversal' ? 'Regime + Reversal' : signal.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : signal.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : 'Strategy Signal'}</div>
           <div style={{ color:sigColor, fontSize:24, fontWeight:800 }}>{sigIcon} {showActiveEntry ? `${lastEntry.signal} (active)` : sig}</div>
           {signal.time && <div style={{ color:V('text-muted'), fontSize:10, marginTop:2 }}>{toIST(signal.time)}</div>}
         </div>
@@ -798,7 +798,7 @@ function SettingsPanel({ onSaved }) {
           <Card>
             <SectionTitle label="Strategy & Instrument" icon={<Cpu size={16} style={{color:V('accent')}} />} />
             <Row label="Strategy">
-              <Sel val={cfg.strategy} opts={[{v:'multi_agent',l:'Multi-Agent Optimized (6 agents + ML)'},{v:'regime_trend_range',l:'Regime Trend/Range Optimized'}]} onChange={v=>set('strategy',v)} />
+              <Sel val={cfg.strategy} opts={[{v:'regime_reversal',l:'Regime + Reversal Combined'},{v:'regime_trend_range',l:'Regime Trend/Range Optimized'}]} onChange={v=>set('strategy',v)} />
             </Row>
             <Row label="Instrument">
               <Sel val={cfg.instrument} opts={['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY','CRUDEOIL']} onChange={v=>set('instrument',v)} />
@@ -870,10 +870,7 @@ function SettingsPanel({ onSaved }) {
           {/* Strategy Specific Settings */}
           <Card>
             <SectionTitle label="Strategy Parameters" icon={<Target size={16} style={{color:V('yellow')}} />} />
-            <div style={{ fontSize:11, color:V('text-muted'), fontWeight:600, margin:'8px 0 4px', textTransform:'uppercase' }}>Multi-Agent Strategy</div>
-            <Row label="ML Threshold">
-              <Num val={cfg.ml_threshold} onChange={v=>set('ml_threshold',v)} min={0.3} max={0.9} step={0.01} />
-            </Row>
+            <div style={{ fontSize:11, color:V('text-muted'), fontWeight:600, margin:'8px 0 4px', textTransform:'uppercase' }}>Strategy Configuration</div>
             <Row label="SL Multiplier (ATR×)">
               <Num val={cfg.atr_sl_mult} onChange={v=>set('atr_sl_mult',v)} min={0.5} max={3} step={0.1} />
             </Row>
@@ -911,12 +908,6 @@ function SettingsPanel({ onSaved }) {
             <Row label="Chart Timeframe">
               <Sel val={cfg.chart_timeframe} opts={[{v:'1',l:'1 Min'},{v:'5',l:'5 Min'},{v:'15',l:'15 Min'},{v:'25',l:'25 Min'},{v:'60',l:'1 Hour'},{v:'DAY',l:'Daily'}]} onChange={v=>set('chart_timeframe',v)} />
             </Row>
-            <Row label="Min Orchestrator Score">
-              <Num val={cfg.min_orchestrator_score} onChange={v=>set('min_orchestrator_score',v)} min={0.3} max={0.9} step={0.05} />
-            </Row>
-            <Row label="Chart Patterns">
-              <Sel val={cfg.chart_patterns_enabled ? 'true' : 'false'} opts={[{v:'true',l:'Enabled'},{v:'false',l:'Disabled'}]} onChange={v=>set('chart_patterns_enabled',v==='true')} />
-            </Row>
           </Card>
         </div>
       </div>
@@ -934,7 +925,7 @@ function SettingsPanel({ onSaved }) {
 // ── Backtest Panel ──────────────────────────────────────────────────────────
 function BacktestPanel({ connected }) {
   const m = window.innerWidth < 768
-  const [form, setForm] = useState({ instrument:'BANKNIFTY', from_date:'', to_date:'', initial_capital:500000, lot_multiplier:1, strategy:'multi_agent' })
+  const [form, setForm] = useState({ instrument:'BANKNIFTY', from_date:'', to_date:'', initial_capital:500000, lot_multiplier:1, strategy:'regime_reversal' })
   const [result, setResult] = useState(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState('')
@@ -982,7 +973,7 @@ function BacktestPanel({ connected }) {
         <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
           {[
             ['Strategy', <select value={form.strategy} onChange={e=>setForm(p=>({...p,strategy:e.target.value}))} style={inputStyle}>
-              {[{v:'multi_agent',l:'Multi-Agent Optimized'},{v:'regime_trend_range',l:'Regime Trend/Range Optimized'},{v:'kalman_vix',l:'Kalman VIX Regime-Switching'},{v:'supertrendy',l:'SuperTrendy (Adaptive ST)'}].map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
+              {[{v:'multi_agent',l:'Multi-Agent Optimized'},{v:'regime_trend_range',l:'Regime Trend/Range Optimized'},{v:'trend_reversal',l:'Regression Trend Reversal'},{v:'regime_reversal',l:'Regime + Reversal Combined'}].map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
             </select>],
             ['Instrument', <select value={form.instrument} onChange={e=>setForm(p=>({...p,instrument:e.target.value}))} style={inputStyle}>
               {['NIFTY','BANKNIFTY','SENSEX','CRUDEOIL'].map(i=><option key={i}>{i}</option>)}
@@ -1165,7 +1156,7 @@ function SignalJournalPanel({ entries, onRefresh }) {
     const headers = ['Date', 'Strategy', 'Instrument', 'Direction', 'Entry Price', 'SL', 'Target 1', 'Target 2', 'Regime', 'Score', 'Exit Time', 'Exit Price', 'P&L pts', 'P&L INR', 'Exit Reason', 'Status']
     const rows = filteredEntries.map(e => [
       e.entry_time,
-      e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy,
+      e.strategy === 'regime_reversal' ? 'Regime + Reversal' : e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy,
       e.instrument,
       e.direction,
       e.entry_price,
@@ -1224,7 +1215,7 @@ function SignalJournalPanel({ entries, onRefresh }) {
                 }}
               >
                 <option value="ALL">All Strategies</option>
-                <option value="multi_agent">Multi-Agent Optimized</option>
+                <option value="regime_reversal">Regime + Reversal Combined</option>
                 <option value="regime_trend_range">Regime T/R Optimized</option>
               </select>
             </div>
@@ -1317,7 +1308,7 @@ function SignalJournalPanel({ entries, onRefresh }) {
                 <tr key={i} style={{ borderBottom:`1px solid ${V('border-light')}`, background: i%2===0 ? 'transparent' : V('bg-tertiary') }}>
                   <td style={{ padding:'6px 8px', color:V('text-muted'), whiteSpace:'nowrap', fontSize:10 }}>{toISTDateTime(e.entry_time)}</td>
                   <td style={{ padding:'6px 8px', color:V('text-primary'), fontWeight:500 }}>
-                    {e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy}
+                    {e.strategy === 'regime_reversal' ? 'Regime + Reversal' : e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy}
                   </td>
                   <td style={{ padding:'6px 8px', color:V('text-primary'), fontWeight:500 }}>{e.instrument}</td>
                   <td style={{ padding:'6px 8px', color:e.direction==='LONG'?V('green'):V('red'), fontWeight:700 }}>{e.direction}</td>
@@ -3635,7 +3626,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
   const d = tradeState?.day_stats
   const displayPnl = todayPnl != null && todayPnl !== 0 ? todayPnl : d?.gross_pnl
 
-  const strategyLabels = { multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized' }
+  const strategyLabels = { regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized' }
   const [sparkData, setSparkData] = React.useState({ closes: [], pct_change: 0.0 })
   const [logs, setLogs] = React.useState([])
   const [isClosing, setIsClosing] = React.useState(false)
@@ -3781,7 +3772,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
     </Card>
   )
 
-  const maSignal = allSignals?.multi_agent || (strategy === 'multi_agent' ? signal : null)
+  const maSignal = allSignals?.regime_reversal || (strategy === 'regime_reversal' ? signal : null)
   const rtrSignal = allSignals?.regime_trend_range || (strategy === 'regime_trend_range' ? signal : null)
 
   // Risk Budget Horizontal Progress Calculation
@@ -3841,7 +3832,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
               background:'transparent', color:V('text-primary'), border:'none', fontSize:17, fontWeight:800, marginTop:4, outline:'none', cursor:'pointer', padding:0, width:'100%'
             }}
           >
-            <option value="multi_agent" style={{background:V('bg-primary')}}>Multi-Agent Optimized</option>
+            <option value="regime_reversal" style={{background:V('bg-primary')}}>Regime + Reversal Combined</option>
             <option value="regime_trend_range" style={{background:V('bg-primary')}}>Regime T/R Optimized</option>
           </select>
         </Card>
@@ -3985,7 +3976,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
 
       {/* Dual strategy signals + Active Position — 3 columns */}
       <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1.2fr', gap:10 }}>
-        {renderSignalCard(maSignal, 'Multi-Agent Signal')}
+        {renderSignalCard(maSignal, 'Regime+Reversal Signal')}
         {renderSignalCard(rtrSignal, 'Regime T/R Signal')}
 
         {/* Position card with Panic Exit Button */}
@@ -4069,7 +4060,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
 // ── Auto Trade Monitor Page ─────────────────────────────────────────────────
 function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals, capitalState, tradeState, strategy, signal }) {
   const m = window.innerWidth < 768
-  const strategyLabels = { multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized' }
+  const strategyLabels = { regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized' }
 
   // ── Inactive state ──
   if (!autoTrade) {
@@ -4090,7 +4081,7 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
   }
 
   // ── Compute confidence score ──
-  const maSignal = allSignals?.multi_agent
+  const maSignal = allSignals?.regime_reversal
   const rtrSignal = allSignals?.regime_trend_range
   const activeSignal = signal || maSignal || rtrSignal
 
@@ -4214,7 +4205,7 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
         <Card style={{ padding:20 }}>
           <div style={{ color:V('text-muted'), fontSize:11, textTransform:'uppercase', fontWeight:600, marginBottom:12 }}>Strategy Agreement</div>
           <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
-            {['multi_agent', 'regime_trend_range'].map(sid => {
+            {['regime_reversal', 'regime_trend_range'].map(sid => {
               const s = allSignals?.[sid]
               const dir = s?.signal
               const dirColor = dir === 'LONG' || dir === 'LONG_EXIT' ? V('green') : dir === 'SHORT' || dir === 'SHORT_EXIT' ? V('red') : V('yellow')
@@ -6068,7 +6059,7 @@ export default function App() {
   const [lotSize,     setLotSize]     = useState(0)
   const [ltp,         setLtp]         = useState(null)
   const [instrument,  setInstrument]  = useState('BANKNIFTY')
-  const [strategy,    setStrategy]    = useState('multi_agent')
+  const [strategy,    setStrategy]    = useState('regime_reversal')
   const [chartTf,     setChartTf]     = useState('5')
   const [sigHistory,  setSigHistory]  = useState([])
   const [chartSignals, setChartSignals] = useState([])
@@ -6409,7 +6400,7 @@ export default function App() {
     dashboard: ['Dashboard', 'Overview of your trading system'],
     auto_monitor: ['Auto Trade Monitor', 'Live trade tracking, confidence, and capital utilization'],
     market_ctx: ['Global Cues & Sentiment', 'Live global markets, bias analysis, and news sentiment'],
-    live: ['Live Trading', `${instrument} • ${chartTf === 'DAY' ? 'Daily' : chartTf + 'm'} • ${strategy === 'multi_agent' ? 'Multi-Agent' : 'Regime T/R'}`],
+    live: ['Live Trading', `${instrument} • ${chartTf === 'DAY' ? 'Daily' : chartTf + 'm'} • ${strategy === 'regime_reversal' ? 'Regime+Reversal' : strategy === 'multi_agent' ? 'Multi-Agent' : 'Regime T/R'}`],
     backtest: ['Backtest', 'Run historical backtests on your strategies'],
     sig_journal: ['Strategy Signals Log', 'Strategy signal history and theoretical P&L'],
     journal: ['Broker Journal', 'Actual broker execution log'],
@@ -6445,7 +6436,7 @@ export default function App() {
           }}>
             <div style={{ display:'flex', gap:16, alignItems:'center' }}>
               <span style={{ color:V('red'), fontWeight:700 }}>AUTO TRADING ACTIVE</span>
-              <span style={{ color:V('text-muted') }}>Strategy: <span style={{color:V('text-primary'), fontWeight:500}}>{strategy === 'multi_agent' ? 'Multi-Agent Optimized' : 'Regime T/R Optimized'}</span></span>
+              <span style={{ color:V('text-muted') }}>Strategy: <span style={{color:V('text-primary'), fontWeight:500}}>{strategy === 'regime_reversal' ? 'Regime + Reversal Combined' : strategy === 'multi_agent' ? 'Multi-Agent Optimized' : 'Regime T/R Optimized'}</span></span>
               <span style={{ color:V('text-muted') }}>Order: <span style={{color:V('text-primary'), fontWeight:500}}>NRML</span></span>
               {tradeState?.position ? (
                 <span style={{ color: tradeState.position.direction === 'LONG' ? V('green') : V('red'), fontWeight:600 }}>
@@ -6478,7 +6469,7 @@ export default function App() {
 
           {/* Live Trading has its own header with controls */}
           {tab === 'live' && (
-            <PageHeader title="Live Trading" subtitle={`${instrument} • ${chartTf === 'DAY' ? 'Daily' : chartTf + ' Min'} • ${strategy === 'multi_agent' ? 'Multi-Agent Optimized' : 'Regime T/R Optimized'}`}>
+            <PageHeader title="Live Trading" subtitle={`${instrument} • ${chartTf === 'DAY' ? 'Daily' : chartTf + ' Min'} • ${strategy === 'regime_reversal' ? 'Regime + Reversal Combined' : strategy === 'multi_agent' ? 'Multi-Agent Optimized' : 'Regime T/R Optimized'}`}>
               <StyledSelect value={instrument} onChange={async (e) => {
                 const val = e.target.value
                 setInstrument(val)
@@ -6507,7 +6498,7 @@ export default function App() {
                 await API.post('/api/settings', { strategy: val })
                 setRefreshChart(r => r + 1)
                 refreshSignal()
-              }} options={[{v:'multi_agent',l:'Multi-Agent Optimized'},{v:'regime_trend_range',l:'Regime T/R Optimized'}]} style={{border:`1px solid ${V('accent')}`}} />
+              }} options={[{v:'regime_reversal',l:'Regime + Reversal Combined'},{v:'regime_trend_range',l:'Regime T/R Optimized'}]} style={{border:`1px solid ${V('accent')}`}} />
 
               <StyledSelect
                 value={optCtxExpiry}
@@ -6598,7 +6589,7 @@ export default function App() {
                     if (otherSignals.length > 0) {
                       return otherSignals.map(([k, sig]) => (
                         <ErrorBoundary key={k}>
-                          <CompactSignalPanel signal={sig} ltp={ltp} lastEntry={lastEntries[k]} strategyLabel={{"multi_agent":"Multi-Agent Optimized","regime_trend_range":"Regime T/R Optimized"}[k] || k} />
+                          <CompactSignalPanel signal={sig} ltp={ltp} lastEntry={lastEntries[k]} strategyLabel={{"regime_reversal":"Regime + Reversal Combined","multi_agent":"Multi-Agent Optimized","regime_trend_range":"Regime T/R Optimized"}[k] || k} />
                         </ErrorBoundary>
                       ))
                     } else {
