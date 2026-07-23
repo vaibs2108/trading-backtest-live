@@ -745,6 +745,25 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                 trail_step = 0
                 is_trailing = False
 
+    # ── INCLUDE OPEN POSITION (so chart shows today's live entry marker) ──
+    if position != "NONE":
+        entry_ts_ist = pd.to_datetime(base.iloc[entry_idx]["timestamp"])
+        trades.append({
+            "entry_time": entry_ts_ist.strftime("%Y-%m-%d %H:%M:%S"),
+            "exit_time": "",
+            "direction": position,
+            "entry_price": round(entry_price, 2),
+            "sl": round(sl, 2),
+            "target1": round(t1, 2),
+            "target2": round(t2, 2),
+            "exit_price": None,
+            "exit_reason": "OPEN",
+            "pnl": 0,
+            "pnl_pts": 0,
+            "pnl_inr": 0,
+            "hit_t1": t1_hit,
+        })
+
     # ── FILTER TRADES BY USER'S REQUESTED DATE RANGE ──────────────
     if _trade_start_date is not None and trades:
         trades = [t for t in trades

@@ -311,6 +311,18 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                     entry_idx = i
                     entry_atr = curr_atr
 
+    # Include open position so chart shows live entry marker
+    if position != "NONE":
+        trades.append({
+            "entry_time": pd.to_datetime(base.iloc[entry_idx]["timestamp"]).strftime("%Y-%m-%d %H:%M:%S"),
+            "exit_time": "",
+            "direction": position,
+            "entry_price": round(entry_price, 2),
+            "exit_price": None,
+            "pnl": 0,
+            "exit_reason": "OPEN",
+        })
+
     # Compute stats
     tdf = pd.DataFrame(trades)
     if tdf.empty:

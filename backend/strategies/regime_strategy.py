@@ -409,6 +409,21 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                 highest_since_entry = bh
                 lowest_since_entry = bl
 
+    # ── INCLUDE OPEN POSITION (so chart shows today's live entry marker) ──
+    if position != "NONE":
+        entry_ts_ist = pd.to_datetime(base.iloc[entry_idx]["timestamp"])
+        trades.append({
+            "entry_time": entry_ts_ist.strftime("%Y-%m-%d %H:%M:%S"),
+            "exit_time": "",
+            "direction": position,
+            "entry_price": round(entry_price, 2),
+            "sl": round(sl, 2),
+            "exit_price": None,
+            "exit_reason": "OPEN",
+            "pnl": 0,
+            "pnl_pts": 0,
+            "pnl_inr": 0,
+        })
 
     # ── FILTER TRADES BY USER'S REQUESTED DATE RANGE ──────────────
     # Warm-up bars were kept in `base` so the regime agent could build
