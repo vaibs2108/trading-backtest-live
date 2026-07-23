@@ -2748,6 +2748,9 @@ async def _signal_polling_loop():
                                 logger.warning(f"Telegram exit alert failed: {e}")
 
                             await ws_manager.broadcast({"type": "trade_closed", "data": rec})
+                            # Invalidate chart cache so exit marker appears on next chart fetch
+                            _chart_signals_cache.clear()
+                            await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": cfg.strategy, "signal": "EXIT"}})
                         else:
                             # T1 hit check (only if not exited)
                             if not pos.t1_hit and pos.target1 > 0:
@@ -3920,6 +3923,7 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                         logger.error(f"Failed to close journal entry on sync exit: {e}")
 
                     logger.info(f"Closed local position {pos.symbol} because it was exited on Dhan.")
+                    _chart_signals_cache.clear()
                 else:
                     # Update current P&L directly from Dhan's actual unrealized profit (very accurate!)
                     unrealized_profit = float(dhan_row.get('unrealizedProfit', 0.0) or dhan_row.get('unrealisedProfit', 0.0) or 0.0)
