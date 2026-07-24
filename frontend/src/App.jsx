@@ -349,7 +349,7 @@ function LiveChart({ instrument, timeframe, signals, strategy, refreshChart, the
           const isLongExit = s.signal === 'LONG_EXIT'
           const isEntry = isLong || isShort
           const isExit = isShortExit || isLongExit
-          const p = s.strategy === 'regime_trend_range' ? 'R' : (s.strategy === 'broker_sync' ? 'B' : 'M')
+          const p = s.strategy === 'regime_reversal' ? 'C' : s.strategy === 'regime_trend_range' ? 'R' : (s.strategy === 'broker_sync' ? 'B' : 'M')
           const up = isLong || isShortExit
           const t = Math.floor(new Date(s.time).getTime()/1000) + 19800
           return {
@@ -410,7 +410,7 @@ function LiveChart({ instrument, timeframe, signals, strategy, refreshChart, the
           <span style={{ color:V('text-primary'), fontWeight:600, fontSize:14 }}>{instrument}</span>
           <Badge label={timeframe === 'DAY' ? 'Daily' : `${timeframe} Min`} color={V('accent')} />
           {debugInfo.markersCount > 0 && <Badge label={`${debugInfo.markersCount} signals`} color={V('green')} />}
-          {externalLoading && <span style={{ color:V('text-muted'), fontSize:11 }}>Loading signals...</span>}
+          {externalLoading && debugInfo.markersCount === 0 && <span style={{ color:V('text-muted'), fontSize:11 }}>Loading signals...</span>}
         </div>
         <button onClick={loadData} style={{
           background:'none', border:'none', color:V('text-muted'), cursor:'pointer', padding:4,

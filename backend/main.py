@@ -2207,7 +2207,7 @@ async def _signal_polling_loop():
                         _all_strat_sigs[_strat_id] = _ui_sig
 
                     except Exception as _s_err:
-                        logger.warning(f"Processor {_strat_id} error: {_s_err}", exc_info=True)
+                        logger.error(f"Processor {_strat_id} error: {_s_err}", exc_info=True)
                         _all_strat_sigs[_strat_id] = {"signal": "ERROR", "strategy": _strat_id, "instrument": cfg.instrument, "reason": str(_s_err)}
 
                 # Publish all-strategy signals to global cache for /api/signals_all

@@ -538,6 +538,8 @@ class RegimeReversalLiveProcessor:
         required = ["5", "15", "60", "1D"]
         for r in required:
             if r not in frames or frames[r] is None or len(frames[r]) < 30:
+                _avail = {k: len(v) if v is not None else 0 for k, v in frames.items() if k in required}
+                logger.debug(f"[RegimeReversalProcessor] Insufficient data for TF={r}, available: {_avail}")
                 return []
 
         try:
@@ -547,15 +549,24 @@ class RegimeReversalLiveProcessor:
             return []
 
         if base.empty:
+            logger.debug("[RegimeReversalProcessor] Empty merged table")
             return []
 
+        _pre_mask = len(base)
         base = base[_session_mask(base, cfg)].copy().reset_index(drop=True)
         if base.empty:
+            logger.debug(f"[RegimeReversalProcessor] All {_pre_mask} bars filtered by session mask")
             return []
 
         # Compute reversal indicators
+        _has_reversal = False
         try:
             base = reversal_add_indicators(base, method="Linear", window=50, smoothness=30.0)
+            _has_reversal = "top_sig" in base.columns and "bot_sig" in base.columns
+            if _has_reversal:
+                _n_top = int(base["top_sig"].sum())
+                _n_bot = int(base["bot_sig"].sum())
+                logger.debug(f"[RegimeReversalProcessor] Reversal indicators OK: {_n_top} top_sig, {_n_bot} bot_sig in {len(base)} bars")
         except Exception as e:
             logger.warning(f"[RegimeReversalProcessor] Reversal indicators failed: {e}")
 
@@ -565,9 +576,12 @@ class RegimeReversalLiveProcessor:
         ts_series = pd.to_datetime(base["timestamp"]).dt.tz_localize(None)
         is_past_day = ts_series.dt.date < now_ist.date()
         is_bar_closed = ts_series.apply(lambda ts: ts + timedelta(minutes=5) <= now_ist)
+        _pre_filter = len(base)
         base = base[is_past_day | is_bar_closed].copy().reset_index(drop=True)
         if base.empty:
+            logger.debug(f"[RegimeReversalProcessor] All {_pre_filter} bars filtered as incomplete (now={now_ist})")
             return []
+        logger.debug(f"[RegimeReversalProcessor] {len(base)}/{_pre_filter} bars after completion filter, last_ts={base.iloc[-1]['timestamp']}, last_processed={self.last_processed_ts}")
 
         df_1h = frames.get("60")
         df_1d = frames.get("1D")
@@ -645,8 +659,10 @@ class RegimeReversalLiveProcessor:
         if self.last_processed_ts is not None:
             mask = base["timestamp"] > self.last_processed_ts
             if not mask.any():
+                logger.debug(f"[RegimeReversalProcessor] No new bars since {self.last_processed_ts}")
                 return []
             start_idx = base[mask].index[0]
+            logger.debug(f"[RegimeReversalProcessor] {n - start_idx} new bars from idx {start_idx} (pos={self.position})")
         else:
             today_idx = _find_today_start(base, fallback_lookback=80)
             warmup_start = max(0, today_idx - 80)
@@ -661,8 +677,9 @@ class RegimeReversalLiveProcessor:
                     w_1d = df_1d[df_1d["timestamp"] <= w_ts].tail(200) if df_1d is not None else None
                     w_1w = df_1w[df_1w["timestamp"] <= w_ts].tail(200) if df_1w is not None else None
                     _run_agents(w_slice, w_row, "NONE", cfg, w_1h, w_1d, w_1w, _state=self._proc_state)
-                logger.info(f"[RegimeReversalProcessor] Warm-up complete")
+                logger.info(f"[RegimeReversalProcessor] Warm-up complete, regime={self._proc_state.get('regime')}")
             start_idx = today_idx
+            logger.info(f"[RegimeReversalProcessor] First run: today_idx={today_idx}, processing {n - start_idx} bars")
 
         for i in range(start_idx, n):
             row = base.iloc[i]
@@ -775,6 +792,9 @@ class RegimeReversalLiveProcessor:
                                   df_1h_cur, df_1d_cur, df_1w_cur,
                                   _state=self._proc_state)
 
+                # Log agent result for new bars (not warm-up replay)
+                logger.debug(f"[RegimeReversalProcessor] Bar {ts} flat: agents={sig.signal} regime={self._proc_state.get('regime')} rev=top:{top_sig[i]}/bot:{bot_sig[i]} close={bc:.1f}")
+
                 # Regime re-entry after reversal SL
                 if just_closed_source == "REVERSAL" and self.last_regime_direction != "NONE":
                     if sig.signal == self.last_regime_direction:
@@ -791,12 +811,14 @@ class RegimeReversalLiveProcessor:
                     sl_val = lower_band[i] if not np.isnan(lower_band[i]) else bc - 1.5 * atr_v
                     self._enter("LONG", "REVERSAL", bc, i, bh, bl, sl_val)
                     signals_out.append(self._make_entry_signal(ts, sig))
+                    logger.info(f"[RegimeReversalProcessor] REVERSAL LONG entry @ {bc:.1f} SL={sl_val:.1f}")
                     self.last_processed_ts = ts
                     continue
                 elif top_sig[i]:
                     sl_val = upper_band[i] if not np.isnan(upper_band[i]) else bc + 1.5 * atr_v
                     self._enter("SHORT", "REVERSAL", bc, i, bh, bl, sl_val)
                     signals_out.append(self._make_entry_signal(ts, sig))
+                    logger.info(f"[RegimeReversalProcessor] REVERSAL SHORT entry @ {bc:.1f} SL={sl_val:.1f}")
                     self.last_processed_ts = ts
                     continue
 
@@ -807,9 +829,12 @@ class RegimeReversalLiveProcessor:
                     self.last_regime_direction = sig.signal
                     self.last_regime_sl = sig.sl
                     signals_out.append(self._make_entry_signal(ts, sig))
+                    logger.info(f"[RegimeReversalProcessor] REGIME {sig.signal} entry @ {bc:.1f} SL={sig.sl:.1f}")
 
             self.last_processed_ts = ts
 
+        if signals_out:
+            logger.info(f"[RegimeReversalProcessor] Generated {len(signals_out)} signals from {n - start_idx} bars")
         return signals_out
 
     def _enter(self, direction, source, price, idx, bh, bl, sl_val):
