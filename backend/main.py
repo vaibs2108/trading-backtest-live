@@ -12,6 +12,17 @@ from typing import Optional
 
 _IST = pytz.timezone("Asia/Kolkata")
 
+import math
+def _sanitise_floats(obj):
+    """Replace NaN/Inf floats with None so json.dumps doesn't crash."""
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitise_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitise_floats(v) for v in obj]
+    return obj
+
 # ── Data health tracking ─────────────────────────────────────────────────────
 _data_health_state = {
     "is_stale": False,
@@ -98,6 +109,12 @@ logger = logging.getLogger(__name__)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Dhan ML Trading Engine", version="1.0.0")
+
+@app.on_event("shutdown")
+def on_app_shutdown():
+    logger.info("Shutdown event triggered — force exiting process cleanly.")
+    import threading, os
+    threading.Timer(0.15, lambda: os._exit(0)).start()
 
 app.add_middleware(
     CORSMiddleware,
@@ -452,7 +469,7 @@ async def get_status():
         except Exception as e:
             logger.warning(f"Failed to sync broker balance in status: {e}")
             
-    lot = broker.get_lot_size(cfg.instrument) if broker.is_connected() else INSTRUMENT_META.get(cfg.instrument, {}).get("lot_size", 15)
+    lot = broker.get_lot_size(cfg.instrument)
     ltp = broker.get_ltp(cfg.instrument) if broker.is_connected() else None
 
     # Compute Live P&L from TradeManager's tracked position
@@ -908,14 +925,17 @@ async def run_backtest(req: BacktestRequest):
     if not frames:
         raise HTTPException(status_code=500, detail="Failed to fetch backtest data")
 
-    # Use dynamic lot size from Dhan (falls back to hardcoded INSTRUMENT_META)
-    lot_size = broker.get_lot_size(req.instrument) if broker.is_connected() else INSTRUMENT_META.get(req.instrument, INSTRUMENT_META["BANKNIFTY"])["lot_size"]
-    # Temporarily override strategy if request specifies one
+    # Use dynamic lot size from Dhan API / INSTRUMENT_META
+    lot_size = broker.get_lot_size(req.instrument)
+    # Temporarily override strategy and instrument for this backtest
     cfg = get_settings()
     bt_strategy = req.strategy or cfg.strategy
     original_strategy = cfg.strategy
+    original_instrument = cfg.instrument
     if bt_strategy != original_strategy:
         cfg.strategy = bt_strategy
+    if req.instrument != original_instrument:
+        cfg.instrument = req.instrument
 
     try:
         result = await asyncio.to_thread(
@@ -928,11 +948,11 @@ async def run_backtest(req: BacktestRequest):
             to_d,
         )
     finally:
-        if cfg.strategy != original_strategy:
-            cfg.strategy = original_strategy
+        cfg.strategy = original_strategy
+        cfg.instrument = original_instrument
 
     result["strategy_used"] = bt_strategy
-    return result
+    return _sanitise_floats(result)
 
 
 
@@ -974,8 +994,11 @@ async def clear_signal_history():
     _virtual_cooldown = {}
     _save_signal_history()
     _chart_signals_cache.clear()  # Invalidate backtest cache too
-    logger.info("Signal history cleared by user request")
-    return {"success": True, "message": "Signal history cleared"}
+    # Reset processors so they re-initialise from fresh backtest state
+    from live_bar_processor import reset_all_processors
+    reset_all_processors()
+    logger.info("Signal history + processors cleared by user request")
+    return {"success": True, "message": "Signal history and processors cleared"}
 
 
 @app.get("/api/live-feed-status")
@@ -1013,9 +1036,8 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
         if frames:
             def _run_bt():
                 try:
-                    from strategy_router import _get_strategy_module
-                    mod = _get_strategy_module(strat)
-                    return mod.run_backtest(frames)
+                    import strategy_router
+                    return strategy_router.run_backtest(frames)
                 except Exception as e:
                     logger.error(f"chart_signals backtest error ({strat}): {e}")
                     return None
@@ -1061,7 +1083,7 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
     except Exception:
         pass
 
-    return {"signals": signals, "strategy": strat, "count": len(signals)}
+    return _sanitise_floats({"signals": signals, "strategy": strat, "count": len(signals)})
 
 
 @app.get("/api/signal_journal")
@@ -1081,28 +1103,28 @@ async def clear_signal_journal_endpoint():
 def reconstruct_dhan_trades(trades: list) -> list:
     """
     Reconstruct open/closed trades from raw Dhan executions using a FIFO/matching algorithm.
+    Correctly maps PUT buying as SHORT market exposure and CALL buying as LONG market exposure.
     """
-    # Sort trades chronologically by execution/create time
+    import re
+
     def get_time(t):
         for key in ["createTime", "exchangeTime", "updateTime"]:
             val = t.get(key)
             if val and val != "NA":
                 return val
         return ""
-    
+
     trades_sorted = sorted(trades, key=get_time)
-    
-    # Group by symbol
+
     from collections import defaultdict
     by_symbol = defaultdict(list)
     for t in trades_sorted:
         sym = t.get("customSymbol") or t.get("tradingSymbol")
         if sym:
             by_symbol[sym].append(t)
-            
+
     reconstructed = []
-    
-    # Helper to guess instrument from symbol
+
     def guess_instrument(symbol: str) -> str:
         s = symbol.upper()
         if "BANKNIFTY" in s:
@@ -1113,13 +1135,33 @@ def reconstruct_dhan_trades(trades: list) -> list:
             return "MIDCPNIFTY"
         if "CRUDEOIL" in s:
             return "CRUDEOIL"
+        if "SENSEX" in s:
+            return "SENSEX"
         if "NIFTY" in s:
             return "NIFTY"
         return "INDEX"
-        
+
+    def parse_contract(symbol: str, tx_type: str):
+        sym_u = symbol.upper()
+        is_put = "PUT" in sym_u or " PE" in sym_u
+        is_call = "CALL" in sym_u or " CE" in sym_u
+
+        opt_type = "PUT" if is_put else ("CALL" if is_call else None)
+        m = re.search(r'\b(\d{4,6})\b', symbol)
+        opt_strike = m.group(1) if m else None
+
+        if is_put:
+            direction = "SHORT" if tx_type == "BUY" else "LONG"
+        elif is_call:
+            direction = "LONG" if tx_type == "BUY" else "SHORT"
+        else:
+            direction = "LONG" if tx_type == "BUY" else "SHORT"
+
+        return direction, opt_type, opt_strike
+
     for symbol, sym_trades in by_symbol.items():
-        active = None  # tracks the current active open position for this symbol
-        
+        active = None
+
         for t_exec in sym_trades:
             qty = int(t_exec.get("tradedQuantity", 0) or t_exec.get("quantity", 0) or 0)
             if qty <= 0:
@@ -1128,32 +1170,27 @@ def reconstruct_dhan_trades(trades: list) -> list:
             tx_type = (t_exec.get("transactionType") or t_exec.get("type") or "").upper()
             if not tx_type:
                 continue
-                
+
             time_str = get_time(t_exec)
-            if "T" in time_str:
-                parts = time_str.split("T")
-            else:
-                parts = time_str.split(" ")
+            parts = time_str.split("T") if "T" in time_str else time_str.split(" ")
             date_part = parts[0] if len(parts) > 0 else ""
             time_part = parts[1] if len(parts) > 1 else ""
-            
-            # De-duplicate trade_id safely
+
             etid = t_exec.get("exchangeTradeId") or t_exec.get("tradeId")
-            if etid and etid != "0":
-                trade_id = etid
-            else:
-                trade_id = f"DHAN_{t_exec.get('orderId')}_{tx_type}"
-            
-            direction = "LONG" if tx_type == "BUY" else "SHORT"
-            
+            trade_id = etid if etid and etid != "0" else f"DHAN_{t_exec.get('orderId')}_{tx_type}"
+
+            direction, opt_type, opt_strike = parse_contract(symbol, tx_type)
+
             if active is None:
-                # Open a new position
                 active = {
                     "trade_id": trade_id,
                     "status": "OPEN",
                     "instrument": guess_instrument(symbol),
                     "symbol": symbol,
                     "direction": direction,
+                    "open_tx_type": tx_type,
+                    "option_type": opt_type,
+                    "option_strike": opt_strike,
                     "qty": qty,
                     "entry_date": date_part,
                     "entry_time": time_part,
@@ -1165,26 +1202,28 @@ def reconstruct_dhan_trades(trades: list) -> list:
                     "reasons": []
                 }
             else:
-                # We have an active position
-                if active["direction"] == direction:
-                    # Same direction: add to position (scale up)
+                # Active position exists. Check if this execution closes or adds to the position.
+                if active["open_tx_type"] == tx_type:
+                    # Same order type: scale up position
                     total_qty = active["qty"] + qty
                     active["entry_price"] = round(((active["entry_price"] * active["qty"]) + (price * qty)) / total_qty, 2)
                     active["qty"] = total_qty
                 else:
-                    # Opposite direction: reduce or close position
+                    # Opposite order type: close or reduce position
+                    closed_qty = min(qty, active["qty"])
+                    if active["open_tx_type"] == "BUY":
+                        pnl = round((price - active["entry_price"]) * closed_qty, 2)
+                    else:
+                        pnl = round((active["entry_price"] - price) * closed_qty, 2)
+
                     if qty >= active["qty"]:
-                        # Fully closed (and potentially flipped)
-                        closed_qty = active["qty"]
-                        pnl = round((price - active["entry_price"]) * closed_qty, 2) if active["direction"] == "LONG" else round((active["entry_price"] - price) * closed_qty, 2)
-                        
                         active["status"] = "CLOSED"
                         active["exit_price"] = price
                         active["exit_time"] = time_part
                         active["pnl"] = pnl
                         active["exit_reason"] = "DHAN_CLOSED"
                         reconstructed.append(active)
-                        
+
                         rem_qty = qty - closed_qty
                         if rem_qty > 0:
                             # Flipped position
@@ -1194,6 +1233,9 @@ def reconstruct_dhan_trades(trades: list) -> list:
                                 "instrument": guess_instrument(symbol),
                                 "symbol": symbol,
                                 "direction": direction,
+                                "open_tx_type": tx_type,
+                                "option_type": opt_type,
+                                "option_strike": opt_strike,
                                 "qty": rem_qty,
                                 "entry_date": date_part,
                                 "entry_time": time_part,
@@ -1207,27 +1249,21 @@ def reconstruct_dhan_trades(trades: list) -> list:
                         else:
                             active = None
                     else:
-                        # Partially closed
-                        pnl = round((price - active["entry_price"]) * qty, 2) if active["direction"] == "LONG" else round((active["entry_price"] - price) * qty, 2)
-                        
-                        # Append the closed part to history
                         closed_part = active.copy()
-                        closed_part["qty"] = qty
+                        closed_part["qty"] = closed_qty
                         closed_part["status"] = "CLOSED"
                         closed_part["exit_price"] = price
                         closed_part["exit_time"] = time_part
                         closed_part["pnl"] = pnl
                         closed_part["exit_reason"] = "DHAN_PARTIAL_CLOSE"
                         reconstructed.append(closed_part)
-                        
-                        # Reduce active position quantity
-                        active["qty"] -= qty
-                        
+                        active["qty"] -= closed_qty
+
         if active is not None:
-            # Still open at the end of the query range
             reconstructed.append(active)
-            
+
     return reconstructed
+
 
 
 def align_with_strategy_journal(reconstructed_trades: list) -> list:
@@ -1311,11 +1347,11 @@ async def get_journal(from_date: Optional[str] = None, to_date: Optional[str] = 
             
         # Fetch trades from history
         logger.info(f"get_journal: from_date={from_date}, to_date={to_date}")
-        hist_trades = broker.get_trade_history(from_date, to_date)
+        hist_trades = broker.get_trade_history(from_date, to_date) if hasattr(broker, "get_trade_history") else []
         logger.info(f"get_journal: hist_trades count = {len(hist_trades)}")
         
         # Fetch trades from today's book
-        today_trades = broker.get_trade_book()
+        today_trades = broker.get_trade_book() if hasattr(broker, "get_trade_book") else []
         logger.info(f"get_journal: today_trades count = {len(today_trades)}")
         
         # Combine and deduplicate
@@ -1344,11 +1380,23 @@ async def get_journal(from_date: Optional[str] = None, to_date: Optional[str] = 
             d = t.get("entry_date", "")
             tm = t.get("entry_time", "")
             return f"{d} {tm}"
-            
+
         enriched_sorted = sorted(enriched, key=sort_key)
-        
+
+        # Filter by requested date range
+        filtered_journal = []
+        for t in enriched_sorted:
+            ed = t.get("entry_date") or ""
+            if not ed and t.get("entry_time"):
+                ed = str(t.get("entry_time")).split("T")[0].split(" ")[0]
+            if from_date and ed and ed.strip() < from_date.strip():
+                continue
+            if to_date and ed and ed.strip() > to_date.strip():
+                continue
+            filtered_journal.append(t)
+
         return {
-            "journal": enriched_sorted,
+            "journal": filtered_journal,
             "status": "connected",
             "from_date": from_date,
             "to_date": to_date
@@ -2054,9 +2102,9 @@ async def _signal_polling_loop():
                 global _last_processed_candle_ts, _virtual_cooldown
                 global _all_strat_sigs_cache
 
-                from live_bar_processor import get_regime_processor, get_multi_agent_processor, get_regime_reversal_processor
+                from live_bar_processor import get_regime_processor, get_regime_reversal_processor
 
-                _lot_size = broker.get_lot_size(cfg.instrument) if broker.is_connected() else INSTRUMENT_META.get(cfg.instrument, {}).get("lot_size", 15)
+                _lot_size = broker.get_lot_size(cfg.instrument)
                 _qty = int(_lot_size * cfg.lot_multiplier)
 
                 _all_strat_sigs = {}
@@ -2064,7 +2112,6 @@ async def _signal_polling_loop():
                 for _strat_id, _processor in [
                     ("regime_reversal", get_regime_reversal_processor()),
                     ("regime_trend_range", get_regime_processor()),
-                    ("multi_agent", get_multi_agent_processor()),
                 ]:
                     try:
                         new_signals = _processor.process_frames(frames, cfg, _qty)
@@ -2079,7 +2126,8 @@ async def _signal_polling_loop():
                                 _chart_signals_cache.clear()
                                 add_activity_log(f"[{_strat_id.upper()}] Processor Entry: {_live_sig.signal} @ {_live_sig.entry_price}")
                                 logger.info(f"[{_strat_id}] Processor Entry: {_live_sig.signal} @ {_live_sig.entry_price} SL={_live_sig.sl}")
-                                # Notify frontend instantly so it re-fetches chart signals
+                                # Notify frontend instantly with complete signal marker data via WebSocket
+                                await ws_manager.broadcast({"type": "signal_event", "data": sig_dict})
                                 await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": _strat_id, "signal": _live_sig.signal}})
                                 # Send Telegram in background (non-blocking) for active strategy
                                 if _strat_id == cfg.strategy:
@@ -2309,6 +2357,22 @@ async def _signal_polling_loop():
                     elif tm.position and tm.position.instrument == sig.get("instrument") and tm.position.direction != sig_direction:
                         pos = tm.position
                         logger.info(f"Opposite signal ({sig_direction}) while in {pos.direction} — exiting only (no auto-flip)")
+
+                        # --- FIX: Do NOT close DHAN_SYNC positions internally when auto_trade is OFF ---
+                        # If auto_trade is OFF we can't send a broker exit order, so closing locally
+                        # is pointless — Dhan sync will re-import the position next poll cycle,
+                        # creating an infinite close/import loop that floods the logs.
+                        _is_dhan_sync = getattr(pos, "order_id", "").startswith("DHAN_SYNC_")
+                        if not cfg.auto_trade and _is_dhan_sync:
+                            logger.warning(
+                                f"Opposite signal ({sig_direction}) vs DHAN_SYNC {pos.direction} {pos.symbol} "
+                                f"— auto_trade OFF, skipping internal close to avoid re-import loop. "
+                                f"Manage this position manually on Dhan."
+                            )
+                            _pending_telegram_signal = sig
+                            _last_telegram_signal_key = ("", "")
+                            continue  # skip — can't act on broker, don't close locally
+
                         if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
                             _opp_exit = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
                             if not _opp_exit.get("success"):
@@ -4176,7 +4240,7 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
         )
     else:
         # Paper order simulation
-        lot_size = broker.get_lot_size(cfg.instrument) if broker.is_connected() else INSTRUMENT_META.get(cfg.instrument, {}).get("lot_size", 15)
+        lot_size = broker.get_lot_size(cfg.instrument)
         qty = lot_size * cfg.lot_multiplier
         
         # Resolve symbol name for option/index

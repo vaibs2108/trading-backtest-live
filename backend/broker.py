@@ -1210,33 +1210,47 @@ def get_positions() -> pd.DataFrame:
 
 def get_lot_size(instrument: str) -> int:
     global _lot_size_cache
-    if instrument in _lot_size_cache:
-        return _lot_size_cache[instrument]
+    inst_upper = instrument.upper()
+    if inst_upper in _lot_size_cache:
+        return _lot_size_cache[inst_upper]
+
+    # Prioritize official exchange lot sizes from INSTRUMENT_META
+    if inst_upper in INSTRUMENT_META and "lot_size" in INSTRUMENT_META[inst_upper]:
+        lot = int(INSTRUMENT_META[inst_upper]["lot_size"])
+        _lot_size_cache[inst_upper] = lot
+        logger.info(f"Using official exchange lot size for {inst_upper}: {lot}")
+        return lot
+
     try:
         df = _load_instrument_df()
         cond = (
-            (df["SEM_TRADING_SYMBOL"] == instrument) |
-            df["SEM_TRADING_SYMBOL"].str.startswith(instrument + "-", na=False) |
-            df["SEM_TRADING_SYMBOL"].str.startswith(instrument + " ", na=False) |
-            (df["SEM_CUSTOM_SYMBOL"] == instrument) |
-            df["SEM_CUSTOM_SYMBOL"].str.startswith(instrument + " ", na=False)
+            (df["SEM_TRADING_SYMBOL"] == inst_upper) |
+            df["SEM_TRADING_SYMBOL"].str.startswith(inst_upper + "-", na=False) |
+            df["SEM_TRADING_SYMBOL"].str.startswith(inst_upper + " ", na=False) |
+            (df["SEM_CUSTOM_SYMBOL"] == inst_upper) |
+            df["SEM_CUSTOM_SYMBOL"].str.startswith(inst_upper + " ", na=False)
         )
         match = df[cond]
-        deriv_match = match[match["SEM_INSTRUMENT_NAME"] != "INDEX"]
+        deriv_types = ["OPTIDX", "FUTIDX", "OPTSTK", "FUTSTK", "OPTCOM", "FUTCOM", "OPTCUR", "FUTCUR"]
+        deriv_match = match[match["SEM_INSTRUMENT_NAME"].isin(deriv_types)]
         if not deriv_match.empty:
             match = deriv_match
 
         if not match.empty:
-            for lot in match["SEM_LOT_UNITS"].unique():
-                if lot and int(lot) > 0:
-                    _lot_size_cache[instrument] = int(lot)
-                    logger.info(f"Lot size for {instrument} resolved from CSV: {lot}")
-                    return int(lot)
+            for lot in match["SEM_LOT_UNITS"].dropna().unique():
+                try:
+                    lot_val = int(float(lot))
+                    if lot_val > 0:
+                        _lot_size_cache[inst_upper] = lot_val
+                        logger.info(f"Lot size for {inst_upper} resolved from CSV: {lot_val}")
+                        return lot_val
+                except (ValueError, TypeError):
+                    continue
     except Exception as e:
-        logger.warning(f"Error fetching lot size from CSV for {instrument}: {e}")
+        logger.warning(f"Error fetching lot size from CSV for {inst_upper}: {e}")
 
-    fallback = INSTRUMENT_META.get(instrument.upper(), {}).get("lot_size", 30)
-    logger.warning(f"Using fallback lot size for {instrument}: {fallback}")
+    fallback = 30
+    _lot_size_cache[inst_upper] = fallback
     return fallback
 
 

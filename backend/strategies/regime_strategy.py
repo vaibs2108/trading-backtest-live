@@ -61,8 +61,15 @@ add_indicators = main_strategy.add_indicators
 
 # ── Trend-only mode: range agent always returns HOLD ─────────────────────────
 _TREND_ONLY = True
-_EOD_EXIT_MINUTE = 15 * 60 + 20  # 3:20 PM IST
-_MAX_TRADES_PER_DAY = 8
+_EOD_EXIT_NSE = 15 * 60 + 20   # 3:20 PM IST (equity)
+_EOD_EXIT_MCX = 23 * 60 + 20   # 11:20 PM IST (commodity)
+
+def _eod_exit_minute(cfg=None):
+    if cfg is None:
+        cfg = get_settings()
+    exch = INSTRUMENT_META.get(cfg.instrument, {}).get("exchange_index", "INDEX")
+    return _EOD_EXIT_MCX if exch == "MCX" else _EOD_EXIT_NSE
+
 
 # ── Trailing SL configuration ────────────────────────────────────────────────
 # Variant A (original): TRAIL_MULT=1.0, TRAIL_ACTIVATION=0.0, BE_TRIGGER=0.3, BE_BUFFER=0.05
@@ -224,6 +231,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
     live processor's module-level globals.
     """
     cfg = get_settings()
+    eod_minute = _eod_exit_minute(cfg)
     trail_mult = getattr(cfg, "regime_trail_mult", 1.5)
     trail_activation = getattr(cfg, "regime_trail_activation", 0.3)
     be_trigger = getattr(cfg, "regime_be_trigger", 0.4)
@@ -335,7 +343,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                 position = "NONE"
 
             # ── 0. END OF DAY EXIT ──────────────────────────────────
-            if cur_mins >= _EOD_EXIT_MINUTE:
+            if cur_mins >= eod_minute:
                 book(bc, "EOD_EXIT")
                 continue
 
@@ -391,7 +399,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
         if position == "NONE":
 
             # No new entries in last 10 min
-            if cur_mins >= _EOD_EXIT_MINUTE:
+            if cur_mins >= eod_minute:
                 continue
 
             sig = _run_agents(df_slice, row, "NONE", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=_bt_state)

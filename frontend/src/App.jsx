@@ -5,7 +5,7 @@ import {
   Wifi, WifiOff, RefreshCw, Play, Square, AlertCircle,
   ChevronDown, CheckCircle, XCircle, Clock, Zap, BookOpen, Send, Cpu,
   Moon, Sun, LayoutDashboard, Globe, ChevronLeft, ChevronRight, Menu,
-  Calendar, Target, Trash2
+  Calendar, Target, Trash2, Filter
 } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip, ResponsiveContainer, Area, AreaChart } from 'recharts'
 
@@ -131,7 +131,6 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
     { id:'sig_journal',  icon:<TrendingUp size={18}/>,      label:'Strategy Signals Log' },
     { id:'journal',      icon:<BookOpen size={18}/>,        label:'Broker Journal' },
     { id:'performance',  icon:<BarChart2 size={18}/>,       label:'Performance' },
-    { id:'research',     icon:<Target size={18}/>,          label:'Research' },
   ]
 
   const sideW = collapsed ? 64 : 240
@@ -933,10 +932,12 @@ function BacktestPanel({ connected }) {
     if (!connected) { setErr('Connect to broker first'); return }
     setLoading(true); setErr('')
     try {
-      const r = await API.post('/api/backtest', form)
-      if (r.error) setErr(r.error)
+      const resp = await fetch('/api/backtest', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(form) })
+      const r = await resp.json()
+      if (!resp.ok) setErr(r.detail || r.error || `Server error ${resp.status}`)
+      else if (r.error) setErr(r.error)
       else setResult(r)
-    } catch(e) { setErr('Backtest failed') }
+    } catch(e) { setErr('Backtest failed: ' + (e.message || e)) }
     finally { setLoading(false) }
   }
 
@@ -973,7 +974,7 @@ function BacktestPanel({ connected }) {
         <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
           {[
             ['Strategy', <select value={form.strategy} onChange={e=>setForm(p=>({...p,strategy:e.target.value}))} style={inputStyle}>
-              {[{v:'multi_agent',l:'Multi-Agent Optimized'},{v:'regime_trend_range',l:'Regime Trend/Range Optimized'},{v:'trend_reversal',l:'Regression Trend Reversal'},{v:'regime_reversal',l:'Regime + Reversal Combined'}].map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
+              {[{v:'regime_trend_range',l:'Regime Trend/Range Optimized'},{v:'regime_reversal',l:'Regime + Reversal Combined'}].map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
             </select>],
             ['Instrument', <select value={form.instrument} onChange={e=>setForm(p=>({...p,instrument:e.target.value}))} style={inputStyle}>
               {['NIFTY','BANKNIFTY','SENSEX','CRUDEOIL'].map(i=><option key={i}>{i}</option>)}
@@ -1119,25 +1120,61 @@ function ConnectModal({ onClose, onConnected }) {
 // ── Signal Journal Panel ────────────────────────────────────────────────────
 function SignalJournalPanel({ entries, onRefresh }) {
   const m = window.innerWidth < 768
-  const [strategyFilter, setStrategyFilter] = React.useState('ALL')
-  const [instrumentFilter, setInstrumentFilter] = React.useState('ALL')
-  const [fromDate, setFromDate] = React.useState(() => {
-    const d = new Date()
-    d.setDate(d.getDate() - 30)
-    return d.toISOString().split('T')[0]
-  })
-  const [toDate, setToDate] = React.useState(() => {
-    return new Date().toISOString().split('T')[0]
+  const [draftStrategy, setDraftStrategy] = React.useState('ALL')
+  const [draftInstrument, setDraftInstrument] = React.useState('ALL')
+  const [draftFromDate, setDraftFromDate] = React.useState('')
+  const [draftToDate, setDraftToDate] = React.useState('')
+
+  // Applied filters state (only updated on Submit)
+  const [appliedFilters, setAppliedFilters] = React.useState({
+    strategy: 'ALL',
+    instrument: 'ALL',
+    fromDate: '',
+    toDate: ''
   })
 
-  // Apply filters
+  const handleSubmitFilters = (e) => {
+    if (e) e.preventDefault()
+    setAppliedFilters({
+      strategy: draftStrategy,
+      instrument: draftInstrument,
+      fromDate: draftFromDate,
+      toDate: draftToDate
+    })
+    if (onRefresh) onRefresh()
+  }
+
+  // Apply filters robustly
   const filteredEntries = entries.filter(e => {
-    if (strategyFilter !== 'ALL' && e.strategy !== strategyFilter) return false
-    if (instrumentFilter !== 'ALL' && e.instrument !== instrumentFilter) return false
-    if (e.entry_time) {
-      const dateStr = e.entry_time.split('T')[0]
-      if (fromDate && dateStr < fromDate) return false
-      if (toDate && dateStr > toDate) return false
+    if (appliedFilters.strategy !== 'ALL') {
+      const s = (e.strategy || '').toLowerCase()
+      const f = appliedFilters.strategy.toLowerCase()
+      if (f === 'regime_reversal') {
+        if (!s.includes('reversal')) return false
+      } else if (f === 'regime_trend_range') {
+        if (!s.includes('regime') && !s.includes('trend') && !s.includes('range')) return false
+      } else if (f === 'multi_agent') {
+        if (!s.includes('multi')) return false
+      } else if (s !== f) {
+        return false
+      }
+    }
+
+    if (appliedFilters.instrument !== 'ALL') {
+      const inst = (e.instrument || '').toUpperCase()
+      if (inst !== appliedFilters.instrument.toUpperCase()) return false
+    }
+
+    // Parse date safely from entry_date, date, or entry_time ISO timestamp
+    const dateStr = e.entry_date || e.date || (
+      e.entry_time && e.entry_time.includes('T') ? e.entry_time.split('T')[0] : (
+        e.entry_time && e.entry_time.includes(' ') ? e.entry_time.split(' ')[0] : ''
+      )
+    )
+
+    if (dateStr && dateStr.length >= 10 && dateStr.startsWith('20')) {
+      if (appliedFilters.fromDate && dateStr < appliedFilters.fromDate) return false
+      if (appliedFilters.toDate && dateStr > appliedFilters.toDate) return false
     }
     return true
   })
@@ -1195,15 +1232,15 @@ function SignalJournalPanel({ entries, onRefresh }) {
       </div>
 
       <Card>
-        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12, flexWrap:'wrap', gap:8 }}>
+        <form onSubmit={handleSubmitFilters} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12, flexWrap:'wrap', gap:8 }}>
           <div style={{ color:V('text-primary'), fontWeight:700, fontSize:15 }}>Strategy Signals Log</div>
           
           <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
             <div style={{ display:'flex', alignItems:'center', gap:4 }}>
               <span style={{ fontSize:11, color:V('text-muted') }}>Strategy:</span>
               <select 
-                value={strategyFilter} 
-                onChange={e => setStrategyFilter(e.target.value)} 
+                value={draftStrategy} 
+                onChange={e => setDraftStrategy(e.target.value)} 
                 style={{
                   background: V('bg-input'),
                   color: V('text-primary'),
@@ -1223,8 +1260,8 @@ function SignalJournalPanel({ entries, onRefresh }) {
             <div style={{ display:'flex', alignItems:'center', gap:4 }}>
               <span style={{ fontSize:11, color:V('text-muted') }}>Instrument:</span>
               <select 
-                value={instrumentFilter} 
-                onChange={e => setInstrumentFilter(e.target.value)} 
+                value={draftInstrument} 
+                onChange={e => setDraftInstrument(e.target.value)} 
                 style={{
                   background: V('bg-input'),
                   color: V('text-primary'),
@@ -1249,8 +1286,8 @@ function SignalJournalPanel({ entries, onRefresh }) {
               <span style={{ fontSize:11, color:V('text-muted') }}>From:</span>
               <input 
                 type="date" 
-                value={fromDate} 
-                onChange={e => setFromDate(e.target.value)} 
+                value={draftFromDate} 
+                onChange={e => setDraftFromDate(e.target.value)} 
                 style={{
                   background: V('bg-input'),
                   color: V('text-primary'),
@@ -1267,8 +1304,8 @@ function SignalJournalPanel({ entries, onRefresh }) {
               <span style={{ fontSize:11, color:V('text-muted') }}>To:</span>
               <input 
                 type="date" 
-                value={toDate} 
-                onChange={e => setToDate(e.target.value)} 
+                value={draftToDate} 
+                onChange={e => setDraftToDate(e.target.value)} 
                 style={{
                   background: V('bg-input'),
                   color: V('text-primary'),
@@ -1282,15 +1319,19 @@ function SignalJournalPanel({ entries, onRefresh }) {
               />
             </div>
 
-            <StyledButton onClick={handleDownloadCSV} variant="primary" style={{ padding:'4px 12px', fontSize:11 }}>Download CSV</StyledButton>
-            <StyledButton onClick={onRefresh} variant="primary" style={{ padding:'4px 12px', fontSize:11 }}>↺ Refresh</StyledButton>
-            <StyledButton onClick={async () => {
+            <StyledButton type="submit" variant="primary" style={{ padding:'4px 14px', fontSize:11, fontWeight:700, display:'flex', alignItems:'center', gap:4 }}>
+              <Filter size={12}/> Submit
+            </StyledButton>
+
+            <StyledButton type="button" onClick={handleDownloadCSV} variant="default" style={{ padding:'4px 12px', fontSize:11 }}>Download CSV</StyledButton>
+            <StyledButton type="button" onClick={onRefresh} variant="default" style={{ padding:'4px 12px', fontSize:11 }}>↺ Refresh</StyledButton>
+            <StyledButton type="button" onClick={async () => {
               if (!window.confirm('Clear all signal journal entries? This cannot be undone.')) return
               await fetch('/api/signal_journal', { method:'DELETE' })
               onRefresh()
             }} variant="danger" style={{ padding:'4px 12px', fontSize:11 }}><Trash2 size={11}/> Clear Logs</StyledButton>
           </div>
-        </div>
+        </form>
 
         {filteredEntries.length === 0 ? (
           <div style={{ color:V('text-muted'), textAlign:'center', padding:40, fontSize:13 }}>
@@ -1341,7 +1382,40 @@ function SignalJournalPanel({ entries, onRefresh }) {
 function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, onToDateChange }) {
   const m = window.innerWidth < 768
   const [selectedTrade, setSelectedTrade] = useState(null)
-  const closedTrades = journal.filter(t => t.status === 'CLOSED')
+  const [draftFrom, setDraftFrom] = useState(fromDate)
+  const [draftTo, setDraftTo] = useState(toDate)
+  const [appliedFrom, setAppliedFrom] = useState(fromDate)
+  const [appliedTo, setAppliedTo] = useState(toDate)
+
+  useEffect(() => {
+    setDraftFrom(fromDate)
+    setAppliedFrom(fromDate)
+  }, [fromDate])
+
+  useEffect(() => {
+    setDraftTo(toDate)
+    setAppliedTo(toDate)
+  }, [toDate])
+
+  const handleSubmitDates = (e) => {
+    if (e) e.preventDefault()
+    setAppliedFrom(draftFrom)
+    setAppliedTo(draftTo)
+    onFromDateChange(draftFrom)
+    onToDateChange(draftTo)
+    if (onRefresh) onRefresh(draftFrom, draftTo)
+  }
+
+  const filteredJournal = journal.filter(t => {
+    const ed = t.entry_date || (t.entry_time && t.entry_time.includes('T') ? t.entry_time.split('T')[0] : (t.entry_time && t.entry_time.includes(' ') ? t.entry_time.split(' ')[0] : ''))
+    if (ed && ed.length >= 10 && ed.startsWith('20')) {
+      if (appliedFrom && ed < appliedFrom) return false
+      if (appliedTo && ed > appliedTo) return false
+    }
+    return true
+  })
+
+  const closedTrades = filteredJournal.filter(t => t.status === 'CLOSED')
   const totalTrades = closedTrades.length
   const wins = closedTrades.filter(t => t.pnl > 0).length
   const losses = totalTrades - wins
@@ -1361,16 +1435,16 @@ function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, 
       </div>
 
       <Card>
-        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12, flexWrap:'wrap', gap:8 }}>
+        <form onSubmit={handleSubmitDates} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12, flexWrap:'wrap', gap:8 }}>
           <div style={{ color:V('text-primary'), fontWeight:700, fontSize:15 }}>Trading Journal Log</div>
           
-          <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+          <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
             <div style={{ display:'flex', alignItems:'center', gap:4 }}>
               <span style={{ fontSize:11, color:V('text-muted') }}>From:</span>
               <input 
                 type="date" 
-                value={fromDate} 
-                onChange={e => onFromDateChange(e.target.value)} 
+                value={draftFrom} 
+                onChange={e => setDraftFrom(e.target.value)} 
                 style={{
                   background: V('bg-input'),
                   color: V('text-primary'),
@@ -1383,12 +1457,13 @@ function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, 
                 }}
               />
             </div>
+
             <div style={{ display:'flex', alignItems:'center', gap:4 }}>
               <span style={{ fontSize:11, color:V('text-muted') }}>To:</span>
               <input 
                 type="date" 
-                value={toDate} 
-                onChange={e => onToDateChange(e.target.value)} 
+                value={draftTo} 
+                onChange={e => setDraftTo(e.target.value)} 
                 style={{
                   background: V('bg-input'),
                   color: V('text-primary'),
@@ -1401,14 +1476,18 @@ function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, 
                 }}
               />
             </div>
+
+            <StyledButton type="submit" variant="primary" style={{ padding:'4px 14px', fontSize:11, fontWeight:700, display:'flex', alignItems:'center', gap:4 }}>
+              <Filter size={12}/> Submit
+            </StyledButton>
             
-            <StyledButton onClick={() => onRefresh()} variant="primary" style={{ padding:'4px 12px', fontSize:11 }}>
+            <StyledButton type="button" onClick={() => onRefresh(draftFrom, draftTo)} variant="default" style={{ padding:'4px 12px', fontSize:11 }}>
               <RefreshCw size={11}/> Refresh
             </StyledButton>
           </div>
-        </div>
+        </form>
 
-        {journal.length === 0 ? (
+        {filteredJournal.length === 0 ? (
           <div style={{ color:V('text-muted'), textAlign:'center', padding:40, fontSize:13 }}>
             No broker-executed trades found on Dhan for the selected date range.<br/>
             <span style={{ fontSize:11, color:V('text-muted'), marginTop:4, display:'inline-block' }}>
@@ -1426,7 +1505,8 @@ function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, 
                 </tr>
               </thead>
               <tbody>
-                {journal.slice().reverse().map((t, idx) => {
+                {filteredJournal.slice().reverse().map((t, idx) => {
+
                   const strikeStr = t.option_strike ? `${t.option_strike} ${t.option_type || ''}` : '—'
                   const pnlVal = t.pnl != null ? t.pnl : 0.0
                   return (<React.Fragment key={idx}>
@@ -6102,8 +6182,10 @@ export default function App() {
     return new Date().toISOString().split('T')[0]
   })
 
-  const fetchJournal = useCallback(async () => {
-    const res = await API.get(`/api/journal?from_date=${journalFromDate}&to_date=${journalToDate}`).catch(()=>null)
+  const fetchJournal = useCallback(async (overrideFromDate, overrideToDate) => {
+    const fDate = overrideFromDate || journalFromDate
+    const tDate = overrideToDate || journalToDate
+    const res = await API.get(`/api/journal?from_date=${fDate}&to_date=${tDate}`).catch(()=>null)
     if (res && res.journal) {
       setJournal(res.journal)
     }
@@ -6133,6 +6215,12 @@ export default function App() {
           if (msg.type === 'trade_opened') { setRefreshChart(r=>r+1); if (fetchChartSignalsRef.current) fetchChartSignalsRef.current() }
           if (msg.type === 'trade_closed') { setRefreshChart(r=>r+1); if (fetchChartSignalsRef.current) fetchChartSignalsRef.current() }
           if (msg.type === 'chart_signals_updated') { if (fetchChartSignalsRef.current) fetchChartSignalsRef.current() }
+          if (msg.type === 'signal_event') {
+            if (!msg.data?.strategy || msg.data.strategy === strategyRef.current) {
+              setChartSignals(prev => [...(prev || []), msg.data])
+              setRefreshChart(r => r + 1)
+            }
+          }
           if (msg.type === 'init') {
             setConnected(msg.data.connected)
             if (msg.data.signal && (!msg.data.signal.instrument || msg.data.signal.instrument === instrumentRef.current))
@@ -6585,7 +6673,7 @@ export default function App() {
 
                   {/* Col 2: Secondary Strategy Signal */}
                   {(() => {
-                    const otherSignals = Object.entries(allSignals || {}).filter(([k]) => k !== strategy)
+                    const otherSignals = Object.entries(allSignals || {}).filter(([k]) => k !== strategy && k !== 'multi_agent')
                     if (otherSignals.length > 0) {
                       return otherSignals.map(([k, sig]) => (
                         <ErrorBoundary key={k}>
@@ -6693,9 +6781,9 @@ export default function App() {
           {tab === 'backtest' && <BacktestPanel connected={connected} />}
 
           {tab === 'sig_journal' && (
-            <SignalJournalPanel entries={sigJournal} onRefresh={async () => {
+            <SignalJournalPanel entries={sigJournal.length > 0 ? sigJournal : sigHistory} onRefresh={async () => {
               const r = await API.get('/api/signal_journal').catch(()=>null)
-              if (r) setSigJournal(r.entries || [])
+              if (r && r.entries) setSigJournal(r.entries)
             }} />
           )}
 
@@ -6711,7 +6799,6 @@ export default function App() {
           )}
 
           {tab === 'performance' && <PerformancePanel theme={theme} />}
-          {tab === 'research' && <ResearchPanel />}
           {tab === 'settings' && <SettingsPanel onSaved={()=>{setRefreshChart(r=>r+1); refreshSettings()}} />}
         </div>
       </div>

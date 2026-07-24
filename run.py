@@ -18,12 +18,9 @@ BASE = Path(__file__).parent
 
 def check_model():
     model_path = BASE / "backend" / "models" / "ml_model.pkl"
-    if not model_path.exists():
-        print("⚠️  Warning: ML model not found at backend/models/ml_model.pkl")
-        print("   System will run in rule-only mode.")
-        print("   To add ML: copy your model.pkl to backend/models/ml_model.pkl\n")
-    else:
-        print(f"✓  ML model found: {model_path}")
+    if model_path.exists():
+        print(f"ℹ️  ML model file present at: {model_path}")
+    print("✓  Strategy Engine active: Rule-Based Regime & Reversal Engine\n")
 
 
 def check_frontend():
@@ -46,6 +43,23 @@ def ensure_dirs():
     print("✓  Directories ready")
 
 
+def free_port(port=8000):
+    import socket
+    import time
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('127.0.0.1', port)) == 0:
+                print(f"⚠️  Port {port} is busy. Clearing existing process...")
+                if sys.platform == 'win32':
+                    subprocess.run(
+                        f'powershell -Command "Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}"',
+                        shell=True, capture_output=True
+                    )
+                time.sleep(1)
+    except Exception:
+        pass
+
+
 def main():
     print("=" * 55)
     print("  DhanML — Multi-Agent Algo Trading Engine")
@@ -53,6 +67,7 @@ def main():
     ensure_dirs()
     check_model()
     check_frontend()
+    free_port(8000)
 
     print("\n🚀 Starting server at http://localhost:8000\n")
     os.chdir(BASE)
@@ -65,15 +80,17 @@ def main():
             "backend.main:app",
             host="0.0.0.0",
             port=8000,
-            reload=True,
+            reload=False,
             log_level="info",
         )
-    except KeyboardInterrupt:
-        print("\n👋 DhanML trading engine stopped cleanly.")
-        os._exit(0)
+    except (KeyboardInterrupt, SystemExit):
+        pass
     except ImportError:
         print("ERROR: uvicorn not installed. Run: uv pip install -r requirements.txt")
         sys.exit(1)
+    finally:
+        print("\n👋 DhanML trading engine stopped cleanly.")
+        os._exit(0)
 
 
 if __name__ == "__main__":

@@ -124,8 +124,8 @@ def get_dhan_reconstructed_trades(target_instrument: str, days: int = 30) -> lis
         from_date = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
         to_date = now_ist.strftime("%Y-%m-%d")
         
-        hist_trades = broker.get_trade_history(from_date, to_date)
-        today_trades = broker.get_trade_book()
+        hist_trades = broker.get_trade_history(from_date, to_date) if hasattr(broker, "get_trade_history") else []
+        today_trades = broker.get_trade_book() if hasattr(broker, "get_trade_book") else []
         
         # Combine and deduplicate
         all_execs = {}

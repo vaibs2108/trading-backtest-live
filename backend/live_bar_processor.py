@@ -1,11 +1,16 @@
 """
-Live Bar Processor — processes 5-min bars sequentially to mirror backtest logic.
+Live Bar Processor — runs each strategy's run_backtest() on live frames and
+diffs consecutive results to detect new entries/exits.
 
-Instead of evaluating only the latest bar (which misses brief regime transitions),
-this module processes ALL new completed bars since the last evaluation, using the
-EXACT same logic as each strategy's `run_backtest` inner loop.
+Architecture:
+    BacktestDiffProcessor (base) calls run_backtest(frames) — the EXACT same
+    function that produces chart overlay signals.  By diffing consecutive
+    backtest results it detects new entries and exits, guaranteeing that live
+    signals are **identical** to the backtest / chart overlay.
 
-This guarantees that live signals are an exact mirror of backtest signals.
+    Each strategy gets a thin subclass that only specifies:
+        - strategy_id   (e.g. "regime_reversal")
+        - _get_module() (returns the strategy module with run_backtest())
 """
 
 import logging
@@ -13,7 +18,6 @@ import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
-from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -94,507 +98,199 @@ def _to_ist_iso(ts) -> str:
     return t.isoformat()
 
 
-def _find_today_start(base: pd.DataFrame, fallback_lookback: int = 80) -> int:
-    """Find the index of the first bar from today's date in the session-filtered base.
+# ═══════════════════════════════════════════════════════════════════════════════
+# GENERIC BACKTEST-DIFF PROCESSOR (base class)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    After daily reset, we must start from today's first bar so we don't miss
-    morning signals.  Falls back to ``max(0, n - fallback_lookback)`` when
-    today has no bars yet (pre-market).
+class BacktestDiffProcessor:
+    """Runs run_backtest(frames) and diffs consecutive results.
+
+    Subclasses must set:
+        strategy_id  – e.g. "regime_reversal"
+    and implement:
+        _get_module() – return the strategy module with run_backtest()
     """
-    import pytz
-    n = len(base)
-    if n == 0:
-        return 0
 
-    today = datetime.now(pytz.timezone("Asia/Kolkata")).date()
-
-    for idx in range(n):
-        bar_ts = pd.to_datetime(base.iloc[idx]["timestamp"])
-        if bar_ts.date() == today:
-            return idx
-
-    # Today has no bars yet — use fallback (should rarely happen)
-    return max(0, n - fallback_lookback)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# REGIME TREND/RANGE LIVE PROCESSOR
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class RegimeLiveProcessor:
-    """Mirrors regime_strategy.run_backtest inner loop for live bar-by-bar processing."""
+    strategy_id: str = ""
 
     def __init__(self):
-        self.position = "NONE"
-        self.entry_price = 0.0
-        self.sl = 0.0
-        self.entry_idx = 0
-        self.highest_since_entry = 0.0
-        self.lowest_since_entry = 99999999.0
-        self.last_processed_ts = None
-        self._entry_signal_detail: Optional[dict] = None
-        self._last_atr = 0.0
-        self._last_close = 0.0
-        self._last_exit_signal: Optional[str] = None   # "LONG_EXIT" / "SHORT_EXIT" — consumed by get_ui_signal
-        self._last_exit_reason: Optional[str] = None    # e.g. "REGIME_EXIT", "SL_HIT"
-        self._proc_state = {
-            "regime": "SIDEWAYS",
-            "regime_age": 0,
-            "htf_cache": None,
-            "htf_cache_hour": -1,
-        }
-
-    def reset(self):
-        """Reset all state — call on daily boundary or restart."""
-        import strategies.regime_strategy as rs
-        rs._prev_regime = "SIDEWAYS"
-        rs._prev_regime_age = 0
-        rs._htf_cache = None
-        rs._htf_cache_hour = -1
-        self._proc_state = {
-            "regime": "SIDEWAYS",
-            "regime_age": 0,
-            "htf_cache": None,
-            "htf_cache_hour": -1,
-        }
-        self.position = "NONE"
-        self.entry_price = 0.0
-        self.sl = 0.0
-        self.entry_idx = 0
-        self.highest_since_entry = 0.0
-        self.lowest_since_entry = 99999999.0
-        self.last_processed_ts = None
-        self._entry_signal_detail = None
-        self._last_atr = 0.0
-        self._last_close = 0.0
-        self._last_exit_signal = None
-        self._last_exit_reason = None
-        logger.info("[RegimeLiveProcessor] State reset")
-
-    def process_frames(self, frames: dict, cfg, lot_size: int = 30) -> List[LiveSignal]:
-        """
-        Build merged table from raw frames and process new bars.
-        This is the main entry point called from the polling loop.
-        """
-        import strategy as main_strategy
-        from strategies.regime_strategy import _session_mask
-
-        required = ["5", "15", "60", "1D"]
-        for r in required:
-            if r not in frames or frames[r] is None or len(frames[r]) < 30:
-                return []
-
-        try:
-            base = main_strategy.build_merged_table(frames, with_patterns=False)
-        except Exception as e:
-            logger.error(f"[RegimeProcessor] Failed to build merged table: {e}")
-            return []
-
-        if base.empty:
-            return []
-
-        base = base[_session_mask(base, cfg)].copy().reset_index(drop=True)
-        if base.empty:
-            return []
-
-        # ── CRITICAL: Filter for completed bars only ─────────────────────────
-        # A 5-minute candle with timestamp T (e.g. 09:30:00) completes at 09:35:00 IST.
-        # Evaluating incomplete forming bars prematurely sets last_processed_ts and
-        # causes completed bar signals to be missed. Only evaluate closed bars!
-        import pytz
-        now_ist = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
-        ts_series = pd.to_datetime(base["timestamp"]).dt.tz_localize(None)
-        is_past_day = ts_series.dt.date < now_ist.date()
-        is_bar_closed = ts_series.apply(lambda ts: ts + timedelta(minutes=5) <= now_ist)
-        base = base[is_past_day | is_bar_closed].copy().reset_index(drop=True)
-        if base.empty:
-            return []
-
-        df_1h = frames.get("60")
-        df_1d = frames.get("1D")
-        df_1w = None
-        if df_1d is not None and len(df_1d) >= 30:
-            try:
-                from features.weekly import derive_weekly_from_daily
-                df_1w = derive_weekly_from_daily(df_1d)
-            except Exception:
-                pass
-
-        return self._process_new_bars(base, df_1h, df_1d, df_1w, cfg, lot_size)
-
-    def get_ui_signal(self, cfg) -> dict:
-        """Return current state as a signal dict for the UI panel.
-
-        CRITICAL: when the processor has just exited a position (REGIME_EXIT,
-        SL_HIT, etc.), return the EXIT signal so the auto-trade monitoring
-        loop in main.py can close the real broker position immediately —
-        rather than waiting for SL to be hit at the index-LTP level.
-        """
-        import strategies.regime_strategy as rs
-
-        # Determine the signal field: EXIT signal takes priority over HOLD
-        if self._last_exit_signal is not None:
-            sig_value = self._last_exit_signal          # "LONG_EXIT" / "SHORT_EXIT"
-            exit_reason = self._last_exit_reason or ""
-            # Consume — only emit once per exit event
-            self._last_exit_signal = None
-            self._last_exit_reason = None
-        elif self.position != "NONE":
-            sig_value = self.position                   # "LONG" / "SHORT"
-            exit_reason = ""
-        else:
-            sig_value = "HOLD"
-            exit_reason = ""
-
-        base = {
-            "signal": sig_value,
-            "strategy": "regime_trend_range",
-            "time": _to_ist_iso(self.last_processed_ts) if self.last_processed_ts else "",
-            "entry": round(self.entry_price, 2) if self.position != "NONE" else 0.0,
-            "sl": round(self.sl, 2),
-            "regime": rs._prev_regime,
-            "regime_confidence": 0.0,
-            "playbook": "",
-            "weighted_score": 0.0,
-            "atr_5m": round(self._last_atr, 2),
-            "close": round(self._last_close, 2),
-            "h1_trend": "",
-            "macro_bias": "",
-            "adx_1h": 0.0,
-            "ml_prob": 0.0,
-            "rr_t1": 0.0,
-            "risk_pts": 0.0,
-            "long_score": 0.0,
-            "short_score": 0.0,
-            "reasons": [exit_reason] if exit_reason else [],
-        }
-        if self._entry_signal_detail:
-            base.update({k: v for k, v in self._entry_signal_detail.items()
-                         if k not in ("signal",) and v})
-            base["signal"] = sig_value  # preserve the EXIT / position / HOLD we chose above
-        return base
-
-    def _process_new_bars(self, base: pd.DataFrame, df_1h, df_1d, df_1w, cfg,
-                          lot_size: int) -> List[LiveSignal]:
-        from strategies.regime_strategy import _run_agents, _EOD_EXIT_MINUTE
-
-        trail_mult = getattr(cfg, "regime_trail_mult", 1.5)
-        trail_activation = getattr(cfg, "regime_trail_activation", 0.3)
-        be_trigger = getattr(cfg, "regime_be_trigger", 0.4)
-        be_buffer = getattr(cfg, "regime_be_buffer", 0.3)
-        qty = lot_size
-
-        if base.empty:
-            return []
-
-        n = len(base)
-        signals_out: List[LiveSignal] = []
-
-        if self.last_processed_ts is not None:
-            mask = base["timestamp"] > self.last_processed_ts
-            if not mask.any():
-                return []
-            start_idx = base[mask].index[0]
-        else:
-            # First run after reset — warm up regime state then start from today
-            today_idx = _find_today_start(base, fallback_lookback=80)
-
-            # Warm-up: run agents on the 80 bars BEFORE today to build correct
-            # regime state (stickiness, HTF cache). Discard signals — we only
-            # care about the regime globals reaching the right state.
-            warmup_start = max(0, today_idx - 80)
-            if warmup_start < today_idx:
-                logger.info(f"[RegimeProcessor] Warming up regime state on bars {warmup_start}..{today_idx-1}")
-                for wi in range(warmup_start, today_idx):
-                    w_row = base.iloc[wi]
-                    w_ctx_start = max(0, wi - 80)
-                    w_df_slice = base.iloc[w_ctx_start:wi + 1]
-                    w_ts = base.iloc[wi]["timestamp"]
-                    w_1h = df_1h[df_1h["timestamp"] <= w_ts].tail(200) if df_1h is not None else None
-                    w_1d = df_1d[df_1d["timestamp"] <= w_ts].tail(200) if df_1d is not None else None
-                    w_1w = df_1w[df_1w["timestamp"] <= w_ts].tail(200) if df_1w is not None else None
-                    _run_agents(w_df_slice, w_row, "NONE", cfg, w_1h, w_1d, w_1w, _state=self._proc_state)
-                logger.info(f"[RegimeProcessor] Warm-up complete, regime state is now primed")
-
-            start_idx = today_idx
-
-        for i in range(start_idx, n):
-            row = base.iloc[i]
-            bh = float(row.get("high", row["close"]))
-            bl = float(row.get("low", row["close"]))
-            bc = float(row["close"])
-            ts = row["timestamp"]
-            atr_v = float(row.get("atr", bc * 0.002))
-            if pd.isna(atr_v) or atr_v < 5:
-                atr_v = bc * 0.002
-
-            self._last_atr = atr_v
-            self._last_close = bc
-
-            ts_ist = pd.to_datetime(ts)
-            cur_mins = ts_ist.hour * 60 + ts_ist.minute
-
-            context_start = max(0, i - 80)
-            df_slice = base.iloc[context_start:i + 1]
-
-            cur_ts = base.iloc[i]["timestamp"]
-            df_1h_cur = df_1h[df_1h["timestamp"] <= cur_ts].tail(200) if df_1h is not None else None
-            df_1d_cur = df_1d[df_1d["timestamp"] <= cur_ts].tail(200) if df_1d is not None else None
-            df_1w_cur = df_1w[df_1w["timestamp"] <= cur_ts].tail(200) if df_1w is not None else None
-
-            # ── MANAGE OPEN POSITION ────────────────────────────────────
-            if self.position != "NONE":
-                if cur_mins >= _EOD_EXIT_MINUTE:
-                    signals_out.append(self._book_exit(bc, "EOD_EXIT", ts, base, qty))
-                    self.last_processed_ts = ts
-                    continue
-
-                if self.position == "LONG" and bl <= self.sl:
-                    signals_out.append(self._book_exit(self.sl, "SL_HIT", ts, base, qty))
-                elif self.position == "SHORT" and bh >= self.sl:
-                    signals_out.append(self._book_exit(self.sl, "SL_HIT", ts, base, qty))
-                elif self.position == "LONG":
-                    if bh > self.highest_since_entry:
-                        self.highest_since_entry = bh
-                    profit = self.highest_since_entry - self.entry_price
-                    if profit >= atr_v * trail_activation:
-                        trail_sl = self.highest_since_entry - atr_v * trail_mult
-                        if be_trigger > 0 and profit > atr_v * be_trigger:
-                            trail_sl = max(trail_sl, self.entry_price + atr_v * be_buffer)
-                        if trail_sl > self.sl:
-                            self.sl = trail_sl
-
-                    sig = _run_agents(df_slice, row, "LONG", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=self._proc_state)
-                    if sig.signal == "LONG_EXIT":
-                        signals_out.append(self._book_exit(bc, "REGIME_EXIT", ts, base, qty))
-                    elif self.position == "LONG":
-                        opp_sig = _run_agents(df_slice, row, "NONE", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=self._proc_state)
-                        if opp_sig.signal == "SHORT":
-                            signals_out.append(self._book_exit(bc, "OPPOSITE_SIGNAL", ts, base, qty))
-
-                elif self.position == "SHORT":
-                    if bl < self.lowest_since_entry:
-                        self.lowest_since_entry = bl
-                    profit = self.entry_price - self.lowest_since_entry
-                    if profit >= atr_v * trail_activation:
-                        trail_sl = self.lowest_since_entry + atr_v * trail_mult
-                        if be_trigger > 0 and profit > atr_v * be_trigger:
-                            trail_sl = min(trail_sl, self.entry_price - atr_v * be_buffer)
-                        if trail_sl < self.sl:
-                            self.sl = trail_sl
-
-                    sig = _run_agents(df_slice, row, "SHORT", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=self._proc_state)
-                    if sig.signal == "SHORT_EXIT":
-                        signals_out.append(self._book_exit(bc, "REGIME_EXIT", ts, base, qty))
-                    elif self.position == "SHORT":
-                        opp_sig = _run_agents(df_slice, row, "NONE", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=self._proc_state)
-                        if opp_sig.signal == "LONG":
-                            signals_out.append(self._book_exit(bc, "OPPOSITE_SIGNAL", ts, base, qty))
-
-            # ── LOOK FOR NEW ENTRY ──────────────────────────────────────
-            if self.position == "NONE":
-                if cur_mins >= _EOD_EXIT_MINUTE:
-                    self.last_processed_ts = ts
-                    continue
-
-                sig = _run_agents(df_slice, row, "NONE", cfg, df_1h_cur, df_1d_cur, df_1w_cur, _state=self._proc_state)
-
-                if sig.signal in ("LONG", "SHORT"):
-                    # Use current close — no look-ahead bias (matches backtest)
-                    self.entry_price = bc
-                    self.sl = sig.sl
-                    self.position = sig.signal
-                    self.entry_idx = i
-                    self.highest_since_entry = bh
-                    self.lowest_since_entry = bl
-
-                    sig_dict = sig.to_dict()
-                    self._entry_signal_detail = sig_dict
-
-                    entry_sig = LiveSignal(
-                        signal_type="ENTRY", direction=sig.signal, signal=sig.signal,
-                        time=_to_ist_iso(ts),
-                        entry_price=round(bc, 2),
-                        sl=round(sig.sl, 2),
-                        target1=round(sig.target1, 2),
-                        target2=round(sig.target2, 2),
-                        strategy="regime_trend_range",
-                        weighted_score=sig.weighted_score,
-                        reasons=list(sig.reasons),
-                        macro_bias=sig.macro_bias, adx_1h=sig.adx_1h,
-                        atr_5m=sig.atr_5m, h1_trend=sig.h1_trend,
-                        regime=sig.regime, regime_confidence=sig.regime_confidence,
-                        playbook=sig.playbook, entry_quality=sig.entry_quality,
-                        ml_prob=sig.ml_prob, rr_t1=sig.rr_t1,
-                        risk_pts=sig.risk_pts, long_score=sig.long_score,
-                        short_score=sig.short_score,
-                    )
-                    signals_out.append(entry_sig)
-
-            self.last_processed_ts = ts
-
-        return signals_out
-
-    def _book_exit(self, exit_px, reason, ts, base, qty):
-        exit_signal = "LONG_EXIT" if self.position == "LONG" else "SHORT_EXIT"
-
-        if self.position == "LONG":
-            pnl = (exit_px - self.entry_price) * qty
-            pnl_pts = exit_px - self.entry_price
-        else:
-            pnl = (self.entry_price - exit_px) * qty
-            pnl_pts = self.entry_price - exit_px
-
-        sig = LiveSignal(
-            signal_type="EXIT", direction=self.position,
-            signal=exit_signal,
-            time=_to_ist_iso(ts),
-            entry_price=round(self.entry_price, 2),
-            exit_price=round(exit_px, 2), exit_reason=reason,
-            pnl=round(pnl, 2), pnl_pts=round(pnl_pts, 2),
-            sl=round(self.sl, 2), strategy="regime_trend_range",
-            reasons=[f"Exit: {reason} @ {round(exit_px, 2)}"],
-        )
-
-        # Stash the exit signal so get_ui_signal() can propagate it
-        # to the auto-trade monitoring loop in main.py
-        self._last_exit_signal = exit_signal
-        self._last_exit_reason = reason
-
-        self.position = "NONE"
-        self.entry_price = 0.0
-        self.sl = 0.0
-        self.highest_since_entry = 0.0
-        self.lowest_since_entry = 99999999.0
-        self._entry_signal_detail = None
-        return sig
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# REGIME + REVERSAL COMBINED LIVE PROCESSOR
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class RegimeReversalLiveProcessor:
-    """Mirrors regime_reversal_strategy.run_backtest for live bar-by-bar processing."""
-
-    TRAIL_MULT = 1.5
-    TRAIL_ACTIVATION = 0.3
-    BE_TRIGGER = 0.4
-    BE_BUFFER = 0.3
-
-    def __init__(self):
-        self.position = "NONE"
-        self.trade_source = "NONE"      # "REGIME" | "REVERSAL" | "NONE"
-        self.entry_price = 0.0
-        self.sl = 0.0
-        self.entry_idx = 0
-        self.highest_since_entry = 0.0
-        self.lowest_since_entry = 99999999.0
-        self.last_processed_ts = None
-        self.last_regime_direction = "NONE"
-        self.last_regime_sl = 0.0
-        self._entry_signal_detail: Optional[dict] = None
-        self._last_atr = 0.0
-        self._last_close = 0.0
-        self._last_exit_signal: Optional[str] = None
-        self._last_exit_reason: Optional[str] = None
-        self._proc_state = {
-            "regime": "SIDEWAYS",
-            "regime_age": 0,
-            "htf_cache": None,
-            "htf_cache_hour": -1,
-        }
-
-    def reset(self):
-        """Reset all state — call on daily boundary or restart."""
-        self._proc_state = {
-            "regime": "SIDEWAYS",
-            "regime_age": 0,
-            "htf_cache": None,
-            "htf_cache_hour": -1,
-        }
+        self._prev_trade_keys: set = set()
+        self._prev_open_key: Optional[tuple] = None
+        self._initialised = False
         self.position = "NONE"
         self.trade_source = "NONE"
         self.entry_price = 0.0
         self.sl = 0.0
-        self.entry_idx = 0
-        self.highest_since_entry = 0.0
-        self.lowest_since_entry = 99999999.0
-        self.last_processed_ts = None
-        self.last_regime_direction = "NONE"
-        self.last_regime_sl = 0.0
-        self._entry_signal_detail = None
+        self.target1 = 0.0
+        self.target2 = 0.0
         self._last_atr = 0.0
         self._last_close = 0.0
+        self._entry_signal_detail: Optional[dict] = None
+        self._last_exit_signal: Optional[str] = None
+        self._last_exit_reason: Optional[str] = None
+        self._regime = "SIDEWAYS"
+        self.last_processed_ts = None
+
+    def _get_module(self):
+        """Return the strategy module that has run_backtest(). Override in subclass."""
+        raise NotImplementedError
+
+    def reset(self):
+        """Reset all state — call on daily boundary or restart."""
+        self._prev_trade_keys = set()
+        self._prev_open_key = None
+        self._initialised = False
+        self.position = "NONE"
+        self.trade_source = "NONE"
+        self.entry_price = 0.0
+        self.sl = 0.0
+        self.target1 = 0.0
+        self.target2 = 0.0
+        self._last_atr = 0.0
+        self._last_close = 0.0
+        self._entry_signal_detail = None
         self._last_exit_signal = None
         self._last_exit_reason = None
-        logger.info("[RegimeReversalProcessor] State reset")
+        self._regime = "SIDEWAYS"
+        self.last_processed_ts = None
+        logger.info(f"[{self.strategy_id}] Processor state reset")
 
+    # ──────────────────────────────────────────────────────────────────
+    #  CORE: run backtest, diff trades, emit LiveSignal objects
+    # ──────────────────────────────────────────────────────────────────
     def process_frames(self, frames: dict, cfg, lot_size: int = 30) -> List[LiveSignal]:
-        import strategy as main_strategy
-        from strategies.regime_reversal_strategy import _session_mask
-        from strategies.trend_reversal_strategy import add_indicators as reversal_add_indicators
+        mod = self._get_module()
 
+        # Validate minimum data
         required = ["5", "15", "60", "1D"]
         for r in required:
             if r not in frames or frames[r] is None or len(frames[r]) < 30:
-                _avail = {k: len(v) if v is not None else 0 for k, v in frames.items() if k in required}
-                logger.debug(f"[RegimeReversalProcessor] Insufficient data for TF={r}, available: {_avail}")
                 return []
 
+        # Run the EXACT same backtest that chart_signals uses
         try:
-            base = main_strategy.build_merged_table(frames, with_patterns=False)
+            result = mod.run_backtest(frames)
         except Exception as e:
-            logger.error(f"[RegimeReversalProcessor] Failed to build merged table: {e}")
+            logger.error(f"[{self.strategy_id}] Backtest failed: {e}", exc_info=True)
             return []
 
-        if base.empty:
-            logger.debug("[RegimeReversalProcessor] Empty merged table")
+        if not result or "error" in result:
+            logger.debug(f"[{self.strategy_id}] Backtest returned: {result}")
             return []
 
-        _pre_mask = len(base)
-        base = base[_session_mask(base, cfg)].copy().reset_index(drop=True)
-        if base.empty:
-            logger.debug(f"[RegimeReversalProcessor] All {_pre_mask} bars filtered by session mask")
+        bt_trades = result.get("trades", [])
+        stats = result.get("stats", {})
+        qty = lot_size
+
+        # Update regime from stats
+        regime_dist = stats.get("regime_distribution", {})
+        if regime_dist:
+            self._regime = max(regime_dist, key=regime_dist.get)
+
+        # Update last close / ATR from 5m frame
+        if "5" in frames and not frames["5"].empty:
+            last_bar = frames["5"].iloc[-1]
+            self._last_close = float(last_bar.get("close", 0))
+            atr_v = float(last_bar.get("atr", 0))
+            self._last_atr = atr_v if atr_v > 5 else self._last_close * 0.002
+            self.last_processed_ts = last_bar.get("timestamp")
+
+        # ── First call: snapshot state, suppress signals ──
+        # Track _prev_open_key for diff detection but do NOT set
+        # self.position — we only show positions from actual new signals,
+        # never from inherited backtest state (avoids phantom positions).
+        if not self._initialised:
+            self._initialised = True
+            self._prev_trade_keys = {(t["direction"], t["entry_time"]) for t in bt_trades}
+            self._prev_open_key = None
+            for t in reversed(bt_trades):
+                if t.get("exit_reason") == "OPEN" and not t.get("exit_time"):
+                    self._prev_open_key = (t["direction"], t["entry_time"])
+                    break
+            logger.info(
+                f"[{self.strategy_id}] Initialised from backtest: "
+                f"{len(bt_trades)} trades, open_key={'yes' if self._prev_open_key else 'no'}, regime={self._regime}"
+            )
             return []
 
-        # Compute reversal indicators
-        _has_reversal = False
-        try:
-            base = reversal_add_indicators(base, method="Linear", window=50, smoothness=30.0)
-            _has_reversal = "top_sig" in base.columns and "bot_sig" in base.columns
-            if _has_reversal:
-                _n_top = int(base["top_sig"].sum())
-                _n_bot = int(base["bot_sig"].sum())
-                logger.debug(f"[RegimeReversalProcessor] Reversal indicators OK: {_n_top} top_sig, {_n_bot} bot_sig in {len(base)} bars")
-        except Exception as e:
-            logger.warning(f"[RegimeReversalProcessor] Reversal indicators failed: {e}")
+        # ── Diff: detect new entries and exits ──
+        signals_out: List[LiveSignal] = []
+        current_keys = set()
+        current_open_key = None
 
-        # Filter for completed bars only
-        import pytz
-        now_ist = datetime.now(pytz.timezone("Asia/Kolkata")).replace(tzinfo=None)
-        ts_series = pd.to_datetime(base["timestamp"]).dt.tz_localize(None)
-        is_past_day = ts_series.dt.date < now_ist.date()
-        is_bar_closed = ts_series.apply(lambda ts: ts + timedelta(minutes=5) <= now_ist)
-        _pre_filter = len(base)
-        base = base[is_past_day | is_bar_closed].copy().reset_index(drop=True)
-        if base.empty:
-            logger.debug(f"[RegimeReversalProcessor] All {_pre_filter} bars filtered as incomplete (now={now_ist})")
-            return []
-        logger.debug(f"[RegimeReversalProcessor] {len(base)}/{_pre_filter} bars after completion filter, last_ts={base.iloc[-1]['timestamp']}, last_processed={self.last_processed_ts}")
+        for t in bt_trades:
+            key = (t["direction"], t["entry_time"])
+            current_keys.add(key)
 
-        df_1h = frames.get("60")
-        df_1d = frames.get("1D")
-        df_1w = None
-        if df_1d is not None and len(df_1d) >= 30:
-            try:
-                from features.weekly import derive_weekly_from_daily
-                df_1w = derive_weekly_from_daily(df_1d)
-            except Exception:
-                pass
+            is_open = t.get("exit_reason") == "OPEN" and not t.get("exit_time")
+            if is_open:
+                current_open_key = key
 
-        return self._process_new_bars(base, df_1h, df_1d, df_1w, cfg, lot_size)
+            # Was the previous open trade now closed?
+            if key == self._prev_open_key and not is_open:
+                signals_out.append(self._exit_from_trade(t, qty))
+                logger.info(
+                    f"[{self.strategy_id}] EXIT {t['direction']} "
+                    f"reason={t.get('exit_reason')} @ {t.get('exit_price', 0)}"
+                )
 
+            # New trade not seen before?
+            if key not in self._prev_trade_keys:
+                signals_out.append(self._entry_from_trade(t))
+                logger.info(
+                    f"[{self.strategy_id}] ENTRY {t['direction']} "
+                    f"@ {t.get('entry_price', 0)} SL={t.get('sl', 0)} "
+                    f"source={t.get('source', '?')}"
+                )
+                # If already closed on the same bar, also emit exit
+                if not is_open and t.get("exit_time"):
+                    signals_out.append(self._exit_from_trade(t, qty))
+                    logger.info(
+                        f"[{self.strategy_id}] Immediate EXIT {t['direction']} "
+                        f"reason={t.get('exit_reason')} (same bar)"
+                    )
+
+        # ── Update internal state ──
+        self._prev_trade_keys = current_keys
+        self._prev_open_key = current_open_key
+
+        if current_open_key:
+            for t in reversed(bt_trades):
+                if (t["direction"], t["entry_time"]) == current_open_key:
+                    self.position = t["direction"]
+                    self.entry_price = t.get("entry_price", 0)
+                    self.sl = t.get("sl", 0)
+                    self.target1 = t.get("target1", 0)
+                    self.target2 = t.get("target2", 0)
+                    self.trade_source = t.get("source", "REGIME")
+                    self._last_exit_signal = None
+                    self._last_exit_reason = None
+                    break
+        else:
+            if self.position != "NONE":
+                last_closed = bt_trades[-1] if bt_trades else None
+                if last_closed and last_closed.get("exit_time"):
+                    self._last_exit_signal = (
+                        "LONG_EXIT" if last_closed["direction"] == "LONG" else "SHORT_EXIT"
+                    )
+                    self._last_exit_reason = last_closed.get("exit_reason", "")
+            self.position = "NONE"
+            self.entry_price = 0.0
+            self.sl = 0.0
+            self.target1 = 0.0
+            self.target2 = 0.0
+            self.trade_source = "NONE"
+
+        if signals_out:
+            logger.info(
+                f"[{self.strategy_id}] Generated {len(signals_out)} signals "
+                f"from backtest diff ({len(bt_trades)} trades total)"
+            )
+        return signals_out
+
+    # ──────────────────────────────────────────────────────────────────
+    #  UI signal (for the frontend signal panel)
+    # ──────────────────────────────────────────────────────────────────
     def get_ui_signal(self, cfg) -> dict:
         if self._last_exit_signal is not None:
             sig_value = self._last_exit_signal
@@ -608,13 +304,15 @@ class RegimeReversalLiveProcessor:
             sig_value = "HOLD"
             exit_reason = ""
 
-        base = {
+        return {
             "signal": sig_value,
-            "strategy": "regime_reversal",
+            "strategy": self.strategy_id,
             "time": _to_ist_iso(self.last_processed_ts) if self.last_processed_ts else "",
             "entry": round(self.entry_price, 2) if self.position != "NONE" else 0.0,
             "sl": round(self.sl, 2),
-            "regime": self._proc_state.get("regime", "SIDEWAYS"),
+            "target1": round(self.target1, 2),
+            "target2": round(self.target2, 2),
+            "regime": self._regime,
             "regime_confidence": 0.0,
             "playbook": "",
             "weighted_score": 0.0,
@@ -631,616 +329,66 @@ class RegimeReversalLiveProcessor:
             "reasons": [exit_reason] if exit_reason else [],
             "trade_source": self.trade_source,
         }
-        if self._entry_signal_detail:
-            base.update({k: v for k, v in self._entry_signal_detail.items()
-                         if k not in ("signal",) and v})
-            base["signal"] = sig_value
-        return base
 
-    def _process_new_bars(self, base, df_1h, df_1d, df_1w, cfg, lot_size):
-        from strategies.regime_reversal_strategy import _run_agents, _EOD_EXIT_MINUTE
-
-        qty = lot_size
-        if base.empty:
-            return []
-
-        n = len(base)
-        signals_out: List[LiveSignal] = []
-
-        # Pre-extract reversal arrays
-        top_sig = base["top_sig"].values if "top_sig" in base.columns else np.zeros(n, dtype=bool)
-        bot_sig = base["bot_sig"].values if "bot_sig" in base.columns else np.zeros(n, dtype=bool)
-        upper_band = base["upper"].values if "upper" in base.columns else np.full(n, np.nan)
-        lower_band = base["lower"].values if "lower" in base.columns else np.full(n, np.nan)
-        close_arr = base["close"].values.astype(float)
-        high_arr = base["high"].values.astype(float)
-        low_arr = base["low"].values.astype(float)
-
-        if self.last_processed_ts is not None:
-            mask = base["timestamp"] > self.last_processed_ts
-            if not mask.any():
-                logger.debug(f"[RegimeReversalProcessor] No new bars since {self.last_processed_ts}")
-                return []
-            start_idx = base[mask].index[0]
-            logger.debug(f"[RegimeReversalProcessor] {n - start_idx} new bars from idx {start_idx} (pos={self.position})")
-        else:
-            today_idx = _find_today_start(base, fallback_lookback=80)
-            warmup_start = max(0, today_idx - 80)
-            if warmup_start < today_idx:
-                logger.info(f"[RegimeReversalProcessor] Warming up on bars {warmup_start}..{today_idx-1}")
-                for wi in range(warmup_start, today_idx):
-                    w_row = base.iloc[wi]
-                    w_ctx = max(0, wi - 80)
-                    w_slice = base.iloc[w_ctx:wi + 1]
-                    w_ts = base.iloc[wi]["timestamp"]
-                    w_1h = df_1h[df_1h["timestamp"] <= w_ts].tail(200) if df_1h is not None else None
-                    w_1d = df_1d[df_1d["timestamp"] <= w_ts].tail(200) if df_1d is not None else None
-                    w_1w = df_1w[df_1w["timestamp"] <= w_ts].tail(200) if df_1w is not None else None
-                    _run_agents(w_slice, w_row, "NONE", cfg, w_1h, w_1d, w_1w, _state=self._proc_state)
-                logger.info(f"[RegimeReversalProcessor] Warm-up complete, regime={self._proc_state.get('regime')}")
-            start_idx = today_idx
-            logger.info(f"[RegimeReversalProcessor] First run: today_idx={today_idx}, processing {n - start_idx} bars")
-
-        for i in range(start_idx, n):
-            row = base.iloc[i]
-            bh = high_arr[i]
-            bl = low_arr[i]
-            bc = close_arr[i]
-            ts = row["timestamp"]
-            atr_v = float(row.get("atr", bc * 0.002))
-            if pd.isna(atr_v) or atr_v < 5:
-                atr_v = bc * 0.002
-
-            self._last_atr = atr_v
-            self._last_close = bc
-
-            ts_ist = pd.to_datetime(ts)
-            cur_mins = ts_ist.hour * 60 + ts_ist.minute
-
-            context_start = max(0, i - 80)
-            df_slice = base.iloc[context_start:i + 1]
-
-            cur_ts = base.iloc[i]["timestamp"]
-            df_1h_cur = df_1h[df_1h["timestamp"] <= cur_ts].tail(200) if df_1h is not None else None
-            df_1d_cur = df_1d[df_1d["timestamp"] <= cur_ts].tail(200) if df_1d is not None else None
-            df_1w_cur = df_1w[df_1w["timestamp"] <= cur_ts].tail(200) if df_1w is not None else None
-
-            just_closed_source = None
-
-            # ── MANAGE OPEN POSITION ──
-            if self.position != "NONE":
-                if cur_mins >= _EOD_EXIT_MINUTE:
-                    signals_out.append(self._book_exit(bc, "EOD_EXIT", ts, qty))
-                    self.last_regime_direction = "NONE"
-                    self.last_processed_ts = ts
-                    continue
-
-                # SL hit — no continue, falls through to flat
-                if self.position == "LONG" and bl <= self.sl:
-                    just_closed_source = self.trade_source
-                    signals_out.append(self._book_exit(self.sl, "SL_HIT", ts, qty))
-                elif self.position == "SHORT" and bh >= self.sl:
-                    just_closed_source = self.trade_source
-                    signals_out.append(self._book_exit(self.sl, "SL_HIT", ts, qty))
-
-                # Run agents + trailing + regime exit (if still in position)
-                if self.position != "NONE":
-                    regime_pos = self.position if self.trade_source == "REGIME" else "NONE"
-                    sig = _run_agents(df_slice, row, regime_pos, cfg,
-                                      df_1h_cur, df_1d_cur, df_1w_cur,
-                                      _state=self._proc_state)
-
-                    if self.trade_source == "REVERSAL":
-                        if sig.signal in ("LONG", "SHORT"):
-                            self.last_regime_direction = sig.signal
-                            self.last_regime_sl = sig.sl
-
-                    if self.trade_source == "REGIME":
-                        if self.position == "LONG":
-                            if bh > self.highest_since_entry:
-                                self.highest_since_entry = bh
-                            profit = self.highest_since_entry - self.entry_price
-                            if profit >= atr_v * self.TRAIL_ACTIVATION:
-                                trail_sl = self.highest_since_entry - atr_v * self.TRAIL_MULT
-                                if self.BE_TRIGGER > 0 and profit > atr_v * self.BE_TRIGGER:
-                                    trail_sl = max(trail_sl, self.entry_price + atr_v * self.BE_BUFFER)
-                                if trail_sl > self.sl:
-                                    self.sl = trail_sl
-                            if sig.signal == "LONG_EXIT":
-                                signals_out.append(self._book_exit(bc, "REGIME_EXIT", ts, qty))
-                                self.last_regime_direction = "NONE"
-
-                        elif self.position == "SHORT":
-                            if bl < self.lowest_since_entry:
-                                self.lowest_since_entry = bl
-                            profit = self.entry_price - self.lowest_since_entry
-                            if profit >= atr_v * self.TRAIL_ACTIVATION:
-                                trail_sl = self.lowest_since_entry + atr_v * self.TRAIL_MULT
-                                if self.BE_TRIGGER > 0 and profit > atr_v * self.BE_TRIGGER:
-                                    trail_sl = min(trail_sl, self.entry_price - atr_v * self.BE_BUFFER)
-                                if trail_sl < self.sl:
-                                    self.sl = trail_sl
-                            if sig.signal == "SHORT_EXIT":
-                                signals_out.append(self._book_exit(bc, "REGIME_EXIT", ts, qty))
-                                self.last_regime_direction = "NONE"
-
-                    # Reversal override
-                    if self.position != "NONE":
-                        if self.position == "LONG" and top_sig[i]:
-                            signals_out.append(self._book_exit(bc, "REV_OVERRIDE", ts, qty))
-                            self._enter("SHORT", "REVERSAL", bc, i, bh, bl,
-                                        upper_band[i] if not np.isnan(upper_band[i]) else bc + 1.5 * atr_v)
-                            signals_out.append(self._make_entry_signal(ts, sig))
-                            self.last_processed_ts = ts
-                            continue
-                        elif self.position == "SHORT" and bot_sig[i]:
-                            signals_out.append(self._book_exit(bc, "REV_OVERRIDE", ts, qty))
-                            self._enter("LONG", "REVERSAL", bc, i, bh, bl,
-                                        lower_band[i] if not np.isnan(lower_band[i]) else bc - 1.5 * atr_v)
-                            signals_out.append(self._make_entry_signal(ts, sig))
-                            self.last_processed_ts = ts
-                            continue
-
-            # ── FLAT: look for new entry ──
-            if self.position == "NONE":
-                if cur_mins >= _EOD_EXIT_MINUTE:
-                    self.last_processed_ts = ts
-                    continue
-
-                # Always run agents when flat
-                sig = _run_agents(df_slice, row, "NONE", cfg,
-                                  df_1h_cur, df_1d_cur, df_1w_cur,
-                                  _state=self._proc_state)
-
-                # Log agent result for new bars (not warm-up replay)
-                logger.debug(f"[RegimeReversalProcessor] Bar {ts} flat: agents={sig.signal} regime={self._proc_state.get('regime')} rev=top:{top_sig[i]}/bot:{bot_sig[i]} close={bc:.1f}")
-
-                # Regime re-entry after reversal SL
-                if just_closed_source == "REVERSAL" and self.last_regime_direction != "NONE":
-                    if sig.signal == self.last_regime_direction:
-                        self._enter(self.last_regime_direction, "REGIME", bc, i, bh, bl, sig.sl)
-                        self._entry_signal_detail = sig.to_dict()
-                        signals_out.append(self._make_entry_signal(ts, sig))
-                    else:
-                        self.last_regime_direction = "NONE"
-                    self.last_processed_ts = ts
-                    continue
-
-                # Priority 1: Reversal signals
-                if bot_sig[i]:
-                    sl_val = lower_band[i] if not np.isnan(lower_band[i]) else bc - 1.5 * atr_v
-                    self._enter("LONG", "REVERSAL", bc, i, bh, bl, sl_val)
-                    signals_out.append(self._make_entry_signal(ts, sig))
-                    logger.info(f"[RegimeReversalProcessor] REVERSAL LONG entry @ {bc:.1f} SL={sl_val:.1f}")
-                    self.last_processed_ts = ts
-                    continue
-                elif top_sig[i]:
-                    sl_val = upper_band[i] if not np.isnan(upper_band[i]) else bc + 1.5 * atr_v
-                    self._enter("SHORT", "REVERSAL", bc, i, bh, bl, sl_val)
-                    signals_out.append(self._make_entry_signal(ts, sig))
-                    logger.info(f"[RegimeReversalProcessor] REVERSAL SHORT entry @ {bc:.1f} SL={sl_val:.1f}")
-                    self.last_processed_ts = ts
-                    continue
-
-                # Priority 2: Regime signal
-                if sig.signal in ("LONG", "SHORT"):
-                    self._enter(sig.signal, "REGIME", bc, i, bh, bl, sig.sl)
-                    self._entry_signal_detail = sig.to_dict()
-                    self.last_regime_direction = sig.signal
-                    self.last_regime_sl = sig.sl
-                    signals_out.append(self._make_entry_signal(ts, sig))
-                    logger.info(f"[RegimeReversalProcessor] REGIME {sig.signal} entry @ {bc:.1f} SL={sig.sl:.1f}")
-
-            self.last_processed_ts = ts
-
-        if signals_out:
-            logger.info(f"[RegimeReversalProcessor] Generated {len(signals_out)} signals from {n - start_idx} bars")
-        return signals_out
-
-    def _enter(self, direction, source, price, idx, bh, bl, sl_val):
-        self.position = direction
-        self.trade_source = source
-        self.entry_price = price
-        self.sl = sl_val
-        self.entry_idx = idx
-        self.highest_since_entry = bh
-        self.lowest_since_entry = bl
-
-    def _make_entry_signal(self, ts, sig) -> LiveSignal:
+    # ──────────────────────────────────────────────────────────────────
+    #  Helpers: convert backtest trade dicts → LiveSignal objects
+    # ──────────────────────────────────────────────────────────────────
+    def _entry_from_trade(self, t: dict) -> LiveSignal:
+        direction = t["direction"]
         return LiveSignal(
-            signal_type="ENTRY", direction=self.position, signal=self.position,
-            time=_to_ist_iso(ts),
-            entry_price=round(self.entry_price, 2),
-            sl=round(self.sl, 2),
-            target1=round(getattr(sig, "target1", 0), 2),
-            target2=round(getattr(sig, "target2", 0), 2),
-            strategy="regime_reversal",
-            weighted_score=getattr(sig, "weighted_score", 0),
-            reasons=list(getattr(sig, "reasons", [])),
-            regime=getattr(sig, "regime", ""),
-            regime_confidence=getattr(sig, "regime_confidence", 0),
-            playbook=getattr(sig, "playbook", ""),
-            entry_quality=getattr(sig, "entry_quality", 0),
+            signal_type="ENTRY",
+            direction=direction,
+            signal=direction,
+            time=t.get("entry_time", ""),
+            entry_price=round(t.get("entry_price", 0), 2),
+            sl=round(t.get("sl", 0), 2),
+            target1=round(t.get("target1", 0), 2),
+            target2=round(t.get("target2", 0), 2),
+            strategy=self.strategy_id,
+            reasons=[f"Source: {t.get('source', 'STRATEGY')}"],
+            regime=self._regime,
             atr_5m=round(self._last_atr, 2),
         )
 
-    def _book_exit(self, exit_px, reason, ts, qty):
-        exit_signal = "LONG_EXIT" if self.position == "LONG" else "SHORT_EXIT"
-        if self.position == "LONG":
-            pnl = (exit_px - self.entry_price) * qty
-            pnl_pts = exit_px - self.entry_price
-        else:
-            pnl = (self.entry_price - exit_px) * qty
-            pnl_pts = self.entry_price - exit_px
-
-        sig = LiveSignal(
-            signal_type="EXIT", direction=self.position,
-            signal=exit_signal,
-            time=_to_ist_iso(ts),
-            entry_price=round(self.entry_price, 2),
-            exit_price=round(exit_px, 2), exit_reason=reason,
-            pnl=round(pnl, 2), pnl_pts=round(pnl_pts, 2),
-            sl=round(self.sl, 2), strategy="regime_reversal",
-            reasons=[f"Exit: {reason} @ {round(exit_px, 2)} (source: {self.trade_source})"],
-        )
-
-        self._last_exit_signal = exit_signal
-        self._last_exit_reason = reason
-
-        self.position = "NONE"
-        self.trade_source = "NONE"
-        self.entry_price = 0.0
-        self.sl = 0.0
-        self.highest_since_entry = 0.0
-        self.lowest_since_entry = 99999999.0
-        self._entry_signal_detail = None
-        return sig
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MULTI-AGENT V3 LIVE PROCESSOR
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class MultiAgentLiveProcessor:
-    """Mirrors strategy.run_backtest inner loop for live bar-by-bar processing."""
-
-    def __init__(self):
-        self.position = "NONE"
-        self.entry_price = 0.0
-        self.sl = 0.0
-        self.t1 = 0.0
-        self.t2 = 0.0
-        self.entry_idx = 0
-        self.t1_hit = False
-        self.entry_atr = 0.0
-        self.peak_profit = 0.0
-        self.trail_step = 0
-        self.is_trailing = False
-        self.block_long_until = 0
-        self.block_short_until = 0
-        self.last_processed_ts = None
-        self._entry_signal_detail: Optional[dict] = None
-        self._bar_counter = 0
-        self._last_atr = 0.0
-        self._last_close = 0.0
-        self._last_exit_signal: Optional[str] = None
-        self._last_exit_reason: Optional[str] = None
-
-    def reset(self):
-        from strategy import _swing_agent
-        _swing_agent._prev_cascade = "UNKNOWN"
-        _swing_agent._journey_start_bar = 0
-        _swing_agent._bar_count = 0
-        self.position = "NONE"
-        self.entry_price = 0.0
-        self.sl = 0.0
-        self.t1 = 0.0
-        self.t2 = 0.0
-        self.entry_idx = 0
-        self.t1_hit = False
-        self.entry_atr = 0.0
-        self.peak_profit = 0.0
-        self.trail_step = 0
-        self.is_trailing = False
-        self.block_long_until = 0
-        self.block_short_until = 0
-        self.last_processed_ts = None
-        self._entry_signal_detail = None
-        self._bar_counter = 0
-        self._last_atr = 0.0
-        self._last_close = 0.0
-        self._last_exit_signal = None
-        self._last_exit_reason = None
-        logger.info("[MultiAgentLiveProcessor] State reset")
-
-    def process_frames(self, frames: dict, cfg, lot_size: int = 30) -> List[LiveSignal]:
-        """Build merged table from raw frames and process new bars."""
-        import strategy as main_strategy
-        from strategy import _session_mask
-
-        required = ["5", "15", "60", "1D"]
-        for r in required:
-            if r not in frames or frames[r] is None or len(frames[r]) < 30:
-                return []
-
-        try:
-            base = main_strategy.build_merged_table(frames, with_patterns=cfg.chart_patterns_enabled)
-        except Exception as e:
-            logger.error(f"[MultiAgentProcessor] Failed to build merged table: {e}")
-            return []
-
-        if base.empty:
-            return []
-
-        base = base[_session_mask(base, cfg)].copy().reset_index(drop=True)
-        if base.empty:
-            return []
-
-        return self._process_new_bars(base, cfg, lot_size)
-
-    def get_ui_signal(self, cfg) -> dict:
-        """Return current state as a signal dict for the UI panel.
-
-        When the processor has just exited a position, emit the EXIT signal
-        so the auto-trade monitoring loop can close the broker position.
-        """
-        # Determine the signal field: EXIT signal takes priority over HOLD
-        if self._last_exit_signal is not None:
-            sig_value = self._last_exit_signal
-            exit_reason = self._last_exit_reason or ""
-            self._last_exit_signal = None
-            self._last_exit_reason = None
-        elif self.position != "NONE":
-            sig_value = self.position
-            exit_reason = ""
-        else:
-            sig_value = "HOLD"
-            exit_reason = ""
-
-        base = {
-            "signal": sig_value,
-            "strategy": "multi_agent",
-            "time": _to_ist_iso(self.last_processed_ts) if self.last_processed_ts else "",
-            "entry": round(self.entry_price, 2) if self.position != "NONE" else 0.0,
-            "sl": round(self.sl, 2),
-            "target1": round(self.t1, 2),
-            "target2": round(self.t2, 2),
-            "weighted_score": 0.0,
-            "atr_5m": round(self._last_atr, 2),
-            "close": round(self._last_close, 2),
-            "macro_bias": "",
-            "h1_trend": "",
-            "adx_1h": 0.0,
-            "ml_prob": 0.0,
-            "rr_t1": 0.0,
-            "risk_pts": 0.0,
-            "long_score": 0.0,
-            "short_score": 0.0,
-            "reasons": [exit_reason] if exit_reason else [],
-        }
-        if self._entry_signal_detail:
-            base.update({k: v for k, v in self._entry_signal_detail.items()
-                         if k not in ("signal",) and v})
-            base["signal"] = sig_value
-        return base
-
-    def _process_new_bars(self, base, cfg, lot_size):
-        from strategy import _run_v3_pipeline
-
-        _EOD_EXIT_MINUTE = 15 * 60 + 20  # 3:20 PM IST — no entries/exits after this
-
-        qty = lot_size
-        cooldown_bars = getattr(cfg, 'cooldown_bars', 0)
-        be_trigger = getattr(cfg, 'trailing_be_trigger_atr', 0)
-        trail_start = getattr(cfg, 'trailing_start_atr', 0)
-        trail_offset = getattr(cfg, 'trailing_offset_atr', 0.5)
-
-        if base.empty:
-            return []
-
-        n = len(base)
-        signals_out = []
-
-        if self.last_processed_ts is not None:
-            mask = base["timestamp"] > self.last_processed_ts
-            if not mask.any():
-                return []
-            start_idx = base[mask].index[0]
-        else:
-            # First run after reset — start from today's first bar
-            start_idx = _find_today_start(base, fallback_lookback=60)
-
-        for i in range(start_idx, n):
-            self._bar_counter += 1
-            row = base.iloc[i]
-            bh = float(row.get("high", row["close"]))
-            bl = float(row.get("low", row["close"]))
-            bc = float(row["close"])
-            atr_v = float(row.get("atr", bc * 0.002))
-            ts = row["timestamp"]
-            if pd.isna(atr_v) or atr_v < 5:
-                atr_v = bc * 0.002
-
-            self._last_atr = atr_v
-            self._last_close = bc
-
-            ts_ist = pd.to_datetime(ts)
-            cur_mins = ts_ist.hour * 60 + ts_ist.minute
-
-            # ── EOD EXIT — mirror regime processor ──────────────────────
-            if self.position != "NONE" and cur_mins >= _EOD_EXIT_MINUTE:
-                signals_out.append(self._book_exit(bc, "EOD_EXIT", ts, qty, cooldown_bars))
-                self.last_processed_ts = ts
-                continue
-
-            # ── MANAGE OPEN POSITION ────────────────────────────────────
-            if self.position != "NONE":
-                bars_held = self._bar_counter - self.entry_idx
-
-                if self.entry_atr > 0:
-                    if self.position == "LONG":
-                        bar_max_profit = bh - self.entry_price
-                    else:
-                        bar_max_profit = self.entry_price - bl
-                    profit_atr = bar_max_profit / self.entry_atr
-                    self.peak_profit = max(self.peak_profit, bar_max_profit)
-                    peak_profit_atr = self.peak_profit / self.entry_atr
-
-                    if be_trigger > 0 and self.trail_step == 0 and profit_atr >= be_trigger:
-                        self.sl = self.entry_price
-                        self.trail_step = 1
-                    if trail_start > 0 and self.trail_step >= 1 and peak_profit_atr >= trail_start:
-                        self.is_trailing = True
-                        self.trail_step = 2
-                    if self.is_trailing and trail_offset > 0:
-                        if self.position == "LONG":
-                            new_sl = self.entry_price + self.peak_profit - trail_offset * self.entry_atr
-                            self.sl = max(self.sl, new_sl)
-                        else:
-                            new_sl = self.entry_price - self.peak_profit + trail_offset * self.entry_atr
-                            self.sl = min(self.sl, new_sl)
-
-                if self.position == "LONG":
-                    if bl <= self.sl:
-                        reason = f"TRAIL_S{self.trail_step}" if self.trail_step > 0 else "SL_HIT"
-                        signals_out.append(self._book_exit(self.sl, reason, ts, qty, cooldown_bars))
-                    elif self.t1_hit and bh >= self.t2:
-                        signals_out.append(self._book_exit(self.t2, "T2_HIT", ts, qty, cooldown_bars))
-                    elif not self.t1_hit and bh >= self.t1:
-                        self.t1_hit = True
-                        self.sl = max(self.sl, self.entry_price)
-                    elif bars_held >= cfg.max_hold_bars:
-                        signals_out.append(self._book_exit(bc, "TIME_EXIT", ts, qty, cooldown_bars))
-                    else:
-                        sig = _run_v3_pipeline(row, "LONG", cfg)
-                        if sig.signal == "LONG_EXIT":
-                            signals_out.append(self._book_exit(bc, "SIG_EXIT", ts, qty, cooldown_bars))
-                        elif sig.signal == "SHORT":
-                            signals_out.append(self._book_exit(bc, "OPPOSITE_SIGNAL", ts, qty, cooldown_bars))
-
-                elif self.position == "SHORT":
-                    if bh >= self.sl:
-                        reason = f"TRAIL_S{self.trail_step}" if self.trail_step > 0 else "SL_HIT"
-                        signals_out.append(self._book_exit(self.sl, reason, ts, qty, cooldown_bars))
-                    elif self.t1_hit and bl <= self.t2:
-                        signals_out.append(self._book_exit(self.t2, "T2_HIT", ts, qty, cooldown_bars))
-                    elif not self.t1_hit and bl <= self.t1:
-                        self.t1_hit = True
-                        self.sl = min(self.sl, self.entry_price)
-                    elif bars_held >= cfg.max_hold_bars:
-                        signals_out.append(self._book_exit(bc, "TIME_EXIT", ts, qty, cooldown_bars))
-                    else:
-                        sig = _run_v3_pipeline(row, "SHORT", cfg)
-                        if sig.signal == "SHORT_EXIT":
-                            signals_out.append(self._book_exit(bc, "SIG_EXIT", ts, qty, cooldown_bars))
-                        elif sig.signal == "LONG":
-                            signals_out.append(self._book_exit(bc, "OPPOSITE_SIGNAL", ts, qty, cooldown_bars))
-
-            # ── LOOK FOR NEW ENTRY ──────────────────────────────────────
-            if self.position == "NONE":
-                # No new entries near market close
-                if cur_mins >= _EOD_EXIT_MINUTE:
-                    self.last_processed_ts = ts
-                    continue
-
-                sig = _run_v3_pipeline(row, "NONE", cfg)
-
-                if sig.signal in ("LONG", "SHORT"):
-                    if sig.signal == "LONG" and self._bar_counter < self.block_long_until:
-                        self.last_processed_ts = ts
-                        continue
-                    if sig.signal == "SHORT" and self._bar_counter < self.block_short_until:
-                        self.last_processed_ts = ts
-                        continue
-
-                    # Use current close — no look-ahead bias (matches backtest)
-                    self.entry_price = bc
-                    self.sl = sig.sl
-                    self.t1 = sig.target1
-                    self.t2 = sig.target2
-                    self.position = sig.signal
-                    self.entry_idx = self._bar_counter
-                    self.t1_hit = False
-                    self.entry_atr = atr_v
-                    self.peak_profit = 0.0
-                    self.trail_step = 0
-                    self.is_trailing = False
-
-                    sig_dict = sig.to_dict()
-                    self._entry_signal_detail = sig_dict
-
-                    entry_sig = LiveSignal(
-                        signal_type="ENTRY", direction=sig.signal, signal=sig.signal,
-                        time=_to_ist_iso(ts),
-                        entry_price=round(bc, 2),
-                        sl=round(sig.sl, 2),
-                        target1=round(sig.target1, 2),
-                        target2=round(sig.target2, 2),
-                        strategy="multi_agent",
-                        weighted_score=sig.weighted_score,
-                        reasons=list(sig.reasons),
-                        macro_bias=getattr(sig, "macro_bias", ""),
-                        adx_1h=getattr(sig, "adx_1h", 0.0),
-                        atr_5m=getattr(sig, "atr_5m", 0.0),
-                        h1_trend=getattr(sig, "h1_trend", ""),
-                        ml_prob=getattr(sig, "ml_prob", 0.0),
-                        rr_t1=getattr(sig, "rr_t1", 0.0),
-                        risk_pts=getattr(sig, "risk_pts", 0.0),
-                        long_score=getattr(sig, "long_score", 0.0),
-                        short_score=getattr(sig, "short_score", 0.0),
-                    )
-                    signals_out.append(entry_sig)
-
-            self.last_processed_ts = ts
-
-        return signals_out
-
-    def _book_exit(self, exit_px, reason, ts, qty, cooldown_bars):
-        direction = self.position
+    def _exit_from_trade(self, t: dict, qty: int) -> LiveSignal:
+        direction = t["direction"]
         exit_signal = "LONG_EXIT" if direction == "LONG" else "SHORT_EXIT"
-
-        if direction == "LONG":
-            pnl = (exit_px - self.entry_price) * qty
-            pnl_pts = exit_px - self.entry_price
-        else:
-            pnl = (self.entry_price - exit_px) * qty
-            pnl_pts = self.entry_price - exit_px
-
-        sig = LiveSignal(
-            signal_type="EXIT", direction=direction,
+        return LiveSignal(
+            signal_type="EXIT",
+            direction=direction,
             signal=exit_signal,
-            time=_to_ist_iso(ts),
-            entry_price=round(self.entry_price, 2),
-            exit_price=round(exit_px, 2), exit_reason=reason,
-            pnl=round(pnl, 2), pnl_pts=round(pnl_pts, 2),
-            sl=round(self.sl, 2),
-            target1=round(self.t1, 2), target2=round(self.t2, 2),
-            strategy="multi_agent",
-            reasons=[f"Exit: {reason} @ {round(exit_px, 2)}"],
+            time=t.get("exit_time", ""),
+            entry_price=round(t.get("entry_price", 0), 2),
+            exit_price=round(t.get("exit_price", 0), 2),
+            exit_reason=t.get("exit_reason", ""),
+            pnl=round(t.get("pnl", 0), 2),
+            pnl_pts=round(t.get("pnl_pts", 0), 2),
+            sl=round(t.get("sl", 0), 2),
+            strategy=self.strategy_id,
+            reasons=[f"Exit: {t.get('exit_reason', '')} @ {t.get('exit_price', 0)}"],
         )
 
-        # Stash for get_ui_signal() → auto-trade monitoring loop
-        self._last_exit_signal = exit_signal
-        self._last_exit_reason = reason
 
-        if pnl <= 0 and cooldown_bars > 0:
-            if direction == "LONG":
-                self.block_long_until = self._bar_counter + cooldown_bars
-            elif direction == "SHORT":
-                self.block_short_until = self._bar_counter + cooldown_bars
+# ═══════════════════════════════════════════════════════════════════════════════
+# STRATEGY-SPECIFIC PROCESSORS (thin wrappers)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        self.position = "NONE"
-        self.entry_price = 0.0
-        self.sl = 0.0
-        self.t1 = 0.0
-        self.t2 = 0.0
-        self.t1_hit = False
-        self.entry_atr = 0.0
-        self.peak_profit = 0.0
-        self.trail_step = 0
-        self.is_trailing = False
-        self._entry_signal_detail = None
-        return sig
+class RegimeLiveProcessor(BacktestDiffProcessor):
+    """Regime Trend/Range Optimized strategy."""
+    strategy_id = "regime_trend_range"
+
+    def _get_module(self):
+        from strategies import regime_strategy
+        return regime_strategy
+
+
+class RegimeReversalLiveProcessor(BacktestDiffProcessor):
+    """Regime + Reversal combined strategy."""
+    strategy_id = "regime_reversal"
+
+    def _get_module(self):
+        from strategies import regime_reversal_strategy
+        return regime_reversal_strategy
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1248,14 +396,10 @@ class MultiAgentLiveProcessor:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _regime_processor = RegimeLiveProcessor()
-_multi_agent_processor = MultiAgentLiveProcessor()
 _regime_reversal_processor = RegimeReversalLiveProcessor()
 
 def get_regime_processor() -> RegimeLiveProcessor:
     return _regime_processor
-
-def get_multi_agent_processor() -> MultiAgentLiveProcessor:
-    return _multi_agent_processor
 
 def get_regime_reversal_processor() -> RegimeReversalLiveProcessor:
     return _regime_reversal_processor
@@ -1263,5 +407,4 @@ def get_regime_reversal_processor() -> RegimeReversalLiveProcessor:
 def reset_all_processors():
     """Reset all processors — call at daily boundary."""
     _regime_processor.reset()
-    _multi_agent_processor.reset()
     _regime_reversal_processor.reset()

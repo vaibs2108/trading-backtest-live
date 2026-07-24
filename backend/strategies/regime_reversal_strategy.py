@@ -44,7 +44,14 @@ _htf_agent = HTFStructureAgent(swing_order=5, proximity_atr=0.5)
 _momentum_agent = MomentumVolumeAgent(lookback=15)
 _orchestrator = RegimeOrchestrator(min_quality=0.25, min_rr=0.0, min_regime_age=1)
 
-_EOD_EXIT_MINUTE = 15 * 60 + 20  # 3:20 PM IST
+_EOD_EXIT_NSE = 15 * 60 + 20   # 3:20 PM IST (equity)
+_EOD_EXIT_MCX = 23 * 60 + 20   # 11:20 PM IST (commodity)
+
+def _eod_exit_minute(cfg=None):
+    if cfg is None:
+        cfg = get_settings()
+    exch = INSTRUMENT_META.get(cfg.instrument, {}).get("exchange_index", "INDEX")
+    return _EOD_EXIT_MCX if exch == "MCX" else _EOD_EXIT_NSE
 
 # Trailing SL config (same as regime_strategy)
 TRAIL_MULT = 1.5
@@ -327,6 +334,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
     """Combined regime trend + regression reversal backtest."""
     cfg = get_settings()
     qty = lot_size * lot_multiplier
+    eod_minute = _eod_exit_minute(cfg)
 
     base = main_strategy.build_merged_table(frames, with_patterns=False)
     if base.empty:
@@ -443,7 +451,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
         if position != "NONE":
 
             # ── 0. EOD EXIT ────────────────────────────────────────────
-            if cur_mins >= _EOD_EXIT_MINUTE:
+            if cur_mins >= eod_minute:
                 book(bc, "EOD_EXIT", i)
                 last_regime_direction = "NONE"
                 continue
@@ -510,7 +518,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                         trade_source = "REVERSAL"
                         entry_price = bc
                         entry_idx = i
-                        sl = upper_band[i] if not np.isnan(upper_band[i]) else bc + 1.5 * atr_v
+                        sl = bc + 1.5 * atr_v  # SL above entry for SHORT
                         highest_since_entry = bh
                         lowest_since_entry = bl
                         continue
@@ -521,7 +529,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                         trade_source = "REVERSAL"
                         entry_price = bc
                         entry_idx = i
-                        sl = lower_band[i] if not np.isnan(lower_band[i]) else bc - 1.5 * atr_v
+                        sl = bc - 1.5 * atr_v  # SL below entry for LONG
                         highest_since_entry = bh
                         lowest_since_entry = bl
                         continue
@@ -534,7 +542,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
         #  LOOK FOR NEW ENTRY (only when flat)
         # ════════════════════════════════════════════════════════════════
         if position == "NONE":
-            if cur_mins >= _EOD_EXIT_MINUTE:
+            if cur_mins >= eod_minute:
                 continue
 
             # ALWAYS run regime agents when flat — keeps state in sync
@@ -565,7 +573,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                 trade_source = "REVERSAL"
                 entry_price = bc
                 entry_idx = i
-                sl = lower_band[i] if not np.isnan(lower_band[i]) else bc - 1.5 * atr_v
+                sl = bc - 1.5 * atr_v  # SL below entry for LONG
                 highest_since_entry = bh
                 lowest_since_entry = bl
                 continue
@@ -575,7 +583,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                 trade_source = "REVERSAL"
                 entry_price = bc
                 entry_idx = i
-                sl = upper_band[i] if not np.isnan(upper_band[i]) else bc + 1.5 * atr_v
+                sl = bc + 1.5 * atr_v  # SL above entry for SHORT
                 highest_since_entry = bh
                 lowest_since_entry = bl
                 continue
