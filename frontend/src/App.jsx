@@ -393,9 +393,17 @@ function LiveChart({ instrument, timeframe, signals, strategy, refreshChart, the
   }, [theme])
 
   useEffect(() => {
+    const handleCandleUpdate = (e) => {
+      if (candleSer.current && e.detail) {
+        candleSer.current.update(e.detail)
+      }
+    }
+    window.addEventListener('candle_update', handleCandleUpdate)
+    return () => window.removeEventListener('candle_update', handleCandleUpdate)
+  }, [])
+
+  useEffect(() => {
     loadData()
-    const id = setInterval(loadData, 5000)
-    return () => clearInterval(id)
   }, [loadData])
 
   return (
@@ -1117,6 +1125,40 @@ function ConnectModal({ onClose, onConnected }) {
   )
 }
 
+// Helper to extract clean YYYY-MM-DD from any date string / timestamp
+const extractISODate = (e) => {
+  if (!e) return ''
+  // Try dedicated date fields first
+  let raw = e.entry_date || e.date || e.trade_date || e.createTime || e.updateTime || e.exchangeTime || ''
+  
+  // If no date field, use timestamp fields only if they contain date delimiters or start with '20'
+  if (!raw && typeof e.entry_time === 'string' && (e.entry_time.includes('-') || e.entry_time.includes('/') || e.entry_time.includes('T') || e.entry_time.startsWith('20'))) {
+    raw = e.entry_time
+  }
+  if (!raw && typeof e.time === 'string' && (e.time.includes('-') || e.time.includes('/') || e.time.includes('T') || e.time.startsWith('20'))) {
+    raw = e.time
+  }
+  if (!raw && typeof e.created_at === 'string') raw = e.created_at
+  if (!raw && typeof e.timestamp === 'string') raw = e.timestamp
+  if (!raw) return ''
+
+  const str = String(raw).trim()
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) return str.slice(0, 10)
+  const dmY = str.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})/)
+  if (dmY) return `${dmY[3]}-${dmY[2].padStart(2, '0')}-${dmY[1].padStart(2, '0')}`
+  try {
+    const d = new Date(str)
+    if (!isNaN(d.getTime())) {
+      const year = d.getFullYear()
+      const month = String(d.getMonth() + 1).padStart(2, '0')
+      const day = String(d.getDate()).padStart(2, '0')
+      return `${year}-${month}-${day}`
+    }
+  } catch {}
+  return ''
+}
+
+
 // ── Signal Journal Panel ────────────────────────────────────────────────────
 function SignalJournalPanel({ entries, onRefresh }) {
   const m = window.innerWidth < 768
@@ -1135,13 +1177,14 @@ function SignalJournalPanel({ entries, onRefresh }) {
 
   const handleSubmitFilters = (e) => {
     if (e) e.preventDefault()
-    setAppliedFilters({
+    const nextFilters = {
       strategy: draftStrategy,
       instrument: draftInstrument,
       fromDate: draftFromDate,
       toDate: draftToDate
-    })
-    if (onRefresh) onRefresh()
+    }
+    setAppliedFilters(nextFilters)
+    if (onRefresh) onRefresh(nextFilters)
   }
 
   // Apply filters robustly
@@ -1149,35 +1192,34 @@ function SignalJournalPanel({ entries, onRefresh }) {
     if (appliedFilters.strategy !== 'ALL') {
       const s = (e.strategy || '').toLowerCase()
       const f = appliedFilters.strategy.toLowerCase()
-      if (f === 'regime_reversal') {
-        if (!s.includes('reversal')) return false
-      } else if (f === 'regime_trend_range') {
-        if (!s.includes('regime') && !s.includes('trend') && !s.includes('range')) return false
-      } else if (f === 'multi_agent') {
-        if (!s.includes('multi')) return false
-      } else if (s !== f) {
-        return false
+      if (s) {
+        if (f === 'regime_reversal' && !s.includes('reversal') && !s.includes('regime')) return false
+        if (f === 'regime_trend_range' && !s.includes('regime') && !s.includes('trend') && !s.includes('range')) return false
+        if (f === 'multi_agent' && !s.includes('multi')) return false
+        if (f !== 'regime_reversal' && f !== 'regime_trend_range' && f !== 'multi_agent' && s !== f && !s.includes(f)) return false
       }
     }
 
     if (appliedFilters.instrument !== 'ALL') {
-      const inst = (e.instrument || '').toUpperCase()
-      if (inst !== appliedFilters.instrument.toUpperCase()) return false
+      const target = appliedFilters.instrument.toUpperCase()
+      const inst = (e.instrument || e.underlying || e.index || '').toUpperCase()
+      const sym = (e.symbol || e.trading_symbol || '').toUpperCase()
+      if (inst) {
+        if (inst !== target && !inst.includes(target) && !target.includes(inst)) return false
+      } else if (sym && (sym.includes('NIFTY') || sym.includes('SENSEX') || sym.includes('BANKEX') || sym.includes('CRUDE') || sym.includes('GOLD'))) {
+        if (!sym.includes(target)) return false
+      }
     }
 
-    // Parse date safely from entry_date, date, or entry_time ISO timestamp
-    const dateStr = e.entry_date || e.date || (
-      e.entry_time && e.entry_time.includes('T') ? e.entry_time.split('T')[0] : (
-        e.entry_time && e.entry_time.includes(' ') ? e.entry_time.split(' ')[0] : ''
-      )
-    )
 
-    if (dateStr && dateStr.length >= 10 && dateStr.startsWith('20')) {
+    const dateStr = extractISODate(e)
+    if (dateStr && dateStr.length === 10) {
       if (appliedFilters.fromDate && dateStr < appliedFilters.fromDate) return false
       if (appliedFilters.toDate && dateStr > appliedFilters.toDate) return false
     }
     return true
   })
+
 
   const closed  = filteredEntries.filter(e => e.status !== 'OPEN')
   const wins    = closed.filter(e => e.status === 'WIN').length
@@ -1382,38 +1424,42 @@ function SignalJournalPanel({ entries, onRefresh }) {
 function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, onToDateChange }) {
   const m = window.innerWidth < 768
   const [selectedTrade, setSelectedTrade] = useState(null)
-  const [draftFrom, setDraftFrom] = useState(fromDate)
-  const [draftTo, setDraftTo] = useState(toDate)
-  const [appliedFrom, setAppliedFrom] = useState(fromDate)
-  const [appliedTo, setAppliedTo] = useState(toDate)
+  const [draftFrom, setDraftFrom] = useState(fromDate || '')
+  const [draftTo, setDraftTo] = useState(toDate || '')
+  const [appliedFrom, setAppliedFrom] = useState(fromDate || '')
+  const [appliedTo, setAppliedTo] = useState(toDate || '')
 
   useEffect(() => {
-    setDraftFrom(fromDate)
-    setAppliedFrom(fromDate)
-  }, [fromDate])
-
-  useEffect(() => {
-    setDraftTo(toDate)
-    setAppliedTo(toDate)
-  }, [toDate])
+    if (fromDate) {
+      setDraftFrom(fromDate)
+      setAppliedFrom(fromDate)
+    }
+    if (toDate) {
+      setDraftTo(toDate)
+      setAppliedTo(toDate)
+    }
+  }, [fromDate, toDate])
 
   const handleSubmitDates = (e) => {
     if (e) e.preventDefault()
     setAppliedFrom(draftFrom)
     setAppliedTo(draftTo)
-    onFromDateChange(draftFrom)
-    onToDateChange(draftTo)
+    if (onFromDateChange) onFromDateChange(draftFrom)
+    if (onToDateChange) onToDateChange(draftTo)
     if (onRefresh) onRefresh(draftFrom, draftTo)
   }
 
+
+
   const filteredJournal = journal.filter(t => {
-    const ed = t.entry_date || (t.entry_time && t.entry_time.includes('T') ? t.entry_time.split('T')[0] : (t.entry_time && t.entry_time.includes(' ') ? t.entry_time.split(' ')[0] : ''))
-    if (ed && ed.length >= 10 && ed.startsWith('20')) {
+    const ed = extractISODate(t)
+    if (ed && ed.length === 10) {
       if (appliedFrom && ed < appliedFrom) return false
       if (appliedTo && ed > appliedTo) return false
     }
     return true
   })
+
 
   const closedTrades = filteredJournal.filter(t => t.status === 'CLOSED')
   const totalTrades = closedTrades.length
@@ -6169,9 +6215,11 @@ export default function App() {
   const [optCtxExpiries, setOptCtxExpiries] = useState([])
   const wsRef = useRef(null)
   const instrumentRef = useRef('BANKNIFTY')
+  const strategyRef = useRef('regime_reversal')
   const fetchChartSignalsRef = useRef(null) // populated later, used by WS handler for instant chart refresh
 
   useEffect(() => { instrumentRef.current = instrument }, [instrument])
+  useEffect(() => { strategyRef.current = strategy }, [strategy])
 
   const [journalFromDate, setJournalFromDate] = useState(() => {
     const d = new Date()
@@ -6207,14 +6255,18 @@ export default function App() {
         
         ws.onmessage = e => {
           const msg = JSON.parse(e.data)
+          if (msg.type === 'candle_update') {
+            if (!msg.instrument || msg.instrument === instrumentRef.current) {
+              window.dispatchEvent(new CustomEvent('candle_update', { detail: msg.data }))
+            }
+          }
           if (msg.type === 'signal') {
             if (!msg.data?.instrument || msg.data.instrument === instrumentRef.current)
               setSignal(msg.data)
           }
           if (msg.type === 'state')        setTradeState(msg.data)
-          if (msg.type === 'trade_opened') { setRefreshChart(r=>r+1); if (fetchChartSignalsRef.current) fetchChartSignalsRef.current() }
-          if (msg.type === 'trade_closed') { setRefreshChart(r=>r+1); if (fetchChartSignalsRef.current) fetchChartSignalsRef.current() }
-          if (msg.type === 'chart_signals_updated') { if (fetchChartSignalsRef.current) fetchChartSignalsRef.current() }
+          if (msg.type === 'trade_opened') { setRefreshChart(r=>r+1) }
+          if (msg.type === 'trade_closed') { setRefreshChart(r=>r+1) }
           if (msg.type === 'signal_event') {
             if (!msg.data?.strategy || msg.data.strategy === strategyRef.current) {
               setChartSignals(prev => [...(prev || []), msg.data])
@@ -6363,7 +6415,36 @@ export default function App() {
       return () => clearInterval(id)
     }
   }, [tab, fetchJournal])
+
+  const mergedSignalEntries = React.useMemo(() => {
+    const list = []
+    const seen = new Set();
+    
+    (sigJournal || []).forEach(e => {
+      const k = `${e.entry_time || e.time}_${e.direction || e.signal}_${e.strategy}`
+      seen.add(k)
+      list.push(e)
+    });
+    
+    (sigHistory || []).forEach(e => {
+      const k = `${e.time || e.entry_time}_${e.signal || e.direction}_${e.strategy}`
+      if (!seen.has(k)) {
+        seen.add(k)
+        list.push({
+          ...e,
+          instrument: e.instrument || instrument,
+          entry_time: e.time || e.entry_time,
+          direction: e.signal || e.direction,
+          status: e.status || (e.signal?.includes('EXIT') ? 'CLOSED' : 'OPEN')
+        })
+      }
+    });
+    
+    return list
+  }, [sigJournal, sigHistory, instrument])
+
   // Options context fetch for Live Trading
+
   const fetchOptionsContext = useCallback(async (inst, dir, exp) => {
     setOptCtxLoading(true)
     try {
@@ -6781,11 +6862,20 @@ export default function App() {
           {tab === 'backtest' && <BacktestPanel connected={connected} />}
 
           {tab === 'sig_journal' && (
-            <SignalJournalPanel entries={sigJournal.length > 0 ? sigJournal : sigHistory} onRefresh={async () => {
-              const r = await API.get('/api/signal_journal').catch(()=>null)
-              if (r && r.entries) setSigJournal(r.entries)
-            }} />
+            <ErrorBoundary>
+              <SignalJournalPanel entries={mergedSignalEntries} onRefresh={async (filters) => {
+                const r = await API.get('/api/signal_journal').catch(()=>null)
+                if (r && r.entries) setSigJournal(r.entries)
+                const targetInst = filters?.instrument && filters.instrument !== 'ALL' ? filters.instrument : instrument
+                const h = await API.get(`/api/signal_history?instrument=${targetInst}`).catch(()=>null)
+                if (h && h.signals) setSigHistory(h.signals)
+              }} />
+            </ErrorBoundary>
           )}
+
+
+
+
 
           {tab === 'journal' && (
             <JournalPanel 

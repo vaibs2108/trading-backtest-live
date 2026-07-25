@@ -88,14 +88,19 @@ import performance_tracker
 from watchdog import write_heartbeat, save_app_state
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-# Ensure logs directory exists
-os.makedirs("logs", exist_ok=True)
+_log_dir = Path(__file__).parent / "logs"
+_log_dir.mkdir(parents=True, exist_ok=True)
+_log_file = _log_dir / "app.log"
 
 console_handler = logging.StreamHandler()
 console_handler.encoding = "utf-8"
 
-file_handler = logging.FileHandler("logs/app.log")
-file_handler.encoding = "utf-8"
+class AutoFlushingFileHandler(logging.FileHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+file_handler = AutoFlushingFileHandler(str(_log_file), encoding="utf-8")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,6 +109,7 @@ logging.basicConfig(
         console_handler,
         file_handler,
     ],
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
@@ -453,12 +459,12 @@ async def get_status():
 
     # Synchronize positions from Dhan first!
     if broker.is_connected():
-        _sync_dhan_positions(cfg, tm)
+        await asyncio.to_thread(_sync_dhan_positions, cfg, tm)
 
     bal = 0.0
     if broker.is_connected():
         try:
-            bal = broker.get_balance()
+            bal = await asyncio.to_thread(broker.get_balance)
             if bal > 0 and cfg.auto_trade:
                 ct = get_capital_tracker()
                 ct.current_equity = bal
@@ -470,7 +476,7 @@ async def get_status():
             logger.warning(f"Failed to sync broker balance in status: {e}")
             
     lot = broker.get_lot_size(cfg.instrument)
-    ltp = broker.get_ltp(cfg.instrument) if broker.is_connected() else None
+    ltp = (await asyncio.to_thread(broker.get_ltp, cfg.instrument)) if broker.is_connected() else None
 
     # Compute Live P&L from TradeManager's tracked position
     live_pnl = 0.0
@@ -486,7 +492,7 @@ async def get_status():
             # Options are always BOUGHT (BUY PUT for SHORT, BUY CE for LONG)
             # so P&L = (current_option_ltp - entry_option_price) * qty
             try:
-                opt_ltp = broker.get_option_ltp(pos.symbol)
+                opt_ltp = await asyncio.to_thread(broker.get_option_ltp, pos.symbol)
                 if opt_ltp and opt_ltp > 0 and pos.entry_price > 0:
                     live_pnl = round((opt_ltp - pos.entry_price) * pos.qty, 2)
                     pos.current_pnl = live_pnl  # keep in sync
@@ -570,7 +576,8 @@ async def get_sparkline():
         from_date = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
         to_date = now_ist.strftime("%Y-%m-%d")
         
-        res = broker._dhan_client.historical_daily_data(
+        res = await asyncio.to_thread(
+            broker._dhan_client.historical_daily_data,
             security_id=meta["id"],
             exchange_segment=meta["seg"],
             instrument_type="INDEX",
@@ -652,13 +659,13 @@ async def get_chart_data(timeframe: str, instrument: Optional[str] = None):
     now_ist = datetime.now(kolkata_tz)
     from_d = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
     to_d   = (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
-    df = broker.get_historical_data(inst, timeframe, from_d, to_d, use_index=True)
+    df = await asyncio.to_thread(broker.get_historical_data, inst, timeframe, from_d, to_d, use_index=True)
     if df is None or df.empty:
         raise HTTPException(status_code=500, detail="Failed to fetch chart data")
 
     # Compute indicators for overlay
     try:
-        edf = strategy_router.add_indicators(df.copy())
+        edf = await asyncio.to_thread(strategy_router.add_indicators, df.copy())
         df["supertrend"]     = edf["supertrend"]
         df["supertrend_dir"] = edf["supertrend_dir"]
         df["ema7"]           = edf["ema7"]
@@ -736,7 +743,7 @@ async def get_signal():
     else:
         strat_pos = _get_strategy_position(cfg.strategy, cfg.instrument)
 
-    sig = strategy_router.get_current_signal(frames, position=strat_pos)
+    sig = await asyncio.to_thread(strategy_router.get_current_signal, frames, position=strat_pos)
     sig["instrument"] = cfg.instrument
     global _last_signal, _live_frames, _live_frames_instrument
     _last_signal = sig
@@ -784,28 +791,29 @@ async def manual_trade(req: ManualTradeRequest):
         pos = tm.position
         
         # Always capture index LTP for journal/display
-        index_exit_ltp = broker.get_ltp(pos.instrument or cfg.instrument) or pos.index_entry_price or 0.0
+        index_exit_ltp = (await asyncio.to_thread(broker.get_ltp, pos.instrument or cfg.instrument)) or pos.index_entry_price or 0.0
 
         # Determine option premium LTP for PnL calc (only for imported Dhan sync OPTIONS positions)
         use_option_ltp = pos.trade_mode == "OPTIONS" and pos.order_id.startswith("DHAN_SYNC_")
         if use_option_ltp:
             opt_premium = 0.0
             try:
-                opt_premium = broker.get_option_ltp(pos.symbol)
+                opt_premium = await asyncio.to_thread(broker.get_option_ltp, pos.symbol)
             except Exception as e:
                 logger.warning(f"Could not fetch option LTP for manual exit: {e}")
             ltp = opt_premium if opt_premium > 0 else pos.entry_price
         else:
-            ltp = index_exit_ltp or broker.get_ltp(cfg.instrument) or pos.entry_price
+            _opt_idx_ltp = await asyncio.to_thread(broker.get_ltp, cfg.instrument) if broker.is_connected() else None
+            ltp = index_exit_ltp or _opt_idx_ltp or pos.entry_price
 
         if not pos.order_id.startswith("PAPER_"):
             if getattr(pos, "sl_order_id", None):
                 try:
-                    broker.cancel_broker_sl(pos.sl_order_id)
+                    await asyncio.to_thread(broker.cancel_broker_sl, pos.sl_order_id)
                 except Exception as sl_cancel_err:
                     logger.warning(f"Could not cancel broker SL during manual exit: {sl_cancel_err}")
                 pos.sl_order_id = None
-            result = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+            result = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
         else:
             result = {"success": True, "order_id": pos.order_id}
             
@@ -814,7 +822,7 @@ async def manual_trade(req: ManualTradeRequest):
         if not pos.order_id.startswith("PAPER_"):
             try:
                 await asyncio.sleep(1.0) # sleep to allow fill
-                df = broker.get_positions()
+                df = await asyncio.to_thread(broker.get_positions)
                 if df is not None and not df.empty:
                     matched_rows = df[df['tradingSymbol'] == pos.symbol].to_dict(orient="records")
                     if matched_rows:
@@ -884,7 +892,7 @@ async def manual_trade(req: ManualTradeRequest):
         return {"success": False, "error": "No active signal to trade"}
 
     sig = _last_signal
-    result = _execute_order(sig, cfg, req.action)
+    result = await asyncio.to_thread(_execute_order, sig, cfg, req.action)
     return result
 
 
@@ -893,10 +901,11 @@ async def get_positions():
     if not broker.is_connected():
         return {"positions": [], "connected": False}
     try:
-        df = broker.get_positions()
+        df = await asyncio.to_thread(broker.get_positions)
         if df is None or df.empty:
             return {"positions": [], "pnl": 0}
-        return {"positions": df.to_dict(orient="records"), "pnl": broker.get_live_pnl()}
+        live_pnl = await asyncio.to_thread(broker.get_live_pnl)
+        return {"positions": df.to_dict(orient="records"), "pnl": live_pnl}
     except Exception as e:
         return {"positions": [], "error": str(e)}
 
@@ -1424,7 +1433,7 @@ async def test_telegram_alert():
         if not frames:
             raise HTTPException(status_code=500, detail="Failed to fetch market data for strategy engine")
 
-        live_sig = strategy_router.get_current_signal(frames, position="NONE")
+        live_sig = await asyncio.to_thread(strategy_router.get_current_signal, frames, position="NONE")
 
         # Use whatever the strategy says (LONG, SHORT, or HOLD)
         signal_direction = live_sig.get("signal", "HOLD")
@@ -1437,7 +1446,7 @@ async def test_telegram_alert():
         qty = lot_size * cfg.lot_multiplier
 
         # Fetch live index LTP
-        index_ltp = broker.get_ltp(cfg.instrument)
+        index_ltp = await asyncio.to_thread(broker.get_ltp, cfg.instrument)
         if not index_ltp:
             fallback = {"BANKNIFTY": 56800.0, "NIFTY": 23450.0, "SENSEX": 76500.0}
             index_ltp = fallback.get(cfg.instrument, 50000.0)
@@ -2013,10 +2022,27 @@ async def _signal_polling_loop():
 
             latest_ts = None
             if frames and "5" in frames and not frames["5"].empty:
-                latest_ts = frames["5"].iloc[-1]["timestamp"]
+                latest_bar = frames["5"].iloc[-1]
+                latest_ts = latest_bar.get("timestamp")
+                try:
+                    _c_time = int(pd.to_datetime(latest_bar["timestamp"]).timestamp()) + 19800
+                    await ws_manager.broadcast({
+                        "type": "candle_update",
+                        "instrument": cfg.instrument,
+                        "data": {
+                            "time": _c_time,
+                            "open": float(latest_bar["open"]),
+                            "high": float(latest_bar["high"]),
+                            "low": float(latest_bar["low"]),
+                            "close": float(latest_bar["close"]),
+                            "volume": float(latest_bar.get("volume", 0))
+                        }
+                    })
+                except Exception as _c_err:
+                    logger.debug(f"Candle WS broadcast error: {_c_err}")
 
             # Synchronize positions from Dhan!
-            _sync_dhan_positions(cfg, tm, latest_ts)
+            await asyncio.to_thread(_sync_dhan_positions, cfg, tm, latest_ts)
 
             # ── Data staleness check ─────────────────────────────────────
             _check_data_staleness(frames, cfg)
@@ -2027,7 +2053,7 @@ async def _signal_polling_loop():
                 global _last_loss_direction, _last_loss_time
 
                 # Fetch current index LTP early for logging, consensus check and alerts
-                ltp = broker.get_ltp(cfg.instrument) or 0
+                ltp = (await asyncio.to_thread(broker.get_ltp, cfg.instrument)) or 0
                 add_activity_log(f"Polling loop check: {cfg.instrument} LTP = {ltp:,.2f}")
 
                 # Check for SL/Target hits on virtual journal entries
@@ -2157,7 +2183,7 @@ async def _signal_polling_loop():
                                                 ok, reason = False, ct_reason
                                         if ok and broker.is_connected():
                                             try:
-                                                bp = broker.sync_position_from_broker(cfg.instrument)
+                                                bp = await asyncio.to_thread(broker.sync_position_from_broker, cfg.instrument)
                                                 if bp and bp.get("has_position"):
                                                     ok, reason = False, f"Broker already has open position: {bp.get('symbol')}"
                                             except Exception:
@@ -2170,7 +2196,7 @@ async def _signal_polling_loop():
                                             if elapsed_mins < cooldown_mins:
                                                 ok, reason = False, f"Cooldown active for {cooldown_mins - elapsed_mins:.1f} mins"
                                     if ok:
-                                        result = _execute_order(sig_dict, cfg, _live_sig.signal)
+                                        result = await asyncio.to_thread(_execute_order, sig_dict, cfg, _live_sig.signal)
                                         if result.get("success"):
                                             tm.reset_order_failures()
                                             await ws_manager.broadcast({"type": "trade_opened", "data": result})
@@ -2192,7 +2218,8 @@ async def _signal_polling_loop():
                                 # Invalidate chart cache so next fetch gets fresh backtest with this signal
                                 _chart_signals_cache.clear()
                                 logger.info(f"[{_strat_id}] Processor Exit: {_live_sig.signal} ({_live_sig.exit_reason}) @ {_live_sig.exit_price}")
-                                # Notify frontend instantly so it re-fetches chart signals
+                                # Notify frontend instantly via WebSocket (both marker push + cache refresh)
+                                await ws_manager.broadcast({"type": "signal_event", "data": sig_dict})
                                 await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": _strat_id, "signal": _live_sig.signal}})
                                 # Send Telegram in background (non-blocking) for active strategy
                                 if _strat_id == cfg.strategy:
@@ -2205,11 +2232,11 @@ async def _signal_polling_loop():
                                     if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
                                         if getattr(pos, "sl_order_id", None):
                                             try:
-                                                broker.cancel_broker_sl(pos.sl_order_id)
+                                                await asyncio.to_thread(broker.cancel_broker_sl, pos.sl_order_id)
                                             except Exception as _sl_c_err:
                                                 logger.warning(f"Could not cancel broker SL on processor exit: {_sl_c_err}")
                                             pos.sl_order_id = None
-                                        _proc_exit = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                                        _proc_exit = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
                                         if not _proc_exit.get("success"):
                                             logger.error(f"Processor EXIT FAILED for {pos.symbol}: {_proc_exit.get('error')}")
                                             try:
@@ -2225,7 +2252,7 @@ async def _signal_polling_loop():
                                             continue  # skip local position close — broker exit failed
                                         # Exit order succeeded — close position locally
                                         logger.info(f"Processor EXIT order placed successfully for {pos.symbol}")
-                                        ltp_idx = broker.get_ltp(pos.instrument) or _live_sig.exit_price
+                                        ltp_idx = (await asyncio.to_thread(broker.get_ltp, pos.instrument)) or _live_sig.exit_price
                                         pnl_exit_price = _safe_pnl_exit_price(pos, ltp_idx)
                                         _recently_closed_symbols[pos.symbol] = datetime.now(_IST)
                                         rec = tm.close_position(pnl_exit_price, _live_sig.exit_reason)
@@ -2233,7 +2260,7 @@ async def _signal_polling_loop():
                                             get_capital_tracker().record_trade_pnl(rec.get("pnl", 0.0))
                                         await ws_manager.broadcast({"type": "trade_closed", "data": rec})
                                     else:
-                                        ltp_idx = broker.get_ltp(pos.instrument) or _live_sig.exit_price
+                                        ltp_idx = (await asyncio.to_thread(broker.get_ltp, pos.instrument)) or _live_sig.exit_price
                                         pnl_exit_price = _safe_pnl_exit_price(pos, ltp_idx)
                                         _recently_closed_symbols[pos.symbol] = datetime.now(_IST)
                                         rec = tm.close_position(pnl_exit_price, _live_sig.exit_reason)
@@ -2288,7 +2315,7 @@ async def _signal_polling_loop():
                         logger.info(f"Auto square-off: {_mins_to_close:.0f} mins to close, squaring off position")
                         pos = tm.position
                         if not pos.order_id.startswith("PAPER_"):
-                            _sq_exit = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                            _sq_exit = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
                             if not _sq_exit.get("success"):
                                 logger.error(f"Auto-squareoff exit FAILED: {_sq_exit.get('error')}. Position kept open.")
                                 try:
@@ -2302,7 +2329,7 @@ async def _signal_polling_loop():
                                 except Exception:
                                     pass
                                 continue  # skip local close — position still at broker
-                        ltp = broker.get_ltp(pos.instrument) or 0
+                        ltp = (await asyncio.to_thread(broker.get_ltp, pos.instrument)) or 0
                         _pnl_exit = _safe_pnl_exit_price(pos, ltp)
                         rec = tm.close_position(_pnl_exit, "AUTO_SQUAREOFF")
                         if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
@@ -2374,7 +2401,7 @@ async def _signal_polling_loop():
                             continue  # skip — can't act on broker, don't close locally
 
                         if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
-                            _opp_exit = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                            _opp_exit = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
                             if not _opp_exit.get("success"):
                                 logger.error(f"Opposite-signal exit FAILED: {_opp_exit.get('error')}. Position kept open.")
                                 try:
@@ -2390,7 +2417,7 @@ async def _signal_polling_loop():
                                 _pending_telegram_signal = sig
                                 _last_telegram_signal_key = ("", "")
                                 continue  # skip local close
-                        ltp = broker.get_ltp(pos.instrument) or 0
+                        ltp = (await asyncio.to_thread(broker.get_ltp, pos.instrument)) or 0
                         exit_reason = f"OPPOSITE_SIGNAL_{sig_direction}"
                         _pnl_exit = _safe_pnl_exit_price(pos, ltp)
                         rec = tm.close_position(_pnl_exit, exit_reason)
@@ -2453,7 +2480,7 @@ async def _signal_polling_loop():
                                 # Prevents duplicate entries if local state got out of sync
                                 if ok and broker.is_connected():
                                     try:
-                                        bp = broker.sync_position_from_broker(cfg.instrument)
+                                        bp = await asyncio.to_thread(broker.sync_position_from_broker, cfg.instrument)
                                         if bp and bp.get("has_position"):
                                             ok = False
                                             reason = f"Broker already has open position: {bp.get('symbol')} qty={bp.get('qty')}"
@@ -2469,7 +2496,7 @@ async def _signal_polling_loop():
                                         ok = False
                                         reason = f"Cooldown: same direction ({sig_direction}) blocked for {cooldown_mins - elapsed_mins:.1f} more mins"
                             if ok:
-                                result = _execute_order(sig, cfg, sig_direction)
+                                result = await asyncio.to_thread(_execute_order, sig, cfg, sig_direction)
                                 if result.get("success"):
                                     tm.reset_order_failures()
                                     await ws_manager.broadcast({"type": "trade_opened", "data": result})
@@ -2496,7 +2523,7 @@ async def _signal_polling_loop():
                 # Monitor open position
                 if tm.position:
                     pos = tm.position
-                    ltp = broker.get_ltp(pos.instrument)  # INDEX LTP — used for SL/T1/T2 hit detection
+                    ltp = await asyncio.to_thread(broker.get_ltp, pos.instrument)  # INDEX LTP — used for SL/T1/T2 hit detection
 
                     # For OPTIONS: also fetch the option premium for correct P&L tracking
                     opt_ltp = _safe_pnl_exit_price(pos, ltp)
@@ -2513,7 +2540,8 @@ async def _signal_polling_loop():
                         # Verify if position was closed at broker (e.g. SL trigger)
                         if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
                             try:
-                                bp = broker.sync_position_from_broker(
+                                bp = await asyncio.to_thread(
+                                    broker.sync_position_from_broker,
                                     pos.instrument,
                                     tracked_symbol=pos.symbol  # exact match — avoids false close from user's other positions
                                 )
@@ -2544,7 +2572,7 @@ async def _signal_polling_loop():
                                     if trail_sl > pos.sl:
                                         logger.info(f"Trailing SL updated: {pos.sl:.2f} -> {trail_sl:.2f} (highest={pos.highest_since_entry:.2f}, ATR={atr_v:.2f})")
                                         pos.sl = trail_sl
-                                        _sync_broker_sl(pos, cfg)
+                                        await asyncio.to_thread(_sync_broker_sl, pos, cfg)
                             elif pos.direction == "SHORT":
                                 if ltp < pos.lowest_since_entry:
                                     pos.lowest_since_entry = ltp
@@ -2556,7 +2584,7 @@ async def _signal_polling_loop():
                                     if trail_sl < pos.sl:
                                         logger.info(f"Trailing SL updated: {pos.sl:.2f} -> {trail_sl:.2f} (lowest={pos.lowest_since_entry:.2f}, ATR={atr_v:.2f})")
                                         pos.sl = trail_sl
-                                        _sync_broker_sl(pos, cfg)
+                                        await asyncio.to_thread(_sync_broker_sl, pos, cfg)
 
                         # ── Trailing SL for multi_agent strategy ──────────────
                         # 3-step: initial → breakeven at +2.0 ATR → trail at +2.5 ATR, offset 0.5 ATR
@@ -2579,7 +2607,7 @@ async def _signal_polling_loop():
                                         pos.sl = pos.index_entry_price
                                         pos.trail_step = 1
                                         logger.info(f"V3 Trail: BE triggered (profit={profit_atr:.1f} ATR), SL -> {pos.sl:.2f}")
-                                        _sync_broker_sl(pos, cfg)
+                                        await asyncio.to_thread(_sync_broker_sl, pos, cfg)
                                     # Step 2: Start trailing
                                     if trail_start > 0 and pos.trail_step >= 1 and peak_profit_atr >= trail_start:
                                         pos.trail_step = 2
@@ -2589,7 +2617,7 @@ async def _signal_polling_loop():
                                         if trail_sl > pos.sl:
                                             logger.info(f"V3 Trail: SL {pos.sl:.2f} -> {trail_sl:.2f} (peak={profit:.0f}pts, ATR={atr_v:.0f})")
                                             pos.sl = trail_sl
-                                            _sync_broker_sl(pos, cfg)
+                                            await asyncio.to_thread(_sync_broker_sl, pos, cfg)
 
                                 elif pos.direction == "SHORT":
                                     if ltp < pos.lowest_since_entry:
@@ -2602,7 +2630,7 @@ async def _signal_polling_loop():
                                         pos.sl = pos.index_entry_price
                                         pos.trail_step = 1
                                         logger.info(f"V3 Trail: BE triggered (profit={profit_atr:.1f} ATR), SL -> {pos.sl:.2f}")
-                                        _sync_broker_sl(pos, cfg)
+                                        await asyncio.to_thread(_sync_broker_sl, pos, cfg)
                                     if trail_start > 0 and pos.trail_step >= 1 and peak_profit_atr >= trail_start:
                                         pos.trail_step = 2
                                     if pos.trail_step >= 2 and trail_offset > 0:
@@ -2610,7 +2638,7 @@ async def _signal_polling_loop():
                                         if trail_sl < pos.sl:
                                             logger.info(f"V3 Trail: SL {pos.sl:.2f} -> {trail_sl:.2f} (peak={profit:.0f}pts, ATR={atr_v:.0f})")
                                             pos.sl = trail_sl
-                                            _sync_broker_sl(pos, cfg)
+                                            await asyncio.to_thread(_sync_broker_sl, pos, cfg)
 
 
 
@@ -2700,12 +2728,12 @@ async def _signal_polling_loop():
                             if cfg.auto_trade and not pos.order_id.startswith("PAPER_") and exit_reason != "BROKER_SL_HIT":
                                 if getattr(pos, "sl_order_id", None):
                                     try:
-                                        broker.cancel_broker_sl(pos.sl_order_id)
+                                        await asyncio.to_thread(broker.cancel_broker_sl, pos.sl_order_id)
                                     except Exception as sl_cancel_err:
                                         logger.warning(f"Could not cancel broker SL: {sl_cancel_err}")
                                     pos.sl_order_id = None
                                 
-                                exit_result = broker.place_exit_order(pos.symbol, pos.exchange, pos.direction, pos.qty)
+                                exit_result = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
                                 if exit_result.get("success"):
                                     logger.info(f"SL/target EXIT order placed successfully for {pos.symbol} ({exit_reason})")
                                 else:
@@ -2838,7 +2866,7 @@ async def get_capital_state():
     equity = state["current_equity"]
     if broker.is_connected():
         try:
-            dhan_bal = broker.get_balance()
+            dhan_bal = await asyncio.to_thread(broker.get_balance)
             if dhan_bal > 0 and cfg.auto_trade:
                 equity = dhan_bal
                 # Update capital tracker in-memory and on-disk
@@ -2854,7 +2882,7 @@ async def get_capital_state():
     today_pnl = 0.0
     if broker.is_connected():
         try:
-            today_pnl = broker.get_today_pnl()
+            today_pnl = await asyncio.to_thread(broker.get_today_pnl)
         except Exception as _pnl_err:
             logger.warning(f"Failed to fetch real-time today's pnl from Dhan: {_pnl_err}")
             # Fallback to local calculation if Dhan call fails
@@ -2944,13 +2972,13 @@ async def get_slippage():
 
 @app.get("/api/performance")
 async def get_performance():
-    return performance_tracker.compute_metrics()
+    return await asyncio.to_thread(performance_tracker.compute_metrics)
 
 
 @app.post("/api/performance/snapshot")
 async def log_performance_snapshot():
     cfg = get_settings()
-    performance_tracker.log_daily_snapshot(cfg.starting_capital)
+    await asyncio.to_thread(performance_tracker.log_daily_snapshot, cfg.starting_capital)
     return {"success": True}
 
 
@@ -3034,50 +3062,50 @@ async def download_slippage_log():
 async def get_global_markets():
     """Global indices and futures data (cached 5 min)."""
     from global_markets import fetch_global_markets
-    return fetch_global_markets()
+    return await asyncio.to_thread(fetch_global_markets)
 
 @app.get("/api/market-context")
 async def get_market_context():
     """Combined: global markets + bias + sentiment + fear & greed + VIX + expiry + composite."""
     from global_markets import get_market_context
-    return get_market_context()
+    return await asyncio.to_thread(get_market_context)
 
 @app.post("/api/market-context/refresh")
 async def refresh_market_context():
     """Clear all market context caches and re-fetch fresh data."""
     from global_markets import clear_all_cache, get_market_context
     clear_all_cache()
-    return get_market_context()
+    return await asyncio.to_thread(get_market_context)
 
 @app.get("/api/india-vix")
 async def get_india_vix():
     """India VIX from Dhan API."""
     from global_markets import fetch_india_vix
-    return fetch_india_vix()
+    return await asyncio.to_thread(fetch_india_vix)
 
 @app.get("/api/expiry-today")
 async def get_expiry_today():
     """Check which instruments have expiry today."""
     from global_markets import fetch_expiry_today
-    return fetch_expiry_today()
+    return await asyncio.to_thread(fetch_expiry_today)
 
 @app.get("/api/oi-analysis")
 async def get_oi_analysis(instrument: str = "BANKNIFTY", expiry: str = None):
     """Open Interest analysis from Dhan option chain."""
     from global_markets import fetch_oi_analysis
-    return fetch_oi_analysis(instrument, expiry)
+    return await asyncio.to_thread(fetch_oi_analysis, instrument, expiry)
 
 @app.get("/api/oi-expiry-list")
 async def get_oi_expiry_list(instrument: str = "BANKNIFTY"):
     """Get available option expiry dates for an instrument."""
     from global_markets import fetch_oi_expiry_list
-    return fetch_oi_expiry_list(instrument)
+    return await asyncio.to_thread(fetch_oi_expiry_list, instrument)
 
 @app.get("/api/options-context")
 async def get_options_context(instrument: str = "BANKNIFTY", expiry: str = None, direction: str = None):
     """Options awareness context for Live Trading — strike recommendations, Greeks, IV, theta decay."""
     from global_markets import fetch_options_context
-    return fetch_options_context(instrument, expiry, direction)
+    return await asyncio.to_thread(fetch_options_context, instrument, expiry, direction)
 
 
 # ── Research Pipeline API ────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 # ── Dhan Broker ──────────────────────────────────────────────────────────────
 dhanhq>=2.0.0
-Dhan-Tradehull>=3.3.1
+# Dhan-Tradehull>=3.3.1  # Unused dead dependency; system uses official dhanhq v2 SDK directly
 
 # ── Web Framework ─────────────────────────────────────────────────────────────
 fastapi>=0.111.0

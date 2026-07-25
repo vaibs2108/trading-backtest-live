@@ -158,20 +158,44 @@ class BacktestDiffProcessor:
     # ──────────────────────────────────────────────────────────────────
     #  CORE: run backtest, diff trades, emit LiveSignal objects
     # ──────────────────────────────────────────────────────────────────
-    def process_frames(self, frames: dict, cfg, lot_size: int = 30) -> List[LiveSignal]:
-        mod = self._get_module()
+    def _get_kernel(self):
+        """Return registered StrategyKernel for this strategy."""
+        try:
+            from strategy_kernel import get_kernel
+            return get_kernel(self.strategy_id)
+        except Exception:
+            return None
 
+    def process_frames(self, frames: dict, cfg, lot_size: int = 30) -> List[LiveSignal]:
         # Validate minimum data
         required = ["5", "15", "60", "1D"]
         for r in required:
             if r not in frames or frames[r] is None or len(frames[r]) < 30:
                 return []
 
-        # Run the EXACT same backtest that chart_signals uses
+        # Check if 5m candle timestamp has changed — skip redundant evaluation if unchanged
+        if "5" in frames and not frames["5"].empty:
+            current_5m_ts = frames["5"].iloc[-1].get("timestamp")
+            if self._initialised and self.last_processed_ts == current_5m_ts:
+                return []
+
+        # Slice frames to trailing window (N=300) for fast live bar evaluation
+        eval_frames = {}
+        for tf, df in frames.items():
+            if df is not None and not df.empty:
+                eval_frames[tf] = df.tail(300).copy() if len(df) > 300 else df
+            else:
+                eval_frames[tf] = df
+
+        # Run kernel backtest
+        kernel = self._get_kernel()
+        if kernel is None:
+            logger.error(f"CRITICAL: StrategyKernel for '{self.strategy_id}' not registered in strategy registry!")
+            return []
         try:
-            result = mod.run_backtest(frames)
+            result = kernel.safe_run_backtest(eval_frames)
         except Exception as e:
-            logger.error(f"[{self.strategy_id}] Backtest failed: {e}", exc_info=True)
+            logger.error(f"[{self.strategy_id}] Strategy evaluation failed: {e}", exc_info=True)
             return []
 
         if not result or "error" in result:
@@ -377,18 +401,10 @@ class RegimeLiveProcessor(BacktestDiffProcessor):
     """Regime Trend/Range Optimized strategy."""
     strategy_id = "regime_trend_range"
 
-    def _get_module(self):
-        from strategies import regime_strategy
-        return regime_strategy
-
 
 class RegimeReversalLiveProcessor(BacktestDiffProcessor):
     """Regime + Reversal combined strategy."""
     strategy_id = "regime_reversal"
-
-    def _get_module(self):
-        from strategies import regime_reversal_strategy
-        return regime_reversal_strategy
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

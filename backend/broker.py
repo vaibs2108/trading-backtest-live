@@ -348,16 +348,27 @@ def get_ltp(instrument: str) -> Optional[float]:
         return None
 
 
+_option_ltp_cache = {}
+_option_ltp_cache_time = {}
+
 def get_option_ltp(symbol: str) -> float:
-    """Fetch live option premium LTP directly from Dhan."""
+    """Fetch live option premium LTP directly from Dhan with 2s caching."""
     if not symbol:
         return 0.0
+    now = _time.time()
+    if symbol in _option_ltp_cache and symbol in _option_ltp_cache_time:
+        if now - _option_ltp_cache_time[symbol] < 2.0:
+            return _option_ltp_cache[symbol]
     try:
         ltps = _get_ltp_data([symbol])
-        return ltps.get(symbol, 0.0)
+        val = ltps.get(symbol, 0.0)
+        if val > 0:
+            _option_ltp_cache[symbol] = val
+            _option_ltp_cache_time[symbol] = now
+        return val
     except Exception as e:
         logger.error(f"get_option_ltp error for {symbol}: {e}")
-        return 0.0
+        return _option_ltp_cache.get(symbol, 0.0)
 
 
 def get_index_security_id(symbol: str) -> Optional[str]:
@@ -701,11 +712,13 @@ def verify_order_fill(order_id: str, timeout: int = 15) -> dict:
                 data = res["data"]
                 order_data = data[0] if isinstance(data, list) else data
                 status = order_data.get("orderStatus")
-                if status == "FILLED":
-                    logger.info(f"Order {order_id} filled successfully.")
+                if status in ["TRADED", "FILLED"]:
+                    logger.info(f"Order {order_id} filled successfully (status={status}).")
                     return order_data
-                elif status in ["REJECTED", "CANCELLED"]:
-                    reason = order_data.get("rejectReason") or "Order cancelled or rejected."
+                elif status == "PART_TRADED":
+                    logger.info(f"Order {order_id} partially traded. Waiting for complete execution...")
+                elif status in ["REJECTED", "CANCELLED", "EXPIRED"]:
+                    reason = order_data.get("rejectReason") or "Order cancelled, rejected, or expired."
                     logger.error(f"Order {order_id} failed with status {status}. Reason: {reason}")
                     raise RuntimeError(f"Order failed: {status}. Reason: {reason}")
             elif isinstance(res, dict) and res.get("status") == "failure":
@@ -793,7 +806,7 @@ def place_entry_order(
             return {"success": False, "error": f"Could not resolve segment for exchange {exch_id}"}
 
         cfg = get_settings()
-        dhan_product_type = "MARGIN" if cfg.product_type == "NRML" else "INTRA"
+        dhan_product_type = "MARGIN" if cfg.product_type == "NRML" else "INTRADAY"
 
         # 3. Call Place Order
         res = _dhan_client.place_order(
@@ -883,7 +896,7 @@ def place_exit_order(symbol: str, exchange: str, direction: str, qty: int) -> di
             return {"success": False, "error": f"Could not resolve segment for exchange {exch_id}"}
 
         cfg = get_settings()
-        dhan_product_type = "MARGIN" if cfg.product_type == "NRML" else "INTRA"
+        dhan_product_type = "MARGIN" if cfg.product_type == "NRML" else "INTRADAY"
 
         res = _dhan_client.place_order(
             security_id=security_id,
@@ -960,19 +973,19 @@ def place_broker_sl(symbol: str, exchange: str, direction: str, quantity: int, t
             raise ValueError(f"Could not resolve segment for exchange {exch_id}")
 
         cfg = get_settings()
-        dhan_product_type = "MARGIN" if cfg.product_type == "NRML" else "INTRA"
+        dhan_product_type = "MARGIN" if cfg.product_type == "NRML" else "INTRADAY"
 
         # Round trigger price to 1 decimal place to align with ticks
         rounded_trigger = round(float(trigger_price), 1)
 
-        # NSE & Dhan API v2 Rule: Options segment prohibits STOP_LOSS_MARKET (STOPMARKET).
-        # For Options, order_type MUST be "SL" (Stop Loss Limit) with both trigger_price and price set.
+        # NSE & Dhan API v2 Rule: Options segment prohibits STOP_LOSS_MARKET.
+        # For Options, order_type MUST be "STOP_LOSS" (Stop Loss Limit) with both trigger_price and price set.
         if is_option:
-            order_type_str = "SL"
+            order_type_str = "STOP_LOSS"
             # Limit price set 2 points below trigger price (min 0.05) to ensure execution without wide slippage
             limit_price = max(0.05, round(rounded_trigger - 2.0, 1))
         else:
-            order_type_str = "STOPMARKET"
+            order_type_str = "STOP_LOSS_MARKET"
             limit_price = 0.0
 
         logger.info(
@@ -1010,10 +1023,10 @@ def modify_broker_sl(order_id: str, quantity: int, new_trigger_price: float, is_
 
     rounded_trigger = round(float(new_trigger_price), 1)
     if is_option:
-        order_type_str = "SL"
+        order_type_str = "STOP_LOSS"
         limit_price = max(0.05, round(rounded_trigger - 2.0, 1))
     else:
-        order_type_str = "STOPMARKET"
+        order_type_str = "STOP_LOSS_MARKET"
         limit_price = 0.0
 
     logger.info(f"Modifying broker-side SL order {order_id} ({order_type_str}) trigger: {rounded_trigger}, price: {limit_price}")
