@@ -1,10 +1,15 @@
 """
 main.py — FastAPI application: REST API + WebSocket for live signals & chart data.
 """
+import os
+import sys
+_backend_dir = os.path.dirname(os.path.abspath(__file__))
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
 import asyncio
 import logging
 import json
-import os
 import pytz
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -956,9 +961,15 @@ async def run_backtest(req: BacktestRequest):
             from_d,
             to_d,
         )
+    except Exception as e:
+        logger.error(f"Backtest execution error for {req.instrument} ({bt_strategy}): {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Backtest error: {str(e)}")
     finally:
         cfg.strategy = original_strategy
         cfg.instrument = original_instrument
+
+    if not isinstance(result, dict):
+        result = {"error": "Invalid backtest result"}
 
     result["strategy_used"] = bt_strategy
     return _sanitise_floats(result)

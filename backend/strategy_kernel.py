@@ -16,6 +16,11 @@ Usage:
           ...
           return SignalEvent(...) or None
 """
+import sys, os
+_backend_dir = os.path.dirname(os.path.abspath(__file__))
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
