@@ -100,12 +100,28 @@ _log_file = _log_dir / "app.log"
 console_handler = logging.StreamHandler()
 console_handler.encoding = "utf-8"
 
+from logging.handlers import TimedRotatingFileHandler
+
 class AutoFlushingFileHandler(logging.FileHandler):
     def emit(self, record):
         super().emit(record)
         self.flush()
 
-file_handler = AutoFlushingFileHandler(str(_log_file), encoding="utf-8")
+class AutoFlushingTimedRotatingFileHandler(TimedRotatingFileHandler):
+    """Rotates app.log at midnight, keeps 30 days of history, flushes every
+    write so entries are durably on disk even if the process is killed or
+    the terminal crashes."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+# app.log always holds "today" (or the current run); on rotation the previous
+# day's log is renamed to app.log.YYYY-MM-DD and kept for 30 days so a crash
+# always leaves something to look back at, even across restarts/days.
+file_handler = AutoFlushingTimedRotatingFileHandler(
+    str(_log_file), when="midnight", backupCount=30, encoding="utf-8", utc=False
+)
+file_handler.suffix = "%Y-%m-%d"
 
 logging.basicConfig(
     level=logging.INFO,

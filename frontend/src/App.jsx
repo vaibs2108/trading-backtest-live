@@ -6805,7 +6805,10 @@ export default function App() {
                         instrument={instrument}
                       />
                     ) : (
-                      <PositionPanel state={tradeState} />
+                      // "Live Position" must reflect broker-confirmed reality only, never a
+                      // paper/simulated position — matches the filter PositionGreeksPanel
+                      // already applies just below, so the two panels can't disagree again.
+                      <PositionPanel state={{ ...tradeState, position: null }} />
                     )}
                   </ErrorBoundary>
                   <ErrorBoundary>

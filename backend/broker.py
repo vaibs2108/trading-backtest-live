@@ -256,7 +256,7 @@ def _get_ltp_data(symbols) -> dict:
             symbol_map[str(sec_id)] = symbol
             continue
 
-        match = df[(df['SEM_CUSTOM_SYMBOL'] == sym_upper) | (df['SEM_TRADING_SYMBOL'] == sym_upper)]
+        match = df[(df['SEM_CUSTOM_SYMBOL'].str.upper() == sym_upper) | (df['SEM_TRADING_SYMBOL'].str.upper() == sym_upper)]
         if not match.empty:
             row = match.iloc[-1]
             sec_id = int(row['SEM_SMST_SECURITY_ID'])
