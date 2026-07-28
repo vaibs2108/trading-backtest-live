@@ -334,6 +334,7 @@ def _safe_pnl_exit_price(pos, index_ltp: float) -> float:
 
 _exit_signal_logged_for_position: str = ""  # order_id for which we already logged an exit signal this position lifetime
 _exit_telegram_sent_for_position: str = ""  # order_id for which we already sent an exit alert this position lifetime
+_manual_exit_alert_last_sent: dict = {}  # order_id -> datetime of last "MANUAL EXIT NEEDED" reminder (DHAN_SYNC + auto_trade=OFF), capped to one reminder per 15 min
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -2092,6 +2093,7 @@ async def _signal_polling_loop():
                 global _last_signal, _last_telegram_signal_key, _pending_telegram_signal
                 global _active_trade_signal, _recently_closed_symbols, _exit_signal_logged_for_position, _exit_telegram_sent_for_position
                 global _last_loss_direction, _last_loss_time
+                global _manual_exit_alert_last_sent
 
                 # Fetch current index LTP early for logging, consensus check and alerts
                 ltp = (await asyncio.to_thread(broker.get_ltp, cfg.instrument)) or 0
@@ -2832,16 +2834,32 @@ async def _signal_polling_loop():
                                 # trade (it doesn't reflect anything that actually happened to the real
                                 # position) that then gets re-imported and re-flagged again next cycle.
                                 logger.warning(f"DHAN_SYNC position {exit_reason} but auto_trade=OFF — user must exit manually on Dhan! Not closing internally.")
-                                try:
-                                    _send_telegram_alert_wrapper(
-                                        f"\u26a0\ufe0f MANUAL EXIT NEEDED\n"
-                                        f"{pos.direction} {pos.symbol}\n"
-                                        f"Reason: {exit_reason} (LTP: {ltp})\n"
-                                        f"Auto-trade is OFF — please exit on Dhan manually!",
-                                        cfg.telegram_bot_token, cfg.telegram_chat_id
-                                    )
-                                except Exception:
-                                    pass
+                                # Reminder cooldown: this condition stays true every single poll
+                                # cycle until the user actually closes the position on Dhan, so
+                                # without a cooldown this alert fires every ~15s and floods
+                                # Telegram. Send it once, then only again every 15 minutes as a
+                                # reminder — not on every cycle.
+                                _now_alert = datetime.now(_IST)
+                                _last_alert = _manual_exit_alert_last_sent.get(pos.order_id)
+                                if _last_alert is None or (_now_alert - _last_alert).total_seconds() >= 900:
+                                    _manual_exit_alert_last_sent[pos.order_id] = _now_alert
+                                    try:
+                                        _send_telegram_alert_wrapper(
+                                            f"\u26a0\ufe0f MANUAL EXIT NEEDED\n"
+                                            f"{pos.direction} {pos.symbol}\n"
+                                            f"Reason: {exit_reason} (LTP: {ltp})\n"
+                                            f"Auto-trade is OFF — please exit on Dhan manually!\n"
+                                            f"(Reminder every 15 min until closed)",
+                                            cfg.telegram_bot_token, cfg.telegram_chat_id
+                                        )
+                                    except Exception:
+                                        pass
+                                    # Prune stale entries so this dict can't grow unbounded over
+                                    # many days of operation (positions never repeat order_ids).
+                                    if len(_manual_exit_alert_last_sent) > 200:
+                                        _cutoff = _now_alert - timedelta(hours=6)
+                                        for _oid in [k for k, v in _manual_exit_alert_last_sent.items() if v < _cutoff]:
+                                            del _manual_exit_alert_last_sent[_oid]
                                 continue  # skip local position close — this position is not ours to close
 
                             # Prevent immediate Dhan re-import for 5 minutes
