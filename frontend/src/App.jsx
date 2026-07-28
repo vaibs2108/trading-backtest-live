@@ -6273,6 +6273,14 @@ export default function App() {
               setRefreshChart(r => r + 1)
             }
           }
+          if (msg.type === 'chart_signals_updated') {
+            // Backend just invalidated its chart-signals cache (new entry/exit) —
+            // refetch immediately instead of waiting for the next poll tick, so
+            // the chart doesn't lag behind real trading activity.
+            if (!msg.data?.strategy || msg.data.strategy === strategyRef.current) {
+              fetchChartSignalsRef.current && fetchChartSignalsRef.current()
+            }
+          }
           if (msg.type === 'init') {
             setConnected(msg.data.connected)
             if (msg.data.signal && (!msg.data.signal.instrument || msg.data.signal.instrument === instrumentRef.current))
@@ -6393,7 +6401,10 @@ export default function App() {
   useEffect(() => {
     if (tab === 'live') {
       fetchChartSignals()
-      const id = setInterval(fetchChartSignals, 30000) // auto-refresh every 30s
+      // Safety-net poll only — real-time updates come instantly via the
+      // 'chart_signals_updated' WebSocket push above. This just guards against
+      // a missed/dropped WS message.
+      const id = setInterval(fetchChartSignals, 10000)
       return () => clearInterval(id)
     }
   }, [strategy, instrument, tab, fetchChartSignals])

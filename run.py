@@ -69,24 +69,26 @@ def main():
     check_frontend()
     free_port(8000)
 
-    print("\n🚀 Starting server at http://localhost:8000\n")
+    print("\n🚀 Starting server at http://localhost:8000 (supervised by watchdog)\n")
     os.chdir(BASE)
     # Add backend to path
     sys.path.insert(0, str(BASE / "backend"))
 
     try:
-        import uvicorn
-        uvicorn.run(
-            "backend.main:app",
-            host="0.0.0.0",
-            port=8000,
-            reload=False,
-            log_level="info",
-        )
+        import watchdog
+        # watchdog.run_watchdog() launches backend/main.py as a supervised
+        # child subprocess (`uvicorn main:app`), monitors its heartbeat file,
+        # and auto-restarts it on crash or freeze (including recovering from
+        # a genuine OS-level sleep/suspend). This is the same watchdog used
+        # by `python backend/watchdog.py` directly — `uv run run.py` now
+        # does the setup checks above AND gives you that same crash/freeze
+        # recovery, from a single command, instead of running uvicorn
+        # in-process with no supervision.
+        watchdog.run_watchdog()
     except (KeyboardInterrupt, SystemExit):
         pass
-    except ImportError:
-        print("ERROR: uvicorn not installed. Run: uv pip install -r requirements.txt")
+    except ImportError as e:
+        print(f"ERROR: could not import watchdog ({e}). Run: uv pip install -r requirements.txt")
         sys.exit(1)
     finally:
         print("\n👋 DhanML trading engine stopped cleanly.")

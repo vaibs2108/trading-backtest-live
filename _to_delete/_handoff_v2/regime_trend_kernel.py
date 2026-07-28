@@ -264,7 +264,6 @@ class RegimeTrendKernel(StrategyKernel):
             bh = float(row.get("high", row["close"]))
             bl = float(row.get("low", row["close"]))
             bc = float(row["close"])
-            bo = float(row.get("open", bc))
             ts = row["timestamp"]
             atr_v = float(row.get("atr", bc * 0.002))
             if pd.isna(atr_v) or atr_v < 5:
@@ -303,20 +302,10 @@ class RegimeTrendKernel(StrategyKernel):
                     continue
 
                 # ── 1. STOP LOSS HIT ────────────────────────────────────
-                # Real-fill check: only book AT the sl level if price actually
-                # traded there this bar (bl <= sl <= bh for LONG, mirrored for
-                # SHORT). If sl sits on the wrong side of the bar's own real
-                # range, the "hit" is mechanical — a stale trailing/breakeven
-                # level the market had already moved past before this bar even
-                # opened — not a genuine touch. Book the real, actually-reached
-                # price (this bar's own open) instead, so every trade is a real,
-                # traceable fill and never a fictitious one.
                 if position == "LONG" and bl <= sl:
-                    real_exit = sl if sl <= bh + 0.01 else bo
-                    book(real_exit, "SL_HIT")
+                    book(sl, "SL_HIT")
                 elif position == "SHORT" and bh >= sl:
-                    real_exit = sl if sl >= bl - 0.01 else bo
-                    book(real_exit, "SL_HIT")
+                    book(sl, "SL_HIT")
 
                 # ── 2. TRAILING STOP (continuous) ───────────────────────
                 elif position == "LONG":

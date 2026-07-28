@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, asdict
 logger = logging.getLogger(__name__)
 
 _DAY_STATS_PATH = Path(__file__).parent / "data" / "day_stats.json"
+_ACTIVE_POSITION_PATH = Path(__file__).parent / "data" / "active_position.json"
 
 
 @dataclass
@@ -67,6 +68,7 @@ class TradeManager:
         self._max_daily_profit = 15000.0
         self._order_failure_count = 0  # consecutive order failures for kill switch
         self._load_day_stats()
+        self._load_position()
 
     def _load_day_stats(self):
         """Load persisted DayStats from file if date matches today."""
@@ -98,6 +100,45 @@ class TradeManager:
         except Exception as e:
             logger.warning(f"Could not persist DayStats: {e}")
 
+    def _load_position(self):
+        """Restore an open position across a restart.
+
+        Positions previously only lived in memory — a crash or restart while a
+        real order (paper or live) was open silently forgot about it, and the
+        next broker reconciliation cycle would then import whatever Dhan shows
+        into the now-empty slot, sometimes replacing a position the app itself
+        had opened. This restores whatever was open before the restart so that
+        doesn't happen.
+        """
+        try:
+            if _ACTIVE_POSITION_PATH.exists():
+                with open(_ACTIVE_POSITION_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if data:
+                    self.position = ActivePosition(**data)
+                    logger.info(
+                        f"Restored open position from disk across restart: "
+                        f"{self.position.direction} {self.position.symbol} "
+                        f"(order_id={self.position.order_id})"
+                    )
+        except Exception as e:
+            logger.warning(f"Could not restore persisted position: {e}")
+
+    def save_position_state(self):
+        """Persist the current position (or its absence) to disk.
+
+        Call this after opening/closing a position and after any in-place
+        mutation of the tracked position (e.g. trailing SL updates), so the
+        on-disk copy never goes stale. A restart then restores exactly what
+        was open instead of silently forgetting it.
+        """
+        try:
+            _ACTIVE_POSITION_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(_ACTIVE_POSITION_PATH, "w", encoding="utf-8") as f:
+                json.dump(asdict(self.position) if self.position else None, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not persist position state: {e}")
+
     def update_limits(self, max_loss: float, max_profit: float):
         self._max_daily_loss   = max_loss
         self._max_daily_profit = max_profit
@@ -123,6 +164,7 @@ class TradeManager:
     def open_position(self, pos: ActivePosition):
         self.position = pos
         logger.info(f"Position opened: {pos.direction} {pos.symbol} @ {pos.entry_price}")
+        self.save_position_state()
 
     def close_position(self, exit_price: float, reason: str, pnl_override: Optional[float] = None) -> dict:
         if self.position is None:
@@ -161,6 +203,7 @@ class TradeManager:
 
         logger.info(f"Position closed: {pos.direction} {pos.symbol} @ {exit_price} | PnL: Rs.{pnl:,.0f} | Reason: {reason}")
         self.position = None
+        self.save_position_state()
         return trade_rec
 
     def update_pnl(self, current_price: float):
@@ -178,6 +221,7 @@ class TradeManager:
             self.position.sl = self.position.entry_price  # trail SL to BE
             self.position.sl_moved_to_be = True
             logger.info("T1 hit — SL moved to breakeven")
+            self.save_position_state()
 
     def sync_from_broker(self, broker_pos: dict, instrument: str):
         """Restore position state from broker data on startup.
@@ -208,6 +252,7 @@ class TradeManager:
         )
         self.position = pos
         logger.info(f"Position synced from broker: {pos.direction} {pos.symbol} x{pos.qty} @ {pos.entry_price}")
+        self.save_position_state()
 
     def record_order_failure(self) -> int:
         """Record an order failure. Returns current consecutive failure count."""

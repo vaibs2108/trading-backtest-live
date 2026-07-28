@@ -2732,10 +2732,7 @@ async def _signal_polling_loop():
                             ):
                                 exit_triggered = True
                                 exit_reason = "T2_HIT"
-                                # Real-fill: book at the actual observed LTP, not the
-                                # preset target level — ltp is always a real, traded
-                                # price; target2 is just the trigger threshold.
-                                exit_price = ltp
+                                exit_price = pos.target2
                             # 2. Stop Loss hit (index level)
                             # Distinguish trailing SL from initial SL (matches backtest)
                             elif pos.sl > 0 and (
@@ -2745,14 +2742,7 @@ async def _signal_polling_loop():
                                 exit_triggered = True
                                 _ts = getattr(pos, 'trail_step', 0)
                                 exit_reason = f"TRAIL_S{_ts}" if _ts > 0 else "SL_HIT"
-                                # Real-fill fix (live version of the same bug fixed in
-                                # regime_trend_kernel.py's backtest): pos.sl can be a
-                                # stale trailing/breakeven level that the market had
-                                # already moved past before this tick — booking at
-                                # pos.sl in that case would log a price that was never
-                                # actually traded. ltp is always the real, current,
-                                # actually-observed price, so book the exit there.
-                                exit_price = ltp
+                                exit_price = pos.sl
                             # 3. Model exit signal (SIG_EXIT — same name as backtest)
                             elif sig.get("instrument") == pos.instrument and (
                                  (pos.direction == "LONG" and sig.get("signal") == "LONG_EXIT") or

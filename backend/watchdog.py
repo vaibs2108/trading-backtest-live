@@ -149,7 +149,8 @@ def run_watchdog():
         save_app_state("RUNNING", f"Started by watchdog, attempt #{restart_count + 1}")
 
         try:
-            cmd = [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+            port = os.environ.get("PORT", "8000")
+            cmd = [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", str(port)]
             creation_flags = 0
             if sys.platform == "win32":
                 creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP

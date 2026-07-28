@@ -55,11 +55,11 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 #   -e DHAN_ACCESS_TOKEN=...
 #   -e TELEGRAM_BOT_TOKEN=...
 #   -e TELEGRAM_CHAT_ID=...
-CMD python -c "\
-import sys, os; \
-sys.path.insert(0, 'backend'); \
-os.chdir('.'); \
-port = int(os.environ.get('PORT', 7860)); \
-import uvicorn; \
-uvicorn.run('backend.main:app', host='0.0.0.0', port=port, log_level='info')\
-"
+#
+# Runs under watchdog.py rather than uvicorn directly: watchdog monitors the
+# app's heartbeat, auto-restarts it on crash or freeze, and logs restart
+# events to backend/logs/watchdog.log — separate from app.log so a crash
+# always leaves something to look back at. Exec form (not shell string) so
+# `docker stop` sends SIGTERM straight to watchdog.py's own graceful-shutdown
+# handler instead of being swallowed by an intermediate shell.
+CMD ["python", "backend/watchdog.py"]

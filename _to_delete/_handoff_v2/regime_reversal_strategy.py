@@ -382,7 +382,6 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
     close_arr = base["close"].values.astype(float)
     high_arr = base["high"].values.astype(float)
     low_arr = base["low"].values.astype(float)
-    open_arr = base["open"].values.astype(float) if "open" in base.columns else close_arr
 
     trades = []
     position = "NONE"       # LONG or SHORT or NONE
@@ -427,7 +426,6 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
         bh = high_arr[i]
         bl = low_arr[i]
         bc = close_arr[i]
-        bo = open_arr[i]
         ts = row["timestamp"]
         atr_v = float(row.get("atr", bc * 0.002))
         if pd.isna(atr_v) or atr_v < 5:
@@ -461,18 +459,10 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
             # ── 1. SL HIT ─────────────────────────────────────────────
             # No `continue` — falls through to flat section where agents
             # run (matching regime_strategy.py's fallthrough pattern).
-            # Real-fill check (same fix as regime_trend_kernel.py): only book
-            # AT the sl level if price actually traded there this bar. If sl
-            # sits on the wrong side of the bar's own real range, the "hit" is
-            # mechanical (a stale trailing/breakeven level already passed by
-            # the market before this bar opened), not a genuine touch — book
-            # the real, actually-reached price (this bar's own open) instead.
             if position == "LONG" and bl <= sl:
-                real_exit = sl if sl <= bh + 0.01 else bo
-                just_closed_source = book(real_exit, "SL_HIT", i)
+                just_closed_source = book(sl, "SL_HIT", i)
             elif position == "SHORT" and bh >= sl:
-                real_exit = sl if sl >= bl - 0.01 else bo
-                just_closed_source = book(real_exit, "SL_HIT", i)
+                just_closed_source = book(sl, "SL_HIT", i)
 
             # ── 2. RUN AGENTS + TRAILING + REGIME EXIT (if still in position) ──
             if position != "NONE":
