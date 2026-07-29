@@ -450,7 +450,7 @@ function SignalPanel({ signal, onManualTrade, position, connected, ltp, lastEntr
     <Card style={{ borderLeft:`3px solid ${sigColor}`, height:'100%', boxSizing:'border-box', display:'flex', flexDirection:'column', justifyContent:'space-between' }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
         <div>
-          <div style={{ color:V('text-muted'), fontSize:11, marginBottom:4, fontWeight:500 }}>{signal.strategy === 'regime_reversal' ? 'Regime + Reversal' : signal.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : signal.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : 'Strategy Signal'}</div>
+          <div style={{ color:V('text-muted'), fontSize:11, marginBottom:4, fontWeight:500 }}>{signal.strategy === 'regime_reversal' ? 'Regime + Reversal' : signal.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : signal.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : signal.strategy === 'regime_trend_v2' ? 'Regime Trend V2 — Selective' : signal.strategy === 'regime_trend_v2b' ? 'Regime Trend V2-B — Balanced' : 'Strategy Signal'}</div>
           <div style={{ color:sigColor, fontSize:24, fontWeight:800 }}>{sigIcon} {showActiveEntry ? `${lastEntry.signal} (active)` : sig}</div>
           {signal.time && <div style={{ color:V('text-muted'), fontSize:10, marginTop:2 }}>{toIST(signal.time)}</div>}
         </div>
@@ -982,7 +982,7 @@ function BacktestPanel({ connected }) {
         <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
           {[
             ['Strategy', <select value={form.strategy} onChange={e=>setForm(p=>({...p,strategy:e.target.value}))} style={inputStyle}>
-              {[{v:'regime_trend_range',l:'Regime Trend/Range Optimized'},{v:'regime_reversal',l:'Regime + Reversal Combined'}].map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
+              {[{v:'regime_trend_range',l:'Regime Trend/Range Optimized'},{v:'regime_reversal',l:'Regime + Reversal Combined'},{v:'regime_trend_v2',l:'Regime Trend V2 — Selective (optimized)'},{v:'regime_trend_v2b',l:'Regime Trend V2-B — Balanced'},{v:'donchian_5m_swing',l:'Donchian 5m Swing (overnight)'},{v:'donchian_5m_intraday',l:'Donchian 5m Intraday'}].map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
             </select>],
             ['Instrument', <select value={form.instrument} onChange={e=>setForm(p=>({...p,instrument:e.target.value}))} style={inputStyle}>
               {['NIFTY','BANKNIFTY','SENSEX','CRUDEOIL'].map(i=><option key={i}>{i}</option>)}
@@ -1296,6 +1296,10 @@ function SignalJournalPanel({ entries, onRefresh }) {
                 <option value="ALL">All Strategies</option>
                 <option value="regime_reversal">Regime + Reversal Combined</option>
                 <option value="regime_trend_range">Regime T/R Optimized</option>
+                <option value="regime_trend_v2">Regime Trend V2 — Selective</option>
+                <option value="regime_trend_v2b">Regime Trend V2-B — Balanced</option>
+                <option value="donchian_5m_swing">Donchian 5m Swing</option>
+                <option value="donchian_5m_intraday">Donchian 5m Intraday</option>
               </select>
             </div>
 
@@ -3752,7 +3756,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
   const d = tradeState?.day_stats
   const displayPnl = todayPnl != null && todayPnl !== 0 ? todayPnl : d?.gross_pnl
 
-  const strategyLabels = { regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized' }
+  const strategyLabels = { regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
   const [sparkData, setSparkData] = React.useState({ closes: [], pct_change: 0.0 })
   const [logs, setLogs] = React.useState([])
   const [isClosing, setIsClosing] = React.useState(false)
@@ -4186,7 +4190,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
 // ── Auto Trade Monitor Page ─────────────────────────────────────────────────
 function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals, capitalState, tradeState, strategy, signal }) {
   const m = window.innerWidth < 768
-  const strategyLabels = { regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized' }
+  const strategyLabels = { regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
 
   // ── Inactive state ──
   if (!autoTrade) {
@@ -5678,7 +5682,7 @@ function OptimizedStrikePanel({ data, loading }) {
         <span style={{ fontSize:14 }}>🎯</span> Optimized Strike
       </div>
       <div style={{ color:V('text-muted'), fontSize:12, textAlign:'center', padding:12 }}>
-        {loading ? 'Analyzing options chain...' : 'Connect to Dhan to view strike recommendation'}
+        {loading ? 'Analyzing options chain...' : (data?.error || 'Connect to Dhan to view strike recommendation')}
       </div>
     </Card>
   )
@@ -5878,7 +5882,7 @@ function GreeksDecayDashboard({ data, loading }) {
     <Card style={{ minHeight:120 }}>
       <div style={{ color:V('text-muted'), fontSize:11, textTransform:'uppercase', fontWeight:600, marginBottom:8, letterSpacing:1 }}>Greeks & Decay</div>
       <div style={{ color:V('text-muted'), fontSize:12, textAlign:'center', padding:20 }}>
-        {loading ? 'Loading...' : 'Connect to Dhan to view Greeks'}
+        {loading ? 'Loading...' : (data?.error || 'Connect to Dhan to view Greeks')}
       </div>
     </Card>
   )
@@ -6243,6 +6247,7 @@ export default function App() {
   useEffect(() => {
     let delay = 1000
     let timerId = null
+    let pingInterval = null
 
     const connect = () => {
       try {
@@ -6250,61 +6255,74 @@ export default function App() {
         const ws = new WebSocket(`${wsProto}//${location.host}/ws`)
         
         ws.onopen = () => {
-          delay = 1000 // Reset on successful open
+          delay = 1000 // Reset backoff on successful open
+          if (pingInterval) clearInterval(pingInterval)
+          pingInterval = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              try { ws.send('ping') } catch(_) {}
+            }
+          }, 15000) // Send ping every 15s to keep TCP socket active
         }
         
         ws.onmessage = e => {
-          const msg = JSON.parse(e.data)
-          if (msg.type === 'candle_update') {
-            if (!msg.instrument || msg.instrument === instrumentRef.current) {
-              window.dispatchEvent(new CustomEvent('candle_update', { detail: msg.data }))
+          if (e.data === 'pong') return
+          try {
+            const msg = JSON.parse(e.data)
+            if (msg.type === 'pong' || msg.type === 'heartbeat') return
+            if (msg.type === 'candle_update') {
+              if (!msg.instrument || msg.instrument === instrumentRef.current) {
+                window.dispatchEvent(new CustomEvent('candle_update', { detail: msg.data }))
+              }
             }
-          }
-          if (msg.type === 'signal') {
-            if (!msg.data?.instrument || msg.data.instrument === instrumentRef.current)
-              setSignal(msg.data)
-          }
-          if (msg.type === 'state')        setTradeState(msg.data)
-          if (msg.type === 'trade_opened') { setRefreshChart(r=>r+1) }
-          if (msg.type === 'trade_closed') { setRefreshChart(r=>r+1) }
-          if (msg.type === 'signal_event') {
-            if (!msg.data?.strategy || msg.data.strategy === strategyRef.current) {
-              setChartSignals(prev => [...(prev || []), msg.data])
-              setRefreshChart(r => r + 1)
+            if (msg.type === 'signal') {
+              if (!msg.data?.instrument || msg.data.instrument === instrumentRef.current)
+                setSignal(msg.data)
             }
-          }
-          if (msg.type === 'chart_signals_updated') {
-            // Backend just invalidated its chart-signals cache (new entry/exit) —
-            // refetch immediately instead of waiting for the next poll tick, so
-            // the chart doesn't lag behind real trading activity.
-            if (!msg.data?.strategy || msg.data.strategy === strategyRef.current) {
-              fetchChartSignalsRef.current && fetchChartSignalsRef.current()
+            if (msg.type === 'state')        setTradeState(msg.data)
+            if (msg.type === 'trade_opened') { setRefreshChart(r=>r+1) }
+            if (msg.type === 'trade_closed') { setRefreshChart(r=>r+1) }
+            if (msg.type === 'signal_event') {
+              if (!msg.data?.strategy || msg.data.strategy === strategyRef.current) {
+                setChartSignals(prev => [...(prev || []), msg.data])
+                setRefreshChart(r => r + 1)
+              }
             }
-          }
-          if (msg.type === 'init') {
-            setConnected(msg.data.connected)
-            if (msg.data.signal && (!msg.data.signal.instrument || msg.data.signal.instrument === instrumentRef.current))
-              setSignal(msg.data.signal)
-            if (msg.data.state)  setTradeState(msg.data.state)
-          }
+            if (msg.type === 'chart_signals_updated') {
+              // Backend just invalidated its chart-signals cache (new entry/exit) —
+              // refetch immediately instead of waiting for the next poll tick, so
+              // the chart doesn't lag behind real trading activity.
+              if (!msg.data?.strategy || msg.data.strategy === strategyRef.current) {
+                fetchChartSignalsRef.current && fetchChartSignalsRef.current()
+              }
+            }
+            if (msg.type === 'init') {
+              setConnected(msg.data.connected)
+              if (msg.data.signal && (!msg.data.signal.instrument || msg.data.signal.instrument === instrumentRef.current))
+                setSignal(msg.data.signal)
+              if (msg.data.state)  setTradeState(msg.data.state)
+            }
+          } catch (e) {}
         }
         ws.onclose = () => {
+          if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
           timerId = setTimeout(() => {
-            delay = Math.min(delay * 2, 30000) // Double the backoff up to 30s
+            delay = Math.min(delay * 1.5, 5000) // Cap reconnect backoff at 5s max
             connect()
           }, delay)
         }
         wsRef.current = ws
       } catch (err) {
+        if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
         console.error("WebSocket connection failed:", err)
         timerId = setTimeout(() => {
-          delay = Math.min(delay * 2, 30000)
+          delay = Math.min(delay * 1.5, 5000)
           connect()
         }, delay)
       }
     }
     connect()
     return () => {
+      if (pingInterval) clearInterval(pingInterval)
       if (timerId) clearTimeout(timerId)
       wsRef.current?.close()
     }
@@ -6386,14 +6404,14 @@ export default function App() {
   const fetchChartSignals = React.useCallback(async () => {
     setChartSignalsLoading(true)
     try {
-      const r = await API.get(`/api/chart_signals?strategy=${strategy}&days=10`)
+      const r = await API.get(`/api/chart_signals?strategy=${strategy}&instrument=${instrument}&days=10`)
       if (r && r.signals) {
         setChartSignals(r.signals)
         setRefreshChart(c => c + 1)
       }
     } catch(e) { console.error('fetchChartSignals error:', e) }
     finally { setChartSignalsLoading(false) }
-  }, [strategy])
+  }, [strategy, instrument])
 
   // Keep ref in sync so WebSocket handler (created earlier) can call fetchChartSignals
   useEffect(() => { fetchChartSignalsRef.current = fetchChartSignals }, [fetchChartSignals])
@@ -6765,11 +6783,11 @@ export default function App() {
 
                   {/* Col 2: Secondary Strategy Signal */}
                   {(() => {
-                    const otherSignals = Object.entries(allSignals || {}).filter(([k]) => k !== strategy && k !== 'multi_agent')
+                    const otherSignals = Object.entries(allSignals || {}).filter(([k]) => ['regime_reversal','regime_trend_range'].includes(k) && k !== strategy)
                     if (otherSignals.length > 0) {
                       return otherSignals.map(([k, sig]) => (
                         <ErrorBoundary key={k}>
-                          <CompactSignalPanel signal={sig} ltp={ltp} lastEntry={lastEntries[k]} strategyLabel={{"regime_reversal":"Regime + Reversal Combined","multi_agent":"Multi-Agent Optimized","regime_trend_range":"Regime T/R Optimized"}[k] || k} />
+                          <CompactSignalPanel signal={sig} ltp={ltp} lastEntry={lastEntries[k]} strategyLabel={{"regime_reversal":"Regime + Reversal Combined","multi_agent":"Multi-Agent Optimized","regime_trend_range":"Regime T/R Optimized","regime_trend_v2":"Regime Trend V2 — Selective","regime_trend_v2b":"Regime Trend V2-B — Balanced","donchian_5m_swing":"Donchian 5m Swing","donchian_5m_intraday":"Donchian 5m Intraday"}[k] || k} />
                         </ErrorBoundary>
                       ))
                     } else {

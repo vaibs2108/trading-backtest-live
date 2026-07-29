@@ -73,15 +73,38 @@ class CandleBuilder:
             }
         else:
             # Same slot — update OHLCV
-            self._current["high"] = max(self._current["high"], price)
-            self._current["low"] = min(self._current["low"], price)
-            self._current["close"] = price
+            if self._current is None:
+                # slot was seeded/time-closed without an active candle — start one
+                self._current = {
+                    "timestamp": slot,
+                    "open": price, "high": price, "low": price, "close": price,
+                    "volume": 0,
+                }
+            else:
+                self._current["high"] = max(self._current["high"], price)
+                self._current["low"] = min(self._current["low"], price)
+                self._current["close"] = price
 
         # Volume is cumulative from exchange; we track it per candle
         # by storing last known volume and computing delta
         self._current["volume"] += volume if volume > 0 else 0
 
         return completed
+
+    def close_on_time(self, now_dt: datetime):
+        """Complete the current candle the moment the clock passes its slot end,
+        WITHOUT waiting for the first tick of the next slot. Returns the
+        completed candle dict, or None."""
+        if self._current is None or self._current_slot is None:
+            return None
+        slot_now = self._get_slot(now_dt)
+        if slot_now > self._current_slot:
+            completed = self._current.copy()
+            self.candles.append(completed)
+            self._current = None
+            self._current_slot = slot_now
+            return completed
+        return None
 
     def get_dataframe(self, include_current: bool = False) -> pd.DataFrame:
         """Return candle history as DataFrame matching the app's expected format."""
@@ -222,6 +245,20 @@ class LiveFeedManager:
                             logger.warning("LiveFeed WebSocket closed, reconnecting...")
                             break
                         logger.debug(f"Tick processing error: {tick_err}")
+                    # Time-based rollover: close candles at the boundary even if
+                    # the next tick hasn't arrived yet (millisecond-level closes)
+                    try:
+                        _now_ist = datetime.now(_IST)
+                        self.candle_1m.close_on_time(_now_ist)
+                        _c5 = self.candle_5m.close_on_time(_now_ist)
+                        if _c5:
+                            logger.info(
+                                f"5m candle closed (time rollover): {_c5['timestamp']} "
+                                f"C={_c5['close']:.2f}")
+                            if self._loop and self._candle_event:
+                                self._loop.call_soon_threadsafe(self._candle_event.set)
+                    except Exception as _ro_err:
+                        logger.debug(f"Rollover check error: {_ro_err}")
                     time.sleep(0.05)  # 50ms — fast enough for tick processing
 
             except Exception as e:
@@ -242,22 +279,66 @@ class LiveFeedManager:
             return
 
         ltp = float(ltp)
+
+        # Sanity guard: reject ticks wildly away from the last known price.
+        # Protects candles from wrong-instrument subscriptions / corrupt packets.
+        _anchor = self.last_price or 0.0
+        if _anchor <= 0:
+            try:
+                if self.candle_5m.candles:
+                    _anchor = float(self.candle_5m.candles[-1]["close"])
+            except Exception:
+                _anchor = 0.0
+        if _anchor > 0 and abs(ltp - _anchor) / _anchor > 0.10:
+            self._rejected_ticks = getattr(self, "_rejected_ticks", 0) + 1
+            if self._rejected_ticks % 200 == 1:
+                logger.warning(
+                    f"LiveFeed: REJECTED tick {ltp} vs anchor {_anchor:.1f} "
+                    f"(wrong instrument or corrupt feed? {self._rejected_ticks} rejected)")
+            return
+
         self.last_price = ltp
         self._tick_count += 1
 
         # Get tick time from data or use current time
         ltt = data.get("LTT") or data.get("ltt") or data.get("last_trade_time")
         if isinstance(ltt, (int, float)):
-            # EPOCH timestamp
+            # EPOCH timestamp — but Dhan segments are inconsistent about the
+            # epoch base (MCX quote packets send IST-shifted epochs, which
+            # would land candles 5h30m in the future). If the derived time
+            # disagrees with the wall clock by more than 3 minutes, trust
+            # the wall clock instead.
             tick_time = datetime.fromtimestamp(ltt, tz=_IST)
+            _now_chk = datetime.now(_IST)
+            if abs((tick_time - _now_chk).total_seconds()) > 180:
+                if getattr(self, "_ltt_warned", 0) < 3:
+                    self._ltt_warned = getattr(self, "_ltt_warned", 0) + 1
+                    logger.warning(
+                        f"LiveFeed: LTT {tick_time} deviates from wall clock "
+                        f"{_now_chk} — using wall clock for candle slots")
+                tick_time = _now_chk
         else:
             tick_time = datetime.now(_IST)
 
         self.last_tick_time = tick_time
 
         # Volume from tick (use 0 if not available — we'll use LTQ or delta)
-        vol = int(data.get("volume", 0) or 0)
-        ltq = int(data.get("LTQ") or data.get("ltq") or data.get("last_traded_qty") or 0)
+        try:
+            vol = int(float(data.get("volume", 0) or 0))
+        except Exception:
+            vol = 0
+        try:
+            ltq = int(float(data.get("LTQ") or data.get("ltq") or data.get("last_traded_qty") or 0))
+        except Exception:
+            ltq = 0
+        if ltq <= 0 and vol > 0:
+            # Index feeds carry no LTQ — use cumulative day-volume delta so
+            # live candle volume matches the historical API (backtest parity)
+            _delta = vol - getattr(self, "_last_cum_vol", 0)
+            if _delta < 0:
+                _delta = 0
+            self._last_cum_vol = vol
+            ltq = _delta
 
         # Feed ticks into candle builders
         self.candle_1m.on_tick(ltp, ltq, tick_time)

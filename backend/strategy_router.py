@@ -47,6 +47,10 @@ def add_indicators(df):
 STRATEGY_OPTIONS = {
     "regime_reversal": "Regime + Reversal Combined",
     "regime_trend_range": "Regime Trend/Range Optimized (6 agents)",
+    "regime_trend_v2": "Regime Trend V2 — Selective (optimized)",
+    "regime_trend_v2b": "Regime Trend V2-B — Balanced (runner-up)",
+    "donchian_5m_swing": "Donchian 5m Swing (overnight)",
+    "donchian_5m_intraday": "Donchian 5m Intraday (flat 15:15)",
 }
 
 

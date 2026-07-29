@@ -12,7 +12,62 @@ from typing import Optional, Tuple
 from config import get_settings, INSTRUMENT_META
 from dhanhq import dhanhq, DhanContext
 
+import threading
+
 logger = logging.getLogger(__name__)
+
+# ── Category-Aware Thread-Safe Rate Limiter ──────────────────────────────────
+_dhan_api_lock = threading.Lock()
+_last_call_by_category = {
+    "historical": 0.0,
+    "market_data": 0.0,
+    "user_data": 0.0,
+    "order": 0.0,
+    "default": 0.0,
+}
+
+_category_min_spacing = {
+    "historical": 1.05,   # 1.05s spacing for intraday & daily historical queries (Dhan HQ limit: 1 req/sec)
+    "market_data": 0.25,  # 250ms spacing for quotes/ticker/option-chain (Dhan HQ limit: 5 req/sec)
+    "user_data": 1.00,    # 1.00s spacing for balance/positions (Dhan HQ limit: 1 req/sec)
+    "order": 0.10,        # 100ms spacing for orders (Dhan HQ limit: 10 req/sec)
+    "default": 0.50,
+}
+
+def dhan_api_call(*args, **kwargs):
+    """
+    Thread-safe rate-limited wrapper adhering strictly to Dhan HQ API v2 rate limits.
+    Can be called as:
+      dhan_api_call(func, *args, **kwargs)
+      dhan_api_call("historical", func, *args, **kwargs)
+      dhan_api_call(category="market_data", func=func, ...)
+    """
+    global _last_call_by_category
+    category = "default"
+    func = None
+
+    if args:
+        if isinstance(args[0], str):
+            category = args[0]
+            func = args[1]
+            func_args = args[2:]
+        else:
+            func = args[0]
+            func_args = args[1:]
+    else:
+        category = kwargs.pop("category", "default")
+        func = kwargs.pop("func")
+        func_args = ()
+
+    min_spacing = _category_min_spacing.get(category, 0.50)
+    with _dhan_api_lock:
+        now = _time.time()
+        last_time = _last_call_by_category.get(category, 0.0)
+        elapsed = now - last_time
+        if elapsed < min_spacing:
+            _time.sleep(min_spacing - elapsed)
+        _last_call_by_category[category] = _time.time()
+        return func(*func_args, **kwargs)
 
 # ── Global client and facade instances ───────────────────────────────────────
 _dhan_client = None
@@ -284,7 +339,7 @@ def _get_ltp_data(symbols) -> dict:
                 symbol_map[str(sec_id)] = symbol
 
     try:
-        res = _dhan_client.ticker_data(instruments)
+        res = dhan_api_call("market_data", _dhan_client.ticker_data, instruments)
         ltps = {}
         if isinstance(res, dict) and res.get("status") == "success":
             inner = res.get("data", {}).get("data", {})
@@ -308,14 +363,19 @@ def get_ltp(instrument: str) -> Optional[float]:
     try:
         meta = INSTRUMENT_META.get(instrument, INSTRUMENT_META["BANKNIFTY"])
         if meta["exchange_index"] == "MCX":
-            fut_sym = get_futures_symbol(instrument, expiry=0)
-            ltps = _get_ltp_data([fut_sym])
-            val = ltps.get(fut_sym)
-            if not val:
-                fut_sym_next = get_futures_symbol(instrument, expiry=1)
-                logger.info(f"MCX {fut_sym} failed, trying next month: {fut_sym_next}")
-                ltps = _get_ltp_data([fut_sym_next])
-                val = ltps.get(fut_sym_next)
+            df_master = _load_instrument_df()
+            sym_idx = meta.get("symbol_index", instrument)
+            match = df_master[
+                (df_master['SEM_EXM_EXCH_ID'] == 'MCX') &
+                (df_master['SEM_INSTRUMENT_NAME'] == 'FUTCOM') &
+                ((df_master['SM_SYMBOL_NAME'] == sym_idx) | (df_master['SEM_TRADING_SYMBOL'].str.startswith(sym_idx)))
+            ]
+            if not match.empty:
+                active_sym = str(match.sort_values(by='SEM_EXPIRY_DATE').iloc[0]['SEM_TRADING_SYMBOL'])
+                ltps = _get_ltp_data([active_sym])
+                val = ltps.get(active_sym)
+            else:
+                val = None
         else:
             ltps = _get_ltp_data([instrument])
             val = ltps.get(instrument)
@@ -387,6 +447,37 @@ def get_index_security_id(symbol: str) -> Optional[str]:
     return fallbacks.get(symbol.upper())
 
 
+def get_feed_subscription(instrument: str):
+    """Resolve (security_id, exchange_segment) for the live tick feed.
+
+    INDEX instruments -> (index_security_id, "IDX_I").
+    MCX commodities  -> nearest FUTCOM contract on "MCX_COMM".
+    Returns None when unresolvable — the caller must NOT start the feed with
+    a guessed id (a wrong id silently streams another instrument's prices).
+    """
+    try:
+        meta = INSTRUMENT_META.get(instrument, {})
+        if meta.get("exchange_index") == "MCX":
+            df_master = _load_instrument_df()
+            symbol = meta.get("symbol_index", instrument)
+            match = df_master[
+                (df_master['SEM_EXM_EXCH_ID'] == 'MCX') &
+                (df_master['SEM_INSTRUMENT_NAME'] == 'FUTCOM') &
+                ((df_master['SM_SYMBOL_NAME'] == symbol) |
+                 (df_master['SEM_TRADING_SYMBOL'].str.startswith(symbol + '-')))
+            ]
+            if not match.empty:
+                row = match.sort_values(by='SEM_EXPIRY_DATE').iloc[0]
+                return str(row['SEM_SMST_SECURITY_ID']), "MCX_COMM"
+            logger.error(f"get_feed_subscription: no FUTCOM found for {symbol}")
+            return None
+        sec = get_index_security_id(instrument)
+        return (sec, "IDX_I") if sec else None
+    except Exception as e:
+        logger.error(f"get_feed_subscription failed for {instrument}: {e}")
+        return None
+
+
 def fetch_index_historical_data(
     instrument: str,
     timeframe: str,
@@ -414,7 +505,10 @@ def get_historical_data(
     import pytz
     now = datetime.now(pytz.timezone("Asia/Kolkata"))
     if cache_key in _hist_cache and cache_key in _hist_cache_time:
-        if (now - _hist_cache_time[cache_key]).total_seconds() < 120:
+        # Intraday frames must stay fresh (a 120s-stale 5m frame delays live
+        # signals by 1-2 candles); slow frames keep the long TTL.
+        _ttl = 20 if str(timeframe).upper() in ("1", "5") else 120
+        if (now - _hist_cache_time[cache_key]).total_seconds() < _ttl:
             return _hist_cache[cache_key].copy()
 
     if not _connected or _dhan_client is None:
@@ -488,7 +582,9 @@ def get_historical_data(
 
         all_dfs = []
         if timeframe.upper() == "DAY":
-            res = _dhan_client.historical_daily_data(
+            res = dhan_api_call(
+                "historical",
+                _dhan_client.historical_daily_data,
                 security_id=int(sec_id),
                 exchange_segment=exch_seg,
                 instrument_type=inst_type,
@@ -506,7 +602,9 @@ def get_historical_data(
                 curr_to = min(curr_from + timedelta(days=89), to_dt)
                 chunk_df = None
                 for attempt in range(3):
-                    res = _dhan_client.intraday_minute_data(
+                    res = dhan_api_call(
+                        "historical",
+                        _dhan_client.intraday_minute_data,
                         security_id=str(sec_id),
                         exchange_segment=exch_seg,
                         instrument_type=inst_type,
@@ -522,7 +620,7 @@ def get_historical_data(
                         res_str = str(res).lower()
                         is_rate_limit = any(x in res_str for x in ["dh-904", "rate_limit", "rate limit", "too many requests", "904"])
                         if is_rate_limit:
-                            wait_secs = 2 ** (attempt + 1)
+                            wait_secs = 0.5 * (attempt + 1)
                             logger.warning(f"Rate limited, retry {attempt+1}/3 in {wait_secs}s")
                             _time.sleep(wait_secs)
                         else:
@@ -1209,7 +1307,7 @@ def get_positions() -> pd.DataFrame:
     if not _connected or _dhan_client is None:
         return pd.DataFrame()
     try:
-        res = _dhan_client.get_positions()
+        res = dhan_api_call("user_data", _dhan_client.get_positions)
         if isinstance(res, dict) and "data" in res and res["data"]:
             df = pd.DataFrame(res["data"])
             _positions_cache = df
@@ -1277,7 +1375,7 @@ def get_balance() -> float:
     if not _connected or _dhan_client is None:
         return 0.0
     try:
-        res = _dhan_client.get_fund_limits()
+        res = dhan_api_call("user_data", _dhan_client.get_fund_limits)
         if isinstance(res, dict) and res.get("status") != "failure" and "data" in res:
             bal = float(res["data"].get("availabelBalance", 0.0))
             _balance_cache = bal

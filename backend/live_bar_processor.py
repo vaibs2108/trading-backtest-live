@@ -407,20 +407,62 @@ class RegimeReversalLiveProcessor(BacktestDiffProcessor):
     strategy_id = "regime_reversal"
 
 
+class RegimeTrendV2LiveProcessor(BacktestDiffProcessor):
+    """Regime Trend V2 — Selective (optimized winner)."""
+    strategy_id = "regime_trend_v2"
+
+
+class RegimeTrendV2BLiveProcessor(BacktestDiffProcessor):
+    """Regime Trend V2-B — Balanced (runner-up)."""
+    strategy_id = "regime_trend_v2b"
+
+
+class DonchianSwingLiveProcessor(BacktestDiffProcessor):
+    """Donchian 5m Swing (overnight-capable)."""
+    strategy_id = "donchian_5m_swing"
+
+
+class DonchianIntradayLiveProcessor(BacktestDiffProcessor):
+    """Donchian 5m Intraday (flat by 15:15)."""
+    strategy_id = "donchian_5m_intraday"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# SINGLETON INSTANCES
+# SINGLETON INSTANCES — created lazily, on first use.
+# Only strategies actually driven by the live loop get a processor instance;
+# exploration strategies cost nothing until they are promoted to live.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_regime_processor = RegimeLiveProcessor()
-_regime_reversal_processor = RegimeReversalLiveProcessor()
+_processors: Dict[str, BacktestDiffProcessor] = {}
+
+
+def _get_processor(cls) -> BacktestDiffProcessor:
+    p = _processors.get(cls.strategy_id)
+    if p is None:
+        p = cls()
+        _processors[cls.strategy_id] = p
+    return p
+
 
 def get_regime_processor() -> RegimeLiveProcessor:
-    return _regime_processor
+    return _get_processor(RegimeLiveProcessor)
 
 def get_regime_reversal_processor() -> RegimeReversalLiveProcessor:
-    return _regime_reversal_processor
+    return _get_processor(RegimeReversalLiveProcessor)
+
+def get_regime_v2_processor() -> RegimeTrendV2LiveProcessor:
+    return _get_processor(RegimeTrendV2LiveProcessor)
+
+def get_regime_v2b_processor() -> RegimeTrendV2BLiveProcessor:
+    return _get_processor(RegimeTrendV2BLiveProcessor)
+
+def get_donchian_swing_processor() -> DonchianSwingLiveProcessor:
+    return _get_processor(DonchianSwingLiveProcessor)
+
+def get_donchian_intraday_processor() -> DonchianIntradayLiveProcessor:
+    return _get_processor(DonchianIntradayLiveProcessor)
 
 def reset_all_processors():
-    """Reset all processors — call at daily boundary."""
-    _regime_processor.reset()
-    _regime_reversal_processor.reset()
+    """Reset the processors that are actually in use — call at daily boundary."""
+    for p in _processors.values():
+        p.reset()

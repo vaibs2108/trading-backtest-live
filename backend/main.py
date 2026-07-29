@@ -1045,7 +1045,7 @@ async def get_live_feed_status():
 
 
 @app.get("/api/chart_signals")
-async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
+async def get_chart_signals(strategy: Optional[str] = None, instrument: Optional[str] = None, days: int = 10):
     """Run backtest for the selected strategy and return entry/exit markers for chart overlay.
 
     This mirrors TradingView behaviour: applying a strategy shows signals
@@ -1053,18 +1053,20 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
     """
     cfg = get_settings()
     strat = strategy or cfg.strategy
+    inst = instrument or cfg.instrument
 
     # Check backtest result cache first (valid for 10s so chart stays in live sync with backtest)
     import time as _t
     _now = _t.time()
-    _bt_cache = _chart_signals_cache.get(strat)
+    cache_key = f"{strat}_{inst}"
+    _bt_cache = _chart_signals_cache.get(cache_key)
 
     # When the market is closed, the underlying candles can't change until the next
     # session opens — reuse whatever we last computed instead of re-fetching historical
     # data and re-running a full multi-hundred-bar backtest on every dashboard poll.
     import pytz as _pytz
     _now_ist = datetime.now(_pytz.timezone("Asia/Kolkata"))
-    _inst_exch = INSTRUMENT_META.get(cfg.instrument, {}).get("exchange_index", "INDEX")
+    _inst_exch = INSTRUMENT_META.get(inst, {}).get("exchange_index", "INDEX")
     if _inst_exch == "MCX":
         _mkt_open = (_now_ist.hour >= 9) and (_now_ist.hour < 23 or (_now_ist.hour == 23 and _now_ist.minute <= 30))
     else:
@@ -1079,18 +1081,30 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
     else:
         # Use cached frames from the polling loop if available and fresh (< 3 min)
         _cache_age = _now - _cached_frames_ts
-        if _cached_frames and _cached_frames_instrument == cfg.instrument and _cache_age < 180:
+        if _cached_frames and _cached_frames_instrument == inst and _cache_age < 180:
             frames = _cached_frames
         else:
-            frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument)
+            frames = await asyncio.to_thread(_fetch_all_frames, inst)
 
         if frames:
             def _run_bt():
                 try:
                     import strategy_router
-                    return strategy_router.run_backtest(frames)
+                    # Run for the REQUESTED strategy and instrument — override cfg
+                    # for the duration of this call so router executes correctly.
+                    _orig_strat = cfg.strategy
+                    _orig_inst = cfg.instrument
+                    if strat != _orig_strat:
+                        cfg.strategy = strat
+                    if inst != _orig_inst:
+                        cfg.instrument = inst
+                    try:
+                        return strategy_router.run_backtest(frames)
+                    finally:
+                        cfg.strategy = _orig_strat
+                        cfg.instrument = _orig_inst
                 except Exception as e:
-                    logger.error(f"chart_signals backtest error ({strat}): {e}")
+                    logger.error(f"chart_signals backtest error ({strat} for {inst}): {e}")
                     return None
 
             result = await asyncio.to_thread(_run_bt)
@@ -1120,7 +1134,7 @@ async def get_chart_signals(strategy: Optional[str] = None, days: int = 10):
                             "pnl": t.get("pnl", 0), "pnl_pts": t.get("pnl_pts", 0),
                             "strategy": strat,
                         })
-                _chart_signals_cache[strat] = {"result": {"signals": signals, "strategy": strat}, "ts": _now}
+                _chart_signals_cache[cache_key] = {"result": {"signals": signals, "strategy": strat, "instrument": inst}, "ts": _now}
 
     # Sort all markers chronologically by timestamp
     def _norm_ts(ts_val) -> str:
@@ -1630,6 +1644,17 @@ async def websocket_endpoint(ws: WebSocket):
         logger.info("WebSocket client disconnected")
 
 
+async def _heartbeat_loop():
+    """Periodically update data/heartbeat.json so watchdog knows main.py is alive."""
+    from watchdog import write_heartbeat
+    while True:
+        try:
+            write_heartbeat()
+        except Exception as e:
+            logger.debug(f"Heartbeat write error: {e}")
+        await asyncio.sleep(10)
+
+
 # ── Background polling (auto-signal every 5 min bar) ─────────────────────────
 
 @app.on_event("startup")
@@ -1654,11 +1679,14 @@ async def startup_event():
     if broker.is_connected():
         try:
             _feed = get_live_feed()
-            _sec_id = broker.get_index_security_id(cfg.instrument) or "25"
+            _sub = broker.get_feed_subscription(cfg.instrument)
+            if _sub is None:
+                raise RuntimeError(f"cannot resolve feed subscription for {cfg.instrument}")
+            _sec_id, _exch_seg = _sub
             _feed.configure(
                 instrument=cfg.instrument,
                 security_id=_sec_id,
-                exchange_segment="IDX_I",
+                exchange_segment=_exch_seg,
                 loop=asyncio.get_event_loop(),
             )
             # Seed with historical candles so indicators work from first tick
@@ -1702,6 +1730,7 @@ async def startup_event():
     ct.update_config(cfg.starting_capital)
 
     asyncio.create_task(_signal_polling_loop())
+    asyncio.create_task(_heartbeat_loop())
 
     # Mark app as running for watchdog crash detection
     try:
@@ -2002,6 +2031,62 @@ def _check_virtual_exits(ltp: float, cfg, frames=None, latest_candle_ts: str = N
         logger.error(f"Error checking virtual exits: {e}")
 
 
+_feed_restart_last_attempt = 0.0
+
+async def _ensure_live_feed(cfg, now_ist):
+    """Live-feed watchdog: (re)start the tick feed if it is down, or rebind it
+    when the configured instrument changed. Without this, a dead feed silently
+    degrades the app to 15s polling + stale REST data (1-2 candle signal lag).
+    Throttled to one attempt per 90s."""
+    global _feed_restart_last_attempt
+    import time as _t
+    _feed = get_live_feed()
+    wrong_inst = getattr(_feed, "_instrument", None) != cfg.instrument
+    if _feed.is_running and not wrong_inst:
+        return
+    if _t.time() - _feed_restart_last_attempt < 90:
+        return
+    _feed_restart_last_attempt = _t.time()
+    reason = "wrong instrument" if (_feed.is_running and wrong_inst) else "not running"
+    logger.warning(f"Live feed {reason} — (re)starting for {cfg.instrument}")
+    add_activity_log(f"Live feed restart ({reason}): {cfg.instrument}")
+    _old_thread = getattr(_feed, "_thread", None)
+    try:
+        _feed.stop()
+    except Exception:
+        pass
+    if _old_thread is not None and _old_thread.is_alive():
+        await asyncio.to_thread(_old_thread.join, 6.0)
+    try:
+        _sub = await asyncio.to_thread(broker.get_feed_subscription, cfg.instrument)
+        if _sub is None:
+            logger.error(f"Feed watchdog: cannot resolve subscription for {cfg.instrument} — "
+                         "staying on REST polling")
+            return
+        _sec_id, _exch_seg = _sub
+        _feed.configure(instrument=cfg.instrument, security_id=_sec_id,
+                        exchange_segment=_exch_seg, loop=asyncio.get_event_loop())
+        _feed.last_price = 0.0
+        _feed._rejected_ticks = 0
+        # fresh builders so candles from the old instrument never mix in
+        from live_feed import CandleBuilder
+        _feed.candle_1m = CandleBuilder(1, max_candles=500)
+        _feed.candle_5m = CandleBuilder(5, max_candles=2000)
+        _hist_5m = await asyncio.to_thread(
+            broker.get_historical_data, cfg.instrument, "5",
+            (now_ist - timedelta(days=30)).strftime("%Y-%m-%d"),
+            (now_ist + timedelta(days=1)).strftime("%Y-%m-%d"))
+        _hist_1m = await asyncio.to_thread(
+            broker.get_historical_data, cfg.instrument, "1",
+            (now_ist - timedelta(days=5)).strftime("%Y-%m-%d"),
+            (now_ist + timedelta(days=1)).strftime("%Y-%m-%d"))
+        _feed.seed_candles(_hist_5m, _hist_1m)
+        _feed.start(cfg.dhan_client_code, cfg.dhan_access_token)
+        add_activity_log(f"Live market feed restarted for {cfg.instrument}")
+    except Exception as _fs_err:
+        logger.error(f"Live feed restart failed: {_fs_err}")
+
+
 async def _signal_polling_loop():
     """Poll for new signals — driven by live feed candle events (1-2s latency)
     with 15s fallback if live feed is not connected."""
@@ -2029,7 +2114,7 @@ async def _signal_polling_loop():
 
             if not broker.is_connected():
                 continue
-            
+
             add_activity_log("Engine Heartbeat: Active & monitoring status.")
             import pytz
             now = datetime.now(pytz.timezone("Asia/Kolkata"))
@@ -2052,6 +2137,12 @@ async def _signal_polling_loop():
             if not _is_open:
                 continue
 
+            # Keep the tick feed alive and bound to the right instrument
+            try:
+                await _ensure_live_feed(cfg, now)
+            except Exception as _fw_err:
+                logger.debug(f"Live feed watchdog error: {_fw_err}")
+
             frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument)
 
             # Cache frames for chart_signals endpoint (avoids 12.5s re-fetch)
@@ -2067,7 +2158,10 @@ async def _signal_polling_loop():
                 latest_bar = frames["5"].iloc[-1]
                 latest_ts = latest_bar.get("timestamp")
                 try:
-                    _c_time = int(pd.to_datetime(latest_bar["timestamp"]).timestamp()) + 19800
+                    _c_ts = pd.to_datetime(latest_bar["timestamp"])
+                    if getattr(_c_ts, "tzinfo", None) is not None:
+                        _c_ts = _c_ts.tz_convert("Asia/Kolkata").tz_localize(None)
+                    _c_time = int(_c_ts.timestamp()) + 19800
                     await ws_manager.broadcast({
                         "type": "candle_update",
                         "instrument": cfg.instrument,
@@ -2178,10 +2272,19 @@ async def _signal_polling_loop():
 
                 _all_strat_sigs = {}
 
-                for _strat_id, _processor in [
+                # Only the two PRODUCTION strategies run live. The
+                # exploration strategies (V2 / V2-B / Donchian) stay
+                # registered for the Backtest page but are not evaluated
+                # in the live loop until promoted.
+                _proc_list = [
                     ("regime_reversal", get_regime_reversal_processor()),
                     ("regime_trend_range", get_regime_processor()),
-                ]:
+                ]
+                # Active strategy FIRST — its chart marker, telegram alert and
+                # auto-trade execution must fire with minimum latency; the
+                # other strategies' virtual tracking follows right after.
+                _proc_list.sort(key=lambda _x: 0 if _x[0] == cfg.strategy else 1)
+                for _strat_id, _processor in _proc_list:
                     try:
                         new_signals = _processor.process_frames(frames, cfg, _qty)
 
@@ -4224,7 +4327,8 @@ def _check_data_staleness(frames: dict, cfg) -> None:
                 logger.info("Data freshness restored")
 
 
-_htf_cache = {}       # cached higher-TF frames: {instrument: {"1D": df, "60": df, "15": df}}
+_htf_cache = {}
+_rest_5m_cache: dict = {}  # instrument -> REST 5m base (volume-bearing)       # cached higher-TF frames: {instrument: {"1D": df, "60": df, "15": df}}
 _htf_cache_ts = 0.0   # last time HTF were fetched
 _htf_poll_count = 0   # cycle counter for periodic HTF refresh
 
@@ -4237,7 +4341,7 @@ def _fetch_all_frames(instrument: str) -> dict:
     """
     import time as _time_mod
     import pytz
-    global _htf_cache, _htf_cache_ts, _htf_poll_count
+    global _htf_cache, _htf_cache_ts, _htf_poll_count, _rest_5m_cache
 
     kolkata_tz = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(kolkata_tz)
@@ -4250,6 +4354,17 @@ def _fetch_all_frames(instrument: str) -> dict:
     htf_stale = (_htf_poll_count % 5 == 1) or not _htf_cache.get(instrument)
 
     if htf_stale:
+        # Refresh the REST 5m base too — it carries exchange volume (live tick
+        # candles for indices don't), keeping live evaluation identical to
+        # what the backtest engine sees.
+        try:
+            _from5 = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
+            _df5 = broker.get_historical_data(instrument, "5", _from5, today)
+            if _df5 is not None and len(_df5) >= 30:
+                _rest_5m_cache[instrument] = _df5
+            _time_mod.sleep(0.3)
+        except Exception as _r5_err:
+            logger.debug(f"REST 5m base refresh failed: {_r5_err}")
         for tf_key, days in [("1D", 1000), ("60", 120), ("15", 60)]:
             tf_dhan = "DAY" if tf_key == "1D" else tf_key
             from_d = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -4265,12 +4380,46 @@ def _fetch_all_frames(instrument: str) -> dict:
 
     # Fast timeframes: prefer live feed candles (near-instant) with historical API fallback
     _feed = get_live_feed()
-    if _feed.is_running and len(_feed.candle_5m.candles) >= 50:
+    _feed_ok = (_feed.is_running
+                and getattr(_feed, "_instrument", None) == instrument
+                and len(_feed.candle_5m.candles) >= 50)
+    if _feed_ok:
         # Use live feed candles — already up-to-date from WebSocket ticks
         live_5m = _feed.get_live_candles("5")
         if live_5m is not None and len(live_5m) >= 50:
-            frames["5"] = live_5m
+            # Merge: REST base (has exchange volume, identical to backtest
+            # data) + live-built candles newer than the REST base's last bar.
+            _rest_base = _rest_5m_cache.get(instrument)
+            if _rest_base is not None and len(_rest_base) > 0:
+                _last_rest_ts = _rest_base["timestamp"].max()
+                _tail = live_5m[live_5m["timestamp"] > _last_rest_ts]
+                frames["5"] = pd.concat([_rest_base, _tail], ignore_index=True)
+            else:
+                frames["5"] = live_5m
             logger.debug(f"Using live feed 5m candles ({len(live_5m)} bars)")
+
+            # ── Freshness guard ──────────────────────────────────────────
+            # If the merged frame's newest bar is older than ~7 minutes, the
+            # live tail isn't contributing (feed gap / rejected ticks / bad
+            # stamps). Don't wait for the next HTF cycle — force-refresh the
+            # REST base NOW so signals never stall on a 25-minute cadence.
+            try:
+                _last5_ts = pd.to_datetime(frames["5"]["timestamp"].max())
+                _now_naive = datetime.now(_IST).replace(tzinfo=None)
+                _age_min = (_now_naive - _last5_ts).total_seconds() / 60.0
+                if _age_min > 7:
+                    logger.warning(
+                        f"5m frame stale ({_age_min:.1f} min old) despite live feed — "
+                        f"forcing REST refresh")
+                    _from5f = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
+                    _df5f = broker.get_historical_data(instrument, "5", _from5f, today)
+                    if _df5f is not None and len(_df5f) >= 30:
+                        _rest_5m_cache[instrument] = _df5f
+                        _last_rest_ts = _df5f["timestamp"].max()
+                        _tail = live_5m[live_5m["timestamp"] > _last_rest_ts]
+                        frames["5"] = pd.concat([_df5f, _tail], ignore_index=True)
+            except Exception as _fg_err:
+                logger.debug(f"5m freshness guard error: {_fg_err}")
         else:
             # Fallback to historical API
             from_d = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")

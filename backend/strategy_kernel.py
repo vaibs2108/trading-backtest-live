@@ -268,6 +268,20 @@ def init_kernels():
         logger.error(f"Failed to register RegimeTrendKernel: {e}")
 
     try:
+        from strategies.regime_trend_v2_kernel import RegimeTrendV2Kernel, RegimeTrendV2BKernel
+        register_kernel(RegimeTrendV2Kernel())
+        register_kernel(RegimeTrendV2BKernel())
+    except Exception as e:
+        logger.error(f"Failed to register RegimeTrendV2 kernels: {e}")
+
+    try:
+        from strategies.donchian_kernel import DonchianSwingKernel, DonchianIntradayKernel
+        register_kernel(DonchianSwingKernel())
+        register_kernel(DonchianIntradayKernel())
+    except Exception as e:
+        logger.error(f"Failed to register Donchian kernels: {e}")
+
+    try:
         from strategies.regime_reversal_kernel import RegimeReversalKernel
         register_kernel(RegimeReversalKernel())
     except Exception as e:

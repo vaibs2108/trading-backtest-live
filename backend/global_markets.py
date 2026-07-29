@@ -1286,7 +1286,7 @@ def fetch_oi_expiry_list(instrument: str = "BANKNIFTY") -> dict:
         exch_seg = OI_EXCHANGE_SEGMENTS.get(instrument.upper(), "IDX_I")
         if not sec_id:
             return result
-        resp = client.expiry_list(under_security_id=sec_id, under_exchange_segment=exch_seg)
+        resp = broker.dhan_api_call("market_data", client.expiry_list, under_security_id=sec_id, under_exchange_segment=exch_seg)
         if isinstance(resp, dict) and resp.get("status") == "success":
             dates = resp.get("data", [])
             if isinstance(dates, dict):
@@ -1325,11 +1325,17 @@ def fetch_oi_analysis(instrument: str = "BANKNIFTY", expiry: str = None) -> dict
             _set_cached(cache_key, result)
             return result
 
+        if instrument.upper() in ("CRUDEOIL", "CRUDEOILM", "NATURALGAS", "GOLD", "SILVER"):
+            result["error"] = f"Dhan API does not provide Option Chain / OI data for MCX Commodities ({instrument}). Futures trading and live signals are 100% active."
+            result["status"] = "unsupported_commodity"
+            _set_cached(cache_key, result)
+            return result
+
         client = broker._dhan_client
         sec_id = OI_SECURITY_IDS.get(instrument.upper(), DHAN_INDEX_IDS.get(instrument.upper()))
         exch_seg = OI_EXCHANGE_SEGMENTS.get(instrument.upper(), "IDX_I")
         if not sec_id:
-            result["error"] = f"Unknown instrument: {instrument}"
+            result["error"] = f"Option chain unsupported for instrument: {instrument}"
             _set_cached(cache_key, result)
             return result
 
@@ -1347,7 +1353,9 @@ def fetch_oi_analysis(instrument: str = "BANKNIFTY", expiry: str = None) -> dict
 
         # 2. Fetch option chain
         # Dhan API: POST /optionchain → {"data": {"last_price": ..., "oc": {...}}, "status": "success"}
-        oc_resp = client.option_chain(
+        oc_resp = broker.dhan_api_call(
+            "market_data",
+            client.option_chain,
             under_security_id=sec_id,
             under_exchange_segment=exch_seg,
             expiry=nearest_expiry
