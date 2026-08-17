@@ -53,25 +53,31 @@ def write_heartbeat():
     HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
     HEARTBEAT_FILE.write_text(json.dumps({
         "pid": os.getpid(),
+        "timestamp": time.time(),
         "time": datetime.now(_IST).isoformat(),
-        "uptime_seconds": time.time(),
     }), encoding="utf-8")
 
 
 def check_heartbeat() -> bool:
     """Check if the app has written a heartbeat recently."""
     if not HEARTBEAT_FILE.exists():
-        return False
+        return True  # Allow time on fresh startup before first heartbeat is written
     try:
         data = json.loads(HEARTBEAT_FILE.read_text(encoding="utf-8"))
+        ts = data.get("timestamp")
+        if ts is not None:
+            age = time.time() - float(ts)
+            return age < HEARTBEAT_TIMEOUT
+        
         last_beat = datetime.fromisoformat(data["time"])
-        # Ensure timezone comparison works: if last_beat is naive, localize it
         if last_beat.tzinfo is None:
             last_beat = _IST.localize(last_beat)
-        age = (datetime.now(_IST) - last_beat).total_seconds()
+        now = datetime.now(_IST)
+        age = abs((now - last_beat).total_seconds())
         return age < HEARTBEAT_TIMEOUT
-    except Exception:
-        return False
+    except Exception as ex:
+        log.warning(f"Transient error reading heartbeat file: {ex}")
+        return True  # Prevent false positive kill on file read lock
 
 
 def save_app_state(state: str, details: str = ""):
@@ -93,6 +99,25 @@ def check_last_state() -> dict:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {"state": "UNKNOWN", "details": "Could not read state file"}
+
+
+def free_port(port=8000):
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('127.0.0.1', int(port))) == 0:
+                log.warning(f"Port {port} is busy. Clearing existing process...")
+                if sys.platform == 'win32':
+                    ps_cmd = (
+                        f"Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | "
+                        f"Select-Object -ExpandProperty OwningProcess | "
+                        f"Where-Object {{ $_ -gt 0 }} | "
+                        f"ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"
+                    )
+                    subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True)
+                time.sleep(1.5)
+    except Exception as ex:
+        log.warning(f"Error freeing port {port}: {ex}")
 
 
 def run_watchdog():
@@ -147,9 +172,15 @@ def run_watchdog():
         # Start the app
         log.info(f"Starting app (attempt #{restart_count + 1})")
         save_app_state("RUNNING", f"Started by watchdog, attempt #{restart_count + 1}")
+        if HEARTBEAT_FILE.exists():
+            try:
+                HEARTBEAT_FILE.unlink()
+            except Exception:
+                pass
 
         try:
             port = os.environ.get("PORT", "8000")
+            free_port(port)
             cmd = [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", str(port)]
             creation_flags = 0
             if sys.platform == "win32":

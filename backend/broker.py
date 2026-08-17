@@ -801,7 +801,21 @@ def verify_order_fill(order_id: str, timeout: int = 15) -> dict:
     """
     Poll get_order_by_id until status is FILLED, REJECTED, or CANCELLED.
     Raises TimeoutError or RuntimeError on failures.
+
+    Fast path: if order_update_feed's Order Update WebSocket is connected
+    and delivers a push for this order_id, the wait below returns almost
+    immediately instead of waiting out the fixed poll interval -- but the
+    actual status decision below is UNCHANGED, still the same
+    get_order_by_id + orderStatus parsing as before. The WS push is only
+    ever used as an early wake-up trigger, never as the status source
+    itself (see order_update_feed.py's module docstring for why).
     """
+    try:
+        import order_update_feed
+        order_update_feed.register(order_id)
+    except Exception:
+        order_update_feed = None
+
     start_time = _time.time()
     while _time.time() - start_time < timeout:
         try:
@@ -812,12 +826,16 @@ def verify_order_fill(order_id: str, timeout: int = 15) -> dict:
                 status = order_data.get("orderStatus")
                 if status in ["TRADED", "FILLED"]:
                     logger.info(f"Order {order_id} filled successfully (status={status}).")
+                    if order_update_feed:
+                        order_update_feed.unregister(order_id)
                     return order_data
                 elif status == "PART_TRADED":
                     logger.info(f"Order {order_id} partially traded. Waiting for complete execution...")
                 elif status in ["REJECTED", "CANCELLED", "EXPIRED"]:
                     reason = order_data.get("rejectReason") or "Order cancelled, rejected, or expired."
                     logger.error(f"Order {order_id} failed with status {status}. Reason: {reason}")
+                    if order_update_feed:
+                        order_update_feed.unregister(order_id)
                     raise RuntimeError(f"Order failed: {status}. Reason: {reason}")
             elif isinstance(res, dict) and res.get("status") == "failure":
                 remarks = res.get("remarks") or "Unknown API failure"
@@ -827,7 +845,13 @@ def verify_order_fill(order_id: str, timeout: int = 15) -> dict:
         except Exception as e:
             logger.warning(f"Error querying status for order {order_id}: {e}")
 
-        _time.sleep(0.5)
+        if order_update_feed:
+            order_update_feed.wait_for_update(order_id, timeout=0.5)
+        else:
+            _time.sleep(0.5)
+
+    if order_update_feed:
+        order_update_feed.unregister(order_id)
 
     raise TimeoutError(f"Order {order_id} fill verification timed out after {timeout} seconds.")
 
@@ -906,8 +930,9 @@ def place_entry_order(
         cfg = get_settings()
         dhan_product_type = "MARGIN" if cfg.product_type == "NRML" else "INTRADAY"
 
-        # 3. Call Place Order
-        res = _dhan_client.place_order(
+        # 3. Call Place Order (rate-limited: DhanHQ v2 caps order APIs at ~10/sec)
+        res = dhan_api_call(
+            "order", _dhan_client.place_order,
             security_id=security_id,
             exchange_segment=exch_seg,
             transaction_type=transaction,
@@ -996,7 +1021,8 @@ def place_exit_order(symbol: str, exchange: str, direction: str, qty: int) -> di
         cfg = get_settings()
         dhan_product_type = "MARGIN" if cfg.product_type == "NRML" else "INTRADAY"
 
-        res = _dhan_client.place_order(
+        res = dhan_api_call(
+            "order", _dhan_client.place_order,
             security_id=security_id,
             exchange_segment=exch_seg,
             transaction_type=transaction,
@@ -1091,7 +1117,8 @@ def place_broker_sl(symbol: str, exchange: str, direction: str, quantity: int, t
             f"trigger={rounded_trigger} price={limit_price} (txn={transaction})"
         )
 
-        res = _dhan_client.place_order(
+        res = dhan_api_call(
+            "order", _dhan_client.place_order,
             security_id=security_id,
             exchange_segment=exch_seg,
             transaction_type=transaction,
@@ -1130,7 +1157,8 @@ def modify_broker_sl(order_id: str, quantity: int, new_trigger_price: float, is_
     logger.info(f"Modifying broker-side SL order {order_id} ({order_type_str}) trigger: {rounded_trigger}, price: {limit_price}")
 
     try:
-        res = _dhan_client.modify_order(
+        res = dhan_api_call(
+            "order", _dhan_client.modify_order,
             order_id=order_id,
             order_type=order_type_str,
             leg_name=None,
@@ -1160,7 +1188,7 @@ def cancel_broker_sl(order_id: str):
 
     logger.info(f"Cancelling broker-side SL order: {order_id}")
     try:
-        res = _dhan_client.cancel_order(order_id)
+        res = dhan_api_call("order", _dhan_client.cancel_order, order_id)
         if not res or res.get("status") == "failure":
             remarks = res.get("remarks") or "Unknown failure"
             logger.warning(f"Failed to cancel broker SL {order_id}: {remarks}")

@@ -13,6 +13,14 @@ yfinance>=0.2.36
 pandas>=2.2.0
 pandas-ta
 numpy>=1.26.0
+
+# ── Research Studio: optional Pine Script syntax pre-check ───────────────────
+# Used only as a fast, no-op-if-missing sanity check on pasted Pine Script
+# before spending an AI/local conversion attempt on clearly malformed input
+# (see strategy_sandbox.py PineSyntaxChecker). Not required for the app to
+# run — /api/research/convert works fine without it, just without the
+# early syntax check.
+pynescript>=0.3.0
 #scikit-learn>=1.4.0
 #xgboost>=2.0.0
 joblib>=1.3.0

@@ -344,11 +344,14 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
             exit_price = curr_close
             reason = ""
 
-            # SL check (band-based)
+            # SL check (band-based with OHLC realism & gap handling)
             if position == "LONG":
                 if bl <= sl:
                     exit_trade = True
-                    exit_price = sl
+                    # Fill at gap-down open if open < sl, otherwise at sl
+                    exit_price = min(open_arr[i], sl)
+                    # Realism cap: exit price cannot exceed candle [low, high]
+                    exit_price = max(bl, min(bh, exit_price))
                     reason = "SL_HIT"
                 elif top_sig[i]:
                     # Bearish reversal → exit LONG
@@ -358,7 +361,10 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
             elif position == "SHORT":
                 if bh >= sl:
                     exit_trade = True
-                    exit_price = sl
+                    # Fill at gap-up open if open > sl, otherwise at sl
+                    exit_price = max(open_arr[i], sl)
+                    # Realism cap: exit price cannot exceed candle [low, high]
+                    exit_price = max(bl, min(bh, exit_price))
                     reason = "SL_HIT"
                 elif bot_sig[i]:
                     # Bullish reversal → exit SHORT
@@ -382,53 +388,41 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                     "exit_reason": reason
                 })
 
-                # Immediate re-entry on reversal signal
-                if reason == "BEARISH_REVERSAL":
-                    # Bearish reversal → enter SHORT
-                    if i + 1 < n:
-                        entry_price = float(open_arr[i + 1])
-                    else:
-                        entry_price = curr_close
+                # Immediate re-entry on reversal signal at next bar's Open
+                if reason == "BEARISH_REVERSAL" and i + 1 < n:
+                    entry_price = float(open_arr[i + 1])
                     position = "SHORT"
-                    entry_idx = i
-                    # SL = upper band (above entry for SHORT)
-                    sl = upper[i] if not np.isnan(upper[i]) else entry_price + 1.5 * atr_arr[i]
+                    entry_idx = i + 1
+                    band_sl = upper[i] if not np.isnan(upper[i]) else entry_price + 1.5 * atr_arr[i]
+                    sl = max(band_sl, entry_price + 0.5 * atr_arr[i])
                     continue
-                elif reason == "BULLISH_REVERSAL":
-                    # Bullish reversal → enter LONG
-                    if i + 1 < n:
-                        entry_price = float(open_arr[i + 1])
-                    else:
-                        entry_price = curr_close
+                elif reason == "BULLISH_REVERSAL" and i + 1 < n:
+                    entry_price = float(open_arr[i + 1])
                     position = "LONG"
-                    entry_idx = i
-                    # SL = lower band (below entry for LONG)
-                    sl = lower[i] if not np.isnan(lower[i]) else entry_price - 1.5 * atr_arr[i]
+                    entry_idx = i + 1
+                    band_sl = lower[i] if not np.isnan(lower[i]) else entry_price - 1.5 * atr_arr[i]
+                    sl = min(band_sl, entry_price - 0.5 * atr_arr[i])
                     continue
                 else:
                     position = "NONE"
 
         # ── Check entries ──
-        if position == "NONE":
+        if position == "NONE" and i + 1 < n:
             if bot_sig[i]:
-                # Bullish reversal → enter LONG
-                if i + 1 < n:
-                    entry_price = float(open_arr[i + 1])
-                else:
-                    entry_price = curr_close
+                # Bullish reversal → enter LONG at next bar's Open
+                entry_price = float(open_arr[i + 1])
                 position = "LONG"
-                entry_idx = i
-                sl = lower[i] if not np.isnan(lower[i]) else entry_price - 1.5 * atr_arr[i]
+                entry_idx = i + 1
+                band_sl = lower[i] if not np.isnan(lower[i]) else entry_price - 1.5 * atr_arr[i]
+                sl = min(band_sl, entry_price - 0.5 * atr_arr[i])
 
             elif top_sig[i]:
-                # Bearish reversal → enter SHORT
-                if i + 1 < n:
-                    entry_price = float(open_arr[i + 1])
-                else:
-                    entry_price = curr_close
+                # Bearish reversal → enter SHORT at next bar's Open
+                entry_price = float(open_arr[i + 1])
                 position = "SHORT"
-                entry_idx = i
-                sl = upper[i] if not np.isnan(upper[i]) else entry_price + 1.5 * atr_arr[i]
+                entry_idx = i + 1
+                band_sl = upper[i] if not np.isnan(upper[i]) else entry_price + 1.5 * atr_arr[i]
+                sl = max(band_sl, entry_price + 0.5 * atr_arr[i])
 
     # Include open position so chart shows live entry marker
     if position != "NONE":

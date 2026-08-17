@@ -115,18 +115,133 @@ class SignalEvent:
 # Strategy Kernel ABC
 # ═════════════════════════════════════════════════════════════════════════════
 
-class StrategyKernel(ABC):
-    """Abstract base class for all trading strategies.
-
-    Modeled on TradingView's Pine Script execution model:
-      - on_bar() is the SINGLE entry point — called for every completed bar
-      - Same function for backtest AND live
-      - Each strategy manages its own state (regime, trailing SL, etc.)
-      - run_backtest() loops on_bar() — subclasses MUST override to implement
-        their own trade management (SL logic, trailing, EOD exits)
+def format_and_enrich_backtest_result(res: dict, frames: dict = None, initial_capital: float = 500_000.0,
+                                       start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
     """
+    Guarantees that every backtest result dictionary contains standard 'trades', 'stats', and 'equity_curve' keys.
+    Computes quantitative metrics and equity curve automatically if not provided by the strategy.
+    Standardizes trade directions to uppercase 'LONG' / 'SHORT' and applies date filtering.
+    """
+    if not isinstance(res, dict):
+        res = {"trades": []}
 
-    # ── Identity (subclasses MUST set these) ────────────────────────────
+    raw_trades = res.get("trades") or res.get("closed_trades") or []
+    formatted_trades = []
+
+    import pandas as pd
+
+    s_dt = pd.to_datetime(start_date) if start_date else None
+    e_dt = pd.to_datetime(end_date) if end_date else None
+
+    for idx, t in enumerate(raw_trades):
+        if not isinstance(t, dict):
+            continue
+
+        e_time = t.get("entry_time")
+        if e_time:
+            try:
+                t_dt = pd.to_datetime(e_time)
+                if s_dt and t_dt < s_dt:
+                    continue
+                if e_dt and t_dt > e_dt:
+                    continue
+            except Exception:
+                pass
+
+        direction = str(t.get("direction", "LONG")).upper()
+        if direction not in ("LONG", "SHORT"):
+            direction = "LONG"
+
+        entry_p = float(t.get("entry_price") or 0.0)
+        exit_p = float(t.get("exit_price") or entry_p)
+        pnl_val = t.get("pnl")
+        if pnl_val is None:
+            pnl_pts = (exit_p - entry_p) if direction == "LONG" else (entry_p - exit_p)
+            pnl_val = pnl_pts * 15
+        else:
+            pnl_val = float(pnl_val)
+
+        trade_item = {
+            "trade_num": idx + 1,
+            "direction": direction,
+            "entry_time": str(e_time or "-"),
+            "entry_price": round(entry_p, 2),
+            "exit_time": str(t.get("exit_time") or "-"),
+            "exit_price": round(exit_p, 2),
+            "exit_reason": t.get("exit_reason") or "CLOSED",
+            "pnl": round(pnl_val, 2),
+            "pnl_pts": round(float(t.get("pnl_pts") or 0.0), 2),
+            "sl": float(t.get("sl") or 0.0),
+            "target1": float(t.get("target1") or 0.0),
+            "target2": float(t.get("target2") or 0.0),
+        }
+        formatted_trades.append(trade_item)
+
+    res["trades"] = formatted_trades
+
+    existing_stats = res.get("stats")
+    if not existing_stats or not isinstance(existing_stats, dict) or "win_rate_pct" not in existing_stats:
+        total_t = len(formatted_trades)
+        wins = [t for t in formatted_trades if t["pnl"] > 0]
+        losses = [t for t in formatted_trades if t["pnl"] < 0]
+        
+        gross_win = sum(t["pnl"] for t in wins)
+        gross_loss = abs(sum(t["pnl"] for t in losses))
+        total_pnl = sum(t["pnl"] for t in formatted_trades)
+        
+        win_rate = round((len(wins) / total_t) * 100, 2) if total_t > 0 else 0.0
+        profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else (round(gross_win, 2) if gross_win > 0 else 0.0)
+        avg_win = round(gross_win / len(wins), 2) if wins else 0.0
+        avg_loss = round(-gross_loss / len(losses), 2) if losses else 0.0
+        expectancy = round(total_pnl / total_t, 2) if total_t > 0 else 0.0
+
+        curr_capital = float(initial_capital)
+        peak = curr_capital
+        max_dd_val = 0.0
+        max_dd_pct = 0.0
+
+        equity_list = []
+        for t in formatted_trades:
+            curr_capital += t["pnl"]
+            if curr_capital > peak:
+                peak = curr_capital
+            dd = peak - curr_capital
+            if dd > max_dd_val:
+                max_dd_val = dd
+                if peak > 0:
+                    max_dd_pct = (dd / peak) * 100
+
+            equity_list.append({
+                "time": t["entry_time"],
+                "equity": round(curr_capital, 2),
+                "pnl": t["pnl"]
+            })
+
+        res["stats"] = {
+            "total_trades": total_t,
+            "winning_trades": len(wins),
+            "losing_trades": len(losses),
+            "win_rate_pct": win_rate,
+            "profit_factor": profit_factor,
+            "total_pnl": round(total_pnl, 2),
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "max_drawdown_pts": round(max_dd_val, 2),
+            "max_drawdown_pct": round(max_dd_pct, 2),
+            "expectancy": expectancy,
+            "initial_capital": initial_capital,
+            "final_capital": round(curr_capital, 2)
+        }
+
+        if "equity_curve" not in res or not res["equity_curve"]:
+            res["equity_curve"] = equity_list
+
+    return res
+
+
+class StrategyKernel(ABC):
+    """Abstract base class for all trading strategies."""
+
     strategy_id: str = ""
     live_capable: bool = False
 
@@ -138,12 +253,28 @@ class StrategyKernel(ABC):
                           lot_size: int = 15, lot_multiplier: int = 1,
                           start_date: Optional[str] = None,
                           end_date: Optional[str] = None) -> dict:
-        """Thread-safe wrapper around run_backtest to prevent state race conditions."""
+        """Thread-safe wrapper around run_backtest to prevent state race conditions.
+
+        Also catches any exception raised by the strategy's own run_backtest()
+        (most likely a buggy custom/AI-generated strategy) and turns it into a
+        clean, structured error instead of letting a raw Python exception
+        surface all the way to the API caller — a broken custom strategy should
+        degrade gracefully (a clear message + zeroed stats), not blow up the
+        request or leave the Backtest page showing nothing at all.
+        """
         if not hasattr(self, "_lock"):
             import threading
             self._lock = threading.Lock()
         with self._lock:
-            return self.run_backtest(frames, initial_capital, lot_size, lot_multiplier, start_date, end_date)
+            try:
+                raw_res = self.run_backtest(frames, initial_capital, lot_size, lot_multiplier, start_date, end_date)
+            except Exception as e:
+                logger.error(f"[{getattr(self, 'strategy_id', '?')}] run_backtest() raised {type(e).__name__}: {e}", exc_info=True)
+                raw_res = {
+                    "error": f"Strategy code raised {type(e).__name__}: {e}",
+                    "trades": [],
+                }
+            return format_and_enrich_backtest_result(raw_res, frames, initial_capital, start_date, end_date)
 
     def get_current_signal(self, frames: dict, position: str = "NONE") -> dict:
         """Evaluate current signal state from trailing frames for manual/API queries."""
@@ -198,30 +329,14 @@ class StrategyKernel(ABC):
             "trade_source": self.strategy_id,
         }
 
-    @abstractmethod
     def on_bar(self, bar_idx: int, base_df, row, position: str,
                context: dict) -> Optional[SignalEvent]:
-        """Process one completed bar and return a signal (or None for HOLD).
+        """Process one completed bar and return a signal (or None for HOLD)."""
+        return None
 
-        Args:
-            bar_idx:   Index of the current bar in base_df
-            base_df:   Full DataFrame (session-filtered, indicators applied)
-            row:       Current bar (base_df.iloc[bar_idx])
-            position:  Current position state ("NONE", "LONG", "SHORT")
-            context:   Strategy-specific context dict with:
-                       - 'cfg': settings
-                       - 'df_1h', 'df_1d', 'df_1w': HTF frames (sliced to cur_ts)
-                       - Any additional state the strategy maintains
-
-        Returns:
-            SignalEvent if entry/exit signal, None for HOLD
-        """
-        ...
-
-    @abstractmethod
     def reset(self):
         """Reset all internal state. Called at daily boundary or restart."""
-        ...
+        pass
 
     @abstractmethod
     def run_backtest(self, frames: dict, initial_capital: float = 500_000,
@@ -288,21 +403,81 @@ def init_kernels():
         logger.error(f"Failed to register RegimeReversalKernel: {e}")
 
     try:
-        from strategies.trend_reversal_kernel import TrendReversalKernel
-        register_kernel(TrendReversalKernel())
-    except Exception as e:
-        logger.error(f"Failed to register TrendReversalKernel: {e}")
-
-    try:
         from strategies.multi_agent_kernel import MultiAgentV3Kernel
         register_kernel(MultiAgentV3Kernel())
     except Exception as e:
         logger.error(f"Failed to register MultiAgentV3Kernel: {e}")
 
+    # Dynamic Custom Strategy Auto-Discovery
+    try:
+        custom_dir = os.path.join(os.path.dirname(__file__), "strategies", "custom")
+        if os.path.exists(custom_dir):
+            import importlib.util
+            for fname in os.listdir(custom_dir):
+                if fname.endswith(".py") and not fname.startswith("__"):
+                    mod_path = os.path.join(custom_dir, fname)
+                    file_strat_id = fname[:-3]
+                    mod_name = f"strategies.custom.{file_strat_id}"
+                    try:
+                        spec = importlib.util.spec_from_file_location(mod_name, mod_path)
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        for item_name in dir(mod):
+                            obj = getattr(mod, item_name)
+                            if isinstance(obj, type) and issubclass(obj, StrategyKernel) and obj is not StrategyKernel:
+                                try:
+                                    inst = obj()
+                                    register_kernel(inst)
+                                    if file_strat_id and file_strat_id != inst.strategy_id:
+                                        _kernel_registry[file_strat_id] = inst
+                                        logger.info(f"Registered custom kernel alias: {file_strat_id} -> {inst.strategy_id}")
+                                except Exception as ex:
+                                    logger.warning(f"Could not instantiate custom kernel {item_name}: {ex}")
+                    except Exception as ex:
+                        logger.warning(f"Could not load custom strategy {fname}: {ex}")
+    except Exception as e:
+        logger.error(f"Failed to auto-discover custom strategy kernels: {e}")
+
+
+def reload_custom_kernels():
+    """Reload all dynamic custom kernels from backend/strategies/custom/."""
+    custom_dir = os.path.join(os.path.dirname(__file__), "strategies", "custom")
+    
+    # Remove existing custom kernels from registry before re-discovering
+    custom_keys = [k for k in list(_kernel_registry.keys()) if k.startswith("custom_")]
+    for k in custom_keys:
+        del _kernel_registry[k]
+
+    if not os.path.exists(custom_dir):
+        return
+    import importlib.util
+    for fname in os.listdir(custom_dir):
+        if fname.endswith(".py") and not fname.startswith("__"):
+            mod_path = os.path.join(custom_dir, fname)
+            file_strat_id = fname[:-3]
+            mod_name = f"strategies.custom.{file_strat_id}"
+            try:
+                spec = importlib.util.spec_from_file_location(mod_name, mod_path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                for item_name in dir(mod):
+                    obj = getattr(mod, item_name)
+                    if isinstance(obj, type) and issubclass(obj, StrategyKernel) and obj is not StrategyKernel:
+                        inst = obj()
+                        register_kernel(inst)
+                        if file_strat_id and file_strat_id != inst.strategy_id:
+                            _kernel_registry[file_strat_id] = inst
+                            logger.info(f"Registered custom kernel alias: {file_strat_id} -> {inst.strategy_id}")
+            except Exception as ex:
+                logger.warning(f"Could not load custom strategy {fname}: {ex}")
+
+
 
 def get_kernel(strategy_id: str) -> Optional[StrategyKernel]:
     """Get a registered kernel by strategy_id."""
     init_kernels()
+    if strategy_id not in _kernel_registry:
+        reload_custom_kernels()
     return _kernel_registry.get(strategy_id)
 
 
@@ -321,10 +496,11 @@ def get_live_kernels() -> dict[str, StrategyKernel]:
 def get_kernel_list() -> list:
     """Return list of {id, label, live} for UI dropdowns."""
     init_kernels()
+    reload_custom_kernels()
     return [
         {
             "id": k.strategy_id,
-            "label": k.strategy_id.replace("_", " ").title(),
+            "label": getattr(k, "display_name", k.strategy_id.replace("_", " ").title()),
             "live": k.live_capable,
         }
         for k in _kernel_registry.values()

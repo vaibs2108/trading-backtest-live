@@ -51,11 +51,14 @@ def free_port(port=8000):
             if s.connect_ex(('127.0.0.1', port)) == 0:
                 print(f"⚠️  Port {port} is busy. Clearing existing process...")
                 if sys.platform == 'win32':
-                    subprocess.run(
-                        f'powershell -Command "Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}"',
-                        shell=True, capture_output=True
+                    ps_cmd = (
+                        f"Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | "
+                        f"Select-Object -ExpandProperty OwningProcess | "
+                        f"Where-Object {{ $_ -gt 0 }} | "
+                        f"ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"
                     )
-                time.sleep(1)
+                    subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True)
+                time.sleep(1.5)
     except Exception:
         pass
 

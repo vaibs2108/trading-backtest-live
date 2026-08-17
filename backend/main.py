@@ -202,13 +202,35 @@ _cached_frames_instrument: str = ""
 # Cached chart_signals backtest result — avoids re-running backtest on every page load
 _chart_signals_cache: dict = {}  # {strategy: {"signals": [...], "ts": float}}
 
+import math
+
+def _clean_nan_values(obj):
+    """Recursively replaces float('nan'), float('inf'), and -float('inf') with None so JSON serialization never fails."""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, dict):
+        return {k: _clean_nan_values(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_clean_nan_values(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_clean_nan_values(v) for v in obj)
+    elif hasattr(obj, 'item') and callable(getattr(obj, 'item')):
+        try:
+            return _clean_nan_values(obj.item())
+        except Exception:
+            return None
+    return obj
+
 def _load_signal_history():
     global _signal_history
     try:
         path = _SIGNAL_HISTORY_PATH
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
-                _signal_history = json.load(f)
+                raw = json.load(f)
+                _signal_history = _clean_nan_values(raw) if isinstance(raw, list) else []
             logger.info(f"Loaded {len(_signal_history)} signals from history log.")
         else:
             _signal_history = []
@@ -220,8 +242,9 @@ def _save_signal_history():
     try:
         path = _SIGNAL_HISTORY_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
+        clean_hist = _clean_nan_values(_signal_history)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(_signal_history, f, indent=2)
+            json.dump(clean_hist, f, indent=2)
     except Exception as e:
         logger.error(f"Failed to save signal history: {e}")
 
@@ -237,7 +260,7 @@ def _add_signal_to_history(sig: dict, source: str = "strategy"):
     # timestamp, but if empty fall back to wall-clock IST.
     if not sig.get("time"):
         sig["time"] = datetime.now(_IST).isoformat()
-    entry = {**sig, "instrument": cfg.instrument, "strategy": strat_id, "source": source, "recorded_at": datetime.now(_IST).isoformat()}
+    entry = _clean_nan_values({**sig, "instrument": cfg.instrument, "strategy": strat_id, "source": source, "recorded_at": datetime.now(_IST).isoformat()})
 
     # DEDUP 1: exact same candle time + direction + instrument + strategy → skip
     exists = any(
@@ -955,7 +978,6 @@ async def run_backtest(req: BacktestRequest):
     )
     if not frames:
         raise HTTPException(status_code=500, detail="Failed to fetch backtest data")
-
     # Use dynamic lot size from Dhan API / INSTRUMENT_META
     lot_size = broker.get_lot_size(req.instrument)
     # Temporarily override strategy and instrument for this backtest
@@ -997,8 +1019,191 @@ async def run_backtest(req: BacktestRequest):
 async def get_strategies():
     """Return list of available strategies."""
     from strategy_router import get_strategy_list
+    from strategy_kernel import init_kernels
+    init_kernels()
     cfg = get_settings()
     return {"strategies": get_strategy_list(), "active": cfg.strategy}
+
+
+# ── Research Studio Endpoints ───────────────────────────────────────────────
+
+from pydantic import BaseModel
+
+class ConvertRequest(BaseModel):
+    pinescript: str
+    mode: str = "local"
+    strategy_id: str = ""
+
+class PromptRequest(BaseModel):
+    prompt: str
+
+class DryRunRequest(BaseModel):
+    python_code: str
+    instrument: str = "BANKNIFTY"
+
+class SaveStrategyRequest(BaseModel):
+    strategy_id: str
+    python_code: str
+
+
+@app.get("/api/research/templates")
+async def get_research_templates():
+    from strategy_sandbox import SAMPLE_ALL_BANK_ATM, SAMPLE_TREND_REVERSAL
+    return {
+        "templates": [
+            {"id": "all_bank_atm", "name": "All Bank ATM Strategy (v5)", "pinescript": SAMPLE_ALL_BANK_ATM},
+            {"id": "trend_reversal", "name": "Trend Reversal Strategy (v5)", "pinescript": SAMPLE_TREND_REVERSAL}
+        ]
+    }
+
+
+@app.post("/api/research/convert")
+async def convert_pinescript(req: ConvertRequest):
+    from strategy_sandbox import PineScriptToPythonConverter, AIStrategyAssistant, StrategyValidator, PineSyntaxChecker
+
+    # Fast syntax-only pre-check (pynescript) before spending an AI call or
+    # running the local transpiler on input that's simply malformed. No-op if
+    # pynescript isn't installed. Returning an "error" key (not raising) here
+    # matches the existing frontend contract in ResearchStudio.jsx, which
+    # already displays res.error when res.python_code is absent.
+    syntax_check = PineSyntaxChecker.check(req.pinescript)
+    if not syntax_check.get("ok", True):
+        return {"error": syntax_check["message"], "syntax_check": syntax_check}
+
+    comp_info = PineScriptToPythonConverter.check_complexity(req.pinescript)
+
+    # 1. Prefer AI Assistant conversion if OPENAI_API_KEY is configured and mode is not local
+    if req.mode == "ai" and not AIStrategyAssistant.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="OPENAI_API_KEY is not configured in .env file or environment. Please add OPENAI_API_KEY=sk-... to .env file."
+        )
+
+    if req.mode != "force_local" and req.mode != "local" and AIStrategyAssistant.is_configured():
+        try:
+            ai_res = await asyncio.to_thread(AIStrategyAssistant.generate_strategy, req.pinescript, True)
+            if ai_res.get("success") and ai_res.get("python_code"):
+                val = StrategyValidator.validate_code(ai_res["python_code"])
+                if val.get("valid"):
+                    return {
+                        "python_code": ai_res["python_code"],
+                        "validation": val,
+                        "mode": "ai",
+                        "warning": "",
+                        "is_complex": comp_info["is_complex"]
+                    }
+                else:
+                    logger.warning(f"AI PineScript code failed AST validation: {val.get('errors')}")
+                    if req.mode == "ai":
+                        err_str = "; ".join(val.get("errors", []))
+                        raise HTTPException(status_code=400, detail=f"AI generated code failed AST validation: {err_str}")
+            elif not ai_res.get("success"):
+                if req.mode == "ai":
+                    raise HTTPException(status_code=400, detail=ai_res.get("error", "AI conversion failed."))
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"AI PineScript conversion attempt failed: {e}")
+            if req.mode == "ai":
+                raise HTTPException(status_code=500, detail=f"AI Conversion failed: {str(e)}")
+    
+    # 2. Fallback to Local Rule-Based Converter
+    py_code = PineScriptToPythonConverter.convert(req.pinescript, req.strategy_id)
+    val = StrategyValidator.validate_code(py_code)
+    return {
+        "python_code": py_code,
+        "validation": val,
+        "mode": "local",
+        "warning": comp_info["warning"],
+        "is_complex": comp_info["is_complex"]
+    }
+
+
+@app.post("/api/research/generate-prompt")
+async def generate_prompt(req: PromptRequest):
+    from strategy_sandbox import AIStrategyAssistant, StrategyValidator
+    if not AIStrategyAssistant.is_configured():
+        raise HTTPException(status_code=400, detail="OPENAI_API_KEY is not configured in .env")
+    ai_res = await asyncio.to_thread(AIStrategyAssistant.generate_strategy, req.prompt, False)
+    if not ai_res.get("success"):
+        raise HTTPException(status_code=500, detail=ai_res.get("error", "AI generation failed"))
+    val = StrategyValidator.validate_code(ai_res["python_code"])
+    return {"python_code": ai_res["python_code"], "validation": val}
+
+
+@app.post("/api/research/dry-run")
+async def dry_run_strategy(req: DryRunRequest):
+    from strategy_sandbox import SignalVerifier
+    res = SignalVerifier.generate_report(req.python_code, instrument=req.instrument)
+    if "error" in res and not res.get("verification_table"):
+        raise HTTPException(status_code=400, detail=str(res["error"]))
+    return res
+
+
+@app.post("/api/research/save")
+async def save_custom_strategy(req: SaveStrategyRequest):
+    from strategy_sandbox import CustomStrategyManager
+    from strategy_kernel import init_kernels
+    res = CustomStrategyManager.save_strategy(req.strategy_id, req.python_code)
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=", ".join(res.get("errors", ["Save failed"])))
+    init_kernels()
+    return res
+
+
+@app.get("/api/research/list")
+async def list_custom_strategies():
+    from strategy_sandbox import CustomStrategyManager
+    return {"strategies": CustomStrategyManager.list_custom_strategies()}
+
+
+@app.get("/api/backtest/strategies")
+async def get_backtest_strategies():
+    from strategy_sandbox import CustomStrategyManager
+    from strategy_kernel import init_kernels
+    init_kernels()
+
+    builtins = [
+        {"id": "regime_trend_range", "label": "Regime Trend/Range Optimized"},
+        {"id": "regime_reversal", "label": "Regime + Reversal Combined"},
+        {"id": "regime_trend_v2", "label": "Regime Trend V2 — Selective (optimized)"},
+        {"id": "regime_trend_v2b", "label": "Regime Trend V2-B — Balanced"},
+        {"id": "multi_agent", "label": "Multi-Agent V3 Kernel"},
+        {"id": "donchian_5m_swing", "label": "Donchian 5m Swing (overnight)"},
+        {"id": "donchian_5m_intraday", "label": "Donchian 5m Intraday"}
+    ]
+    builtin_ids = {b["id"] for b in builtins}
+
+    customs = []
+    for s in CustomStrategyManager.list_custom_strategies():
+        s_id = s.get("strategy_id")
+        if s_id and s_id not in builtin_ids:
+            customs.append({
+                "id": s_id,
+                "label": f"✨ Custom: {s.get('display_name') or s_id}"
+            })
+
+    return {"strategies": builtins + customs}
+
+
+@app.get("/api/research/strategy/{strategy_id}")
+async def get_custom_strategy(strategy_id: str):
+    from strategy_sandbox import CustomStrategyManager
+    res = CustomStrategyManager.get_strategy(strategy_id)
+    if not res:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    return res
+
+
+@app.delete("/api/research/strategy/{strategy_id}")
+async def delete_custom_strategy(strategy_id: str):
+    from strategy_sandbox import CustomStrategyManager
+    from strategy_kernel import init_kernels
+    ok = CustomStrategyManager.delete_strategy(strategy_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Strategy file not found or could not be deleted")
+    init_kernels()
+    return {"success": True, "message": f"Strategy {strategy_id} deleted"}
 
 
 @app.get("/api/signal_history")
@@ -1016,7 +1221,7 @@ async def get_signal_history(instrument: Optional[str] = None):
         )
         if is_strategy or is_sync_exit:
             filtered.append(s)
-    return {"signals": filtered[-80:]}
+    return _clean_nan_values({"signals": filtered[-80:]})
 
 
 
@@ -1504,8 +1709,8 @@ async def test_telegram_alert():
         # Fetch live index LTP
         index_ltp = await asyncio.to_thread(broker.get_ltp, cfg.instrument)
         if not index_ltp:
-            fallback = {"BANKNIFTY": 56800.0, "NIFTY": 23450.0, "SENSEX": 76500.0}
-            index_ltp = fallback.get(cfg.instrument, 50000.0)
+            fallback = {"BANKNIFTY": 57150.0, "NIFTY": 24500.0, "SENSEX": 80000.0}
+            index_ltp = fallback.get(cfg.instrument, 57150.0)
 
         if cfg.trade_mode == "OPTIONS":
             # Resolve real option symbol via Tradehull API
@@ -1675,6 +1880,17 @@ async def startup_event():
             logger.warning(f"Dhan auto-connection failed: {msg}")
             add_activity_log(f"Dhan auto-connection failed: {msg}")
 
+    # Start the Order Update WebSocket -- a fast-path wake-up for
+    # verify_order_fill() (see order_update_feed.py). Purely a latency
+    # optimization; fill confirmation still falls back to its normal
+    # REST poll cadence if this feed isn't connected.
+    if broker.is_connected():
+        try:
+            import order_update_feed
+            order_update_feed.start(cfg.dhan_client_code, cfg.dhan_access_token)
+        except Exception as _ouf_err:
+            logger.warning(f"Could not start Order Update feed: {_ouf_err}")
+
     # Start live market feed for near-instant signal processing
     if broker.is_connected():
         try:
@@ -1750,6 +1966,12 @@ async def shutdown_event():
     # Stop live feed
     try:
         get_live_feed().stop()
+    except Exception:
+        pass
+    # Stop order update feed
+    try:
+        import order_update_feed
+        order_update_feed.stop()
     except Exception:
         pass
     try:
@@ -2087,6 +2309,85 @@ async def _ensure_live_feed(cfg, now_ist):
         logger.error(f"Live feed restart failed: {_fs_err}")
 
 
+# ── Live-strategy exit-management config, keyed by strategy_id ────────────
+# Generalizes what used to be hardcoded `if cfg.strategy == "regime_trend_range"`
+# / `elif cfg.strategy == "multi_agent"` branches so any live strategy using
+# the same "continuous ATR trail + breakeven lock" exit shape (which is what
+# each of these 3 kernels' own already-validated internal exit logic uses)
+# gets the broker-side trailing-SL safety net without a new copy-pasted
+# elif block per strategy. Values match each kernel's own validated
+# TRAIL_MULT / TRAIL_ACTIVATION / BE_TRIGGER / BE_BUFFER class attributes
+# (backend/strategies/regime_trend_range_v1_research.py).
+_TRAIL_PARAMS = {
+    "custom_regime_v1_trend_range_final": {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
+    "custom_halftrend_hull_standalone":   {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
+    "custom_cusum15_nodonchian_cd8":      {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
+}
+
+# Cooldown-after-loss bar counts, keyed by strategy_id. CUSUM's 8-bar
+# cooldown is load-bearing for its validated drawdown control (it's what
+# brought maxDD down from -11.44% to -7.92% in backtest) and must be
+# respected here exactly, not silently default to 0 like an unrecognized
+# strategy would.
+_COOLDOWN_BARS = {
+    "custom_regime_v1_trend_range_final": 4,
+    "custom_halftrend_hull_standalone": 4,
+    "custom_cusum15_nodonchian_cd8": 8,
+}
+
+
+async def _apply_generic_trailing_sl(pos, cfg, ltp, sig):
+    """Continuous ATR trail + breakeven lock, parameterized by
+    _TRAIL_PARAMS[cfg.strategy]. Mirrors the shape of the (still-present,
+    now-dormant) regime_trend_range branch below, generalized so any live
+    strategy in _TRAIL_PARAMS gets the same broker-side trailing-SL safety
+    net without its own hardcoded elif block. Returns True if it updated
+    pos.sl (caller does nothing further; _sync_broker_sl is called here)."""
+    params = _TRAIL_PARAMS.get(cfg.strategy)
+    if not params:
+        return False
+    trail_mult = params["trail_mult"]
+    trail_activation = params["trail_activation"]
+    be_trigger = params["be_trigger"]
+    be_buffer = params["be_buffer"]
+    atr_v = pos.entry_atr or sig.get("atr_5m", 0) or (ltp * 0.002)
+    updated = False
+    if pos.direction == "LONG":
+        if ltp > pos.highest_since_entry:
+            pos.highest_since_entry = ltp
+        profit = pos.highest_since_entry - pos.index_entry_price
+        if profit >= atr_v * trail_activation:
+            trail_sl = pos.highest_since_entry - atr_v * trail_mult
+            if be_trigger > 0 and profit > atr_v * be_trigger:
+                trail_sl = max(trail_sl, pos.index_entry_price + atr_v * be_buffer)
+            # Clamp: the ATR-derived breakeven level can otherwise be pushed
+            # above the highest LTP this LONG has actually traded at,
+            # producing an "SL hit" price the market never reached.
+            trail_sl = min(trail_sl, pos.highest_since_entry)
+            if trail_sl > pos.sl:
+                logger.info(f"Trailing SL updated: {pos.sl:.2f} -> {trail_sl:.2f} (highest={pos.highest_since_entry:.2f}, ATR={atr_v:.2f})")
+                pos.sl = trail_sl
+                updated = True
+    elif pos.direction == "SHORT":
+        if ltp < pos.lowest_since_entry:
+            pos.lowest_since_entry = ltp
+        profit = pos.index_entry_price - pos.lowest_since_entry
+        if profit >= atr_v * trail_activation:
+            trail_sl = pos.lowest_since_entry + atr_v * trail_mult
+            if be_trigger > 0 and profit > atr_v * be_trigger:
+                trail_sl = min(trail_sl, pos.index_entry_price - atr_v * be_buffer)
+            # Clamp: mirrored fix — must never fall below the lowest LTP
+            # this SHORT has actually traded at.
+            trail_sl = max(trail_sl, pos.lowest_since_entry)
+            if trail_sl < pos.sl:
+                logger.info(f"Trailing SL updated: {pos.sl:.2f} -> {trail_sl:.2f} (lowest={pos.lowest_since_entry:.2f}, ATR={atr_v:.2f})")
+                pos.sl = trail_sl
+                updated = True
+    if updated:
+        await asyncio.to_thread(_sync_broker_sl, pos, cfg)
+    return updated
+
+
 async def _signal_polling_loop():
     """Poll for new signals — driven by live feed candle events (1-2s latency)
     with 15s fallback if live feed is not connected."""
@@ -2265,28 +2566,55 @@ async def _signal_polling_loop():
                 global _last_processed_candle_ts, _virtual_cooldown
                 global _all_strat_sigs_cache
 
-                from live_bar_processor import get_regime_processor, get_regime_reversal_processor
+                from live_bar_processor import (
+                    get_regime_v1_final_processor, get_halftrend_hull_processor, get_cusum15_processor,
+                )
 
                 _lot_size = broker.get_lot_size(cfg.instrument)
                 _qty = int(_lot_size * cfg.lot_multiplier)
 
                 _all_strat_sigs = {}
 
-                # Only the two PRODUCTION strategies run live. The
-                # exploration strategies (V2 / V2-B / Donchian) stay
-                # registered for the Backtest page but are not evaluated
-                # in the live loop until promoted.
+                # Three PRODUCTION strategies run live: the 3 research
+                # strategies validated in scratch/research_v1/ (Regime T/R
+                # V1 Final, HalfTrend+Hull Standalone, CUSUM 1.5/No-Donchian/
+                # CD8), promoted from exploration in place of the prior
+                # regime_reversal/regime_trend_range/multi_agent trio, which
+                # remain registered for the Backtest page but are no longer
+                # evaluated in the live loop. V2 / V2-B / Donchian also stay
+                # backtest-only, as before.
                 _proc_list = [
-                    ("regime_reversal", get_regime_reversal_processor()),
-                    ("regime_trend_range", get_regime_processor()),
+                    ("custom_regime_v1_trend_range_final", get_regime_v1_final_processor()),
+                    ("custom_halftrend_hull_standalone", get_halftrend_hull_processor()),
+                    ("custom_cusum15_nodonchian_cd8", get_cusum15_processor()),
                 ]
                 # Active strategy FIRST — its chart marker, telegram alert and
                 # auto-trade execution must fire with minimum latency; the
                 # other strategies' virtual tracking follows right after.
                 _proc_list.sort(key=lambda _x: 0 if _x[0] == cfg.strategy else 1)
-                for _strat_id, _processor in _proc_list:
+
+                # Evaluate all 3 strategies CONCURRENTLY in background threads
+                # instead of sequentially blocking the event loop — each
+                # process_frames() call re-runs a strategy's full run_backtest()
+                # (~850-1040ms per strategy), so evaluating them one after
+                # another cost ~2.8s per candle close and froze WebSocket
+                # delivery/other requests for that whole window. Each processor
+                # is an independent singleton with its own state and its own
+                # kernel's own lock (safe_run_backtest), so concurrent
+                # evaluation across strategies is safe. Side-effect processing
+                # below (broadcast/telegram/order execution) stays sequential,
+                # in the same active-strategy-first order as before — only the
+                # heavy evaluation itself is parallelized.
+                _eval_results = await asyncio.gather(
+                    *[asyncio.to_thread(_processor.process_frames, frames, cfg, _qty)
+                      for _strat_id, _processor in _proc_list],
+                    return_exceptions=True,
+                )
+
+                for (_strat_id, _processor), new_signals in zip(_proc_list, _eval_results):
                     try:
-                        new_signals = _processor.process_frames(frames, cfg, _qty)
+                        if isinstance(new_signals, BaseException):
+                            raise new_signals
 
                         for _live_sig in new_signals:
                             sig_dict = _live_sig.to_signal_dict()
@@ -2335,7 +2663,7 @@ async def _signal_polling_loop():
                                             except Exception:
                                                 pass
                                     if ok:
-                                        cooldown_bars = getattr(cfg, 'cooldown_bars', 0) if cfg.strategy == "multi_agent" else 0
+                                        cooldown_bars = _COOLDOWN_BARS.get(cfg.strategy, 0)
                                         if cooldown_bars > 0 and _last_loss_direction == _live_sig.signal and _last_loss_time:
                                             elapsed_mins = (datetime.now(_IST) - _last_loss_time).total_seconds() / 60.0
                                             cooldown_mins = cooldown_bars * 5
@@ -2581,7 +2909,7 @@ async def _signal_polling_loop():
                         exit_reason = f"OPPOSITE_SIGNAL_{sig_direction}"
                         _pnl_exit = _safe_pnl_exit_price(pos, ltp)
                         rec = tm.close_position(_pnl_exit, exit_reason)
-                        if cfg.strategy == "multi_agent" and rec.get("pnl", 0.0) <= 0.0:
+                        if cfg.strategy in _COOLDOWN_BARS and rec.get("pnl", 0.0) <= 0.0:
                             record_cooldown_loss(pos.direction)
                         _active_trade_signal = {}
                         try:
@@ -2648,7 +2976,7 @@ async def _signal_polling_loop():
                                     except Exception:
                                         pass  # don't block entry if check fails
                             if ok:
-                                cooldown_bars = getattr(cfg, 'cooldown_bars', 0) if cfg.strategy == "multi_agent" else 0
+                                cooldown_bars = _COOLDOWN_BARS.get(cfg.strategy, 0)
                                 if cooldown_bars > 0 and _last_loss_direction == sig_direction and _last_loss_time:
                                     elapsed_mins = (datetime.now(_IST) - _last_loss_time).total_seconds() / 60.0
                                     cooldown_mins = cooldown_bars * 5
@@ -2714,8 +3042,17 @@ async def _signal_polling_loop():
                             except Exception as bp_err:
                                 logger.error(f"Error checking position sync from broker: {bp_err}")
 
-                        # ── Trailing SL for regime strategy ──────────────────
-                        if not exit_triggered and cfg.strategy == "regime_trend_range":
+                        # ── Trailing SL for the 3 live research strategies ────
+                        # Generic version — see _apply_generic_trailing_sl and
+                        # _TRAIL_PARAMS above _signal_polling_loop's definition.
+                        if not exit_triggered and cfg.strategy in _TRAIL_PARAMS:
+                            await _apply_generic_trailing_sl(pos, cfg, ltp, sig)
+
+                        # ── Trailing SL for regime_trend_range (dormant —
+                        # regime_trend_range is no longer live-selectable, but
+                        # this stays intact since the strategy is still valid
+                        # for backtesting) ────────────────────────────────────
+                        elif not exit_triggered and cfg.strategy == "regime_trend_range":
                             trail_mult = getattr(cfg, "regime_trail_mult", 1.5)
                             trail_activation = getattr(cfg, "regime_trail_activation", 0.3)
                             be_trigger = getattr(cfg, "regime_be_trigger", 0.4)
@@ -2974,7 +3311,7 @@ async def _signal_polling_loop():
                             rec = tm.close_position(pnl_price, exit_reason)
                             if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
                                 get_capital_tracker().record_trade_pnl(rec.get("pnl", 0.0))
-                            if cfg.strategy == "multi_agent" and rec.get("pnl", 0.0) <= 0.0:
+                            if cfg.strategy in _COOLDOWN_BARS and rec.get("pnl", 0.0) <= 0.0:
                                 record_cooldown_loss(pos.direction)
 
                             # Log exit fill slippage
@@ -4168,7 +4505,7 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                     _exit_signal_logged_for_position = ""
                     _exit_telegram_sent_for_position = ""
                     rec = tm.close_position(exit_ltp, "DHAN_SYNC_EXIT", pnl_override=realized_pnl)
-                    if cfg.strategy == "multi_agent" and rec.get("pnl", 0.0) <= 0.0:
+                    if cfg.strategy in _COOLDOWN_BARS and rec.get("pnl", 0.0) <= 0.0:
                         record_cooldown_loss(pos.direction)
                     _active_trade_signal = {}
 
@@ -4658,28 +4995,39 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
 
         tm.open_position(pos)
 
-        # Post-entry verification: confirm position exists at broker
+        # Post-entry verification: confirm position exists at broker.
+        # This is a "trust but verify, alert if wrong" safety check, not
+        # part of the critical execution path — the order is already
+        # placed and the local position already opened above. Run it in
+        # a background thread instead of blocking this function's return
+        # (and therefore the trade_opened broadcast / Telegram entry
+        # alert the caller sends immediately after _execute_order comes
+        # back) on a brief settle-time sleep.
         if cfg.auto_trade and broker.is_connected() and not result["order_id"].startswith("PAPER_"):
-            try:
-                import time as _verify_time
-                _verify_time.sleep(1)  # brief wait for broker to register
-                bp = broker.sync_position_from_broker(cfg.instrument, tracked_symbol=result["symbol"])
-                if bp and bp.get("has_position"):
-                    logger.info(f"Post-entry verified: {bp.get('symbol')} qty={bp.get('qty')} at broker")
-                else:
-                    logger.warning(f"Post-entry check: position {result['symbol']} NOT found at broker — may need manual verification")
-                    try:
-                        _send_telegram_alert_wrapper(
-                            f"ENTRY VERIFICATION WARNING\n"
-                            f"{direction} {result['symbol']}\n"
-                            f"Order filled but position NOT confirmed at broker\n"
-                            f"Please verify manually!",
-                            cfg.telegram_bot_token, cfg.telegram_chat_id
-                        )
-                    except Exception:
-                        pass
-            except Exception as _verify_err:
-                logger.debug(f"Post-entry verification failed: {_verify_err}")
+            def _post_entry_verify():
+                try:
+                    import time as _verify_time
+                    _verify_time.sleep(1)  # brief wait for broker to register
+                    bp = broker.sync_position_from_broker(cfg.instrument, tracked_symbol=result["symbol"])
+                    if bp and bp.get("has_position"):
+                        logger.info(f"Post-entry verified: {bp.get('symbol')} qty={bp.get('qty')} at broker")
+                    else:
+                        logger.warning(f"Post-entry check: position {result['symbol']} NOT found at broker — may need manual verification")
+                        try:
+                            _send_telegram_alert_wrapper(
+                                f"ENTRY VERIFICATION WARNING\n"
+                                f"{direction} {result['symbol']}\n"
+                                f"Order filled but position NOT confirmed at broker\n"
+                                f"Please verify manually!",
+                                cfg.telegram_bot_token, cfg.telegram_chat_id
+                            )
+                        except Exception:
+                            pass
+                except Exception as _verify_err:
+                    logger.debug(f"Post-entry verification failed: {_verify_err}")
+
+            import threading as _threading
+            _threading.Thread(target=_post_entry_verify, daemon=True, name="PostEntryVerify").start()
 
         # Log entry fill slippage
         slippage_tracker.log_entry_fill(

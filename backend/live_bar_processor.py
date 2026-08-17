@@ -246,7 +246,17 @@ class BacktestDiffProcessor:
             key = (t["direction"], t["entry_time"])
             current_keys.add(key)
 
-            is_open = t.get("exit_reason") == "OPEN" and not t.get("exit_time")
+            # NOTE: deliberately NOT also checking `not t.get("exit_time")` here.
+            # safe_run_backtest() pipes every trade through
+            # format_and_enrich_backtest_result(), which coerces a still-open
+            # trade's empty exit_time ("") into the literal string "-" (truthy) —
+            # combining that with exit_reason=="OPEN" made is_open permanently
+            # False for every genuinely-open live position, which fired a
+            # spurious same-batch EXIT right behind every ENTRY and then made
+            # the position invisible to _prev_open_key tracking forever after.
+            # exit_reason survives enrichment unchanged, so it alone is a
+            # reliable signal of "still open".
+            is_open = t.get("exit_reason") == "OPEN"
             if is_open:
                 current_open_key = key
 
@@ -407,6 +417,11 @@ class RegimeReversalLiveProcessor(BacktestDiffProcessor):
     strategy_id = "regime_reversal"
 
 
+class MultiAgentLiveProcessor(BacktestDiffProcessor):
+    """Multi-Agent V3 Kernel strategy."""
+    strategy_id = "multi_agent"
+
+
 class RegimeTrendV2LiveProcessor(BacktestDiffProcessor):
     """Regime Trend V2 — Selective (optimized winner)."""
     strategy_id = "regime_trend_v2"
@@ -425,6 +440,27 @@ class DonchianSwingLiveProcessor(BacktestDiffProcessor):
 class DonchianIntradayLiveProcessor(BacktestDiffProcessor):
     """Donchian 5m Intraday (flat by 15:15)."""
     strategy_id = "donchian_5m_intraday"
+
+
+class RegimeV1FinalLiveProcessor(BacktestDiffProcessor):
+    """Regime T/R V1 Final (Research) -- Donchian+CUSUM(2.0)+HTF-hold+
+    SuperTrend-adaptive on the trend side, VWAP+half-life on the range
+    side. Promoted to live after the scratch/research_v1/ session."""
+    strategy_id = "custom_regime_v1_trend_range_final"
+
+
+class HalfTrendHullLiveProcessor(BacktestDiffProcessor):
+    """HalfTrend + Hull (Standalone, Research). Promoted to live after
+    the scratch/research_v1/ session."""
+    strategy_id = "custom_halftrend_hull_standalone"
+
+
+class Cusum15LiveProcessor(BacktestDiffProcessor):
+    """CUSUM 1.5 + No Donchian + CD8 (Research) -- best points/PF/net of
+    the whole research session; maxDD runs ~0.9pp over the user's 7% cap,
+    accepted deliberately. Promoted to live after the scratch/research_v1/
+    session."""
+    strategy_id = "custom_cusum15_nodonchian_cd8"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -450,6 +486,9 @@ def get_regime_processor() -> RegimeLiveProcessor:
 def get_regime_reversal_processor() -> RegimeReversalLiveProcessor:
     return _get_processor(RegimeReversalLiveProcessor)
 
+def get_multi_agent_processor() -> MultiAgentLiveProcessor:
+    return _get_processor(MultiAgentLiveProcessor)
+
 def get_regime_v2_processor() -> RegimeTrendV2LiveProcessor:
     return _get_processor(RegimeTrendV2LiveProcessor)
 
@@ -461,6 +500,15 @@ def get_donchian_swing_processor() -> DonchianSwingLiveProcessor:
 
 def get_donchian_intraday_processor() -> DonchianIntradayLiveProcessor:
     return _get_processor(DonchianIntradayLiveProcessor)
+
+def get_regime_v1_final_processor() -> RegimeV1FinalLiveProcessor:
+    return _get_processor(RegimeV1FinalLiveProcessor)
+
+def get_halftrend_hull_processor() -> HalfTrendHullLiveProcessor:
+    return _get_processor(HalfTrendHullLiveProcessor)
+
+def get_cusum15_processor() -> Cusum15LiveProcessor:
+    return _get_processor(Cusum15LiveProcessor)
 
 def reset_all_processors():
     """Reset the processors that are actually in use — call at daily boundary."""

@@ -5,15 +5,31 @@ import {
   Wifi, WifiOff, RefreshCw, Play, Square, AlertCircle,
   ChevronDown, CheckCircle, XCircle, Clock, Zap, BookOpen, Send, Cpu,
   Moon, Sun, LayoutDashboard, Globe, ChevronLeft, ChevronRight, Menu,
-  Calendar, Target, Trash2, Filter
+  Calendar, Target, Trash2, Filter, Code2, Sparkles
 } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip, ResponsiveContainer, Area, AreaChart } from 'recharts'
+import ResearchStudio from './components/ResearchStudio.jsx'
 
 // ── API helpers ──────────────────────────────────────────────────────────────
 const API = {
   get:  (url)       => fetch(url).then(r => r.json()),
   post: (url, body) => fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(r => r.json()),
 }
+
+// ── Live Trading strategies ────────────────────────────────────────────────
+// The 3 research strategies promoted to Live Trading, replacing the prior
+// regime_reversal / regime_trend_range / multi_agent trio (those remain
+// selectable on the Backtest page, just no longer live). Single source of
+// truth for every dropdown/label surface that shows live strategy options.
+const LIVE_STRATEGY_OPTIONS = [
+  { v: 'custom_regime_v1_trend_range_final', l: 'Regime T/R V1 Final' },
+  { v: 'custom_halftrend_hull_standalone', l: 'HalfTrend + Hull' },
+  { v: 'custom_cusum15_nodonchian_cd8', l: 'CUSUM 1.5 (No Donchian)' },
+]
+const LIVE_STRATEGY_LABELS = Object.fromEntries(LIVE_STRATEGY_OPTIONS.map(o => [o.v, o.l]))
+// All 3 are regime-classifier-based, so the regime badge (TRENDING_UP/DOWN/
+// SIDEWAYS, confidence, playbook) should render for all of them.
+const LIVE_REGIME_STRATEGY_IDS = LIVE_STRATEGY_OPTIONS.map(o => o.v)
 
 // ── Theme Hook ──────────────────────────────────────────────────────────────
 function useTheme() {
@@ -123,14 +139,15 @@ function MetricBox({ label, value, color, sub }) {
 // ── Sidebar ──────────────────────────────────────────────────────────────────
 function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, connected, collapsed, setCollapsed, isMobile, mobileOpen, setMobileOpen }) {
   const navItems = [
-    { id:'dashboard',    icon:<LayoutDashboard size={18}/>, label:'Dashboard' },
-    { id:'market_ctx',   icon:<Globe size={18}/>,           label:'Market Context' },
-    { id:'live',         icon:<Activity size={18}/>,        label:'Live Trading' },
-    { id:'auto_monitor', icon:<Zap size={18}/>,             label:'Auto Trade' },
-    { id:'backtest',     icon:<BarChart2 size={18}/>,       label:'Backtest' },
-    { id:'sig_journal',  icon:<TrendingUp size={18}/>,      label:'Strategy Signals Log' },
-    { id:'journal',      icon:<BookOpen size={18}/>,        label:'Broker Journal' },
-    { id:'performance',  icon:<BarChart2 size={18}/>,       label:'Performance' },
+    { id:'dashboard',       icon:<LayoutDashboard size={18}/>, label:'Dashboard' },
+    { id:'market_ctx',      icon:<Globe size={18}/>,           label:'Market Context' },
+    { id:'live',            icon:<Activity size={18}/>,        label:'Live Trading' },
+    { id:'auto_monitor',    icon:<Zap size={18}/>,             label:'Auto Trade' },
+    { id:'backtest',        icon:<BarChart2 size={18}/>,       label:'Backtest' },
+    { id:'sig_journal',     icon:<TrendingUp size={18}/>,      label:'Strategy Signals Log' },
+    { id:'journal',         icon:<BookOpen size={18}/>,        label:'Broker Journal' },
+    { id:'performance',     icon:<BarChart2 size={18}/>,       label:'Performance' },
+    { id:'research_studio', icon:<Code2 size={18}/>,           label:'Research Studio' },
   ]
 
   const sideW = collapsed ? 64 : 240
@@ -348,7 +365,7 @@ function LiveChart({ instrument, timeframe, signals, strategy, refreshChart, the
           const isLongExit = s.signal === 'LONG_EXIT'
           const isEntry = isLong || isShort
           const isExit = isShortExit || isLongExit
-          const p = s.strategy === 'regime_reversal' ? 'C' : s.strategy === 'regime_trend_range' ? 'R' : (s.strategy === 'broker_sync' ? 'B' : 'M')
+          const p = s.strategy === 'custom_regime_v1_trend_range_final' ? 'V' : s.strategy === 'custom_halftrend_hull_standalone' ? 'H' : s.strategy === 'custom_cusum15_nodonchian_cd8' ? 'C' : (s.strategy === 'broker_sync' ? 'B' : 'M')
           const up = isLong || isShortExit
           const t = Math.floor(new Date(s.time).getTime()/1000) + 19800
           return {
@@ -439,7 +456,7 @@ function SignalPanel({ signal, onManualTrade, position, connected, ltp, lastEntr
   const isEntry = sig === 'LONG' || sig === 'SHORT'
   const isExit  = sig === 'LONG_EXIT' || sig === 'SHORT_EXIT'
   const isHold  = sig === 'HOLD'
-  const isRegime = signal.strategy === 'regime_trend_range'
+  const isRegime = LIVE_REGIME_STRATEGY_IDS.includes(signal.strategy)
   const showActiveEntry = isHold && lastEntry && (lastEntry.signal === 'LONG' || lastEntry.signal === 'SHORT')
   const displaySig = showActiveEntry ? lastEntry.signal : sig
   const sigColor = displaySig==='LONG'||displaySig==='LONG_EXIT' ? V('green') : displaySig==='SHORT'||displaySig==='SHORT_EXIT' ? V('red') : V('yellow')
@@ -450,7 +467,7 @@ function SignalPanel({ signal, onManualTrade, position, connected, ltp, lastEntr
     <Card style={{ borderLeft:`3px solid ${sigColor}`, height:'100%', boxSizing:'border-box', display:'flex', flexDirection:'column', justifyContent:'space-between' }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
         <div>
-          <div style={{ color:V('text-muted'), fontSize:11, marginBottom:4, fontWeight:500 }}>{signal.strategy === 'regime_reversal' ? 'Regime + Reversal' : signal.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : signal.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : signal.strategy === 'regime_trend_v2' ? 'Regime Trend V2 — Selective' : signal.strategy === 'regime_trend_v2b' ? 'Regime Trend V2-B — Balanced' : 'Strategy Signal'}</div>
+          <div style={{ color:V('text-muted'), fontSize:11, marginBottom:4, fontWeight:500 }}>{LIVE_STRATEGY_LABELS[signal.strategy] || 'Strategy Signal'}</div>
           <div style={{ color:sigColor, fontSize:24, fontWeight:800 }}>{sigIcon} {showActiveEntry ? `${lastEntry.signal} (active)` : sig}</div>
           {signal.time && <div style={{ color:V('text-muted'), fontSize:10, marginTop:2 }}>{toIST(signal.time)}</div>}
         </div>
@@ -539,7 +556,7 @@ function CompactSignalPanel({ signal, strategyLabel, ltp, lastEntry }) {
   const m = window.innerWidth < 768
   if (!signal || !signal.signal) return null
   const sig = signal.signal
-  const isRegime = signal.strategy === 'regime_trend_range'
+  const isRegime = LIVE_REGIME_STRATEGY_IDS.includes(signal.strategy)
   const isEntry = sig === 'LONG' || sig === 'SHORT'
   const isHold  = sig === 'HOLD'
   const showActiveEntry = isHold && lastEntry && (lastEntry.signal === 'LONG' || lastEntry.signal === 'SHORT')
@@ -805,7 +822,7 @@ function SettingsPanel({ onSaved }) {
           <Card>
             <SectionTitle label="Strategy & Instrument" icon={<Cpu size={16} style={{color:V('accent')}} />} />
             <Row label="Strategy">
-              <Sel val={cfg.strategy} opts={[{v:'regime_reversal',l:'Regime + Reversal Combined'},{v:'regime_trend_range',l:'Regime Trend/Range Optimized'}]} onChange={v=>set('strategy',v)} />
+              <Sel val={cfg.strategy} opts={LIVE_STRATEGY_OPTIONS} onChange={v=>set('strategy',v)} />
             </Row>
             <Row label="Instrument">
               <Sel val={cfg.instrument} opts={['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY','CRUDEOIL']} onChange={v=>set('instrument',v)} />
@@ -930,12 +947,58 @@ function SettingsPanel({ onSaved }) {
 }
 
 // ── Backtest Panel ──────────────────────────────────────────────────────────
-function BacktestPanel({ connected }) {
+function BacktestPanel({ connected, selectedStrategy, onSelectStrategy }) {
   const m = window.innerWidth < 768
-  const [form, setForm] = useState({ instrument:'BANKNIFTY', from_date:'', to_date:'', initial_capital:500000, lot_multiplier:1, strategy:'regime_reversal' })
+  const [form, setForm] = useState({ instrument:'BANKNIFTY', from_date:'', to_date:'', initial_capital:500000, lot_multiplier:1, strategy: selectedStrategy || 'regime_reversal' })
   const [result, setResult] = useState(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState('')
+  const [availableStrategies, setAvailableStrategies] = useState([
+    { v:'regime_trend_range', l:'Regime Trend/Range Optimized' },
+    { v:'regime_reversal', l:'Regime + Reversal Combined' },
+    { v:'regime_trend_v2', l:'Regime Trend V2 — Selective (optimized)' },
+    { v:'regime_trend_v2b', l:'Regime Trend V2-B — Balanced' },
+    { v:'multi_agent', l:'Multi-Agent V3 Kernel' },
+    { v:'donchian_5m_swing', l:'Donchian 5m Swing (overnight)' },
+    { v:'donchian_5m_intraday', l:'Donchian 5m Intraday' }
+  ])
+
+  useEffect(() => {
+    if (selectedStrategy) {
+      setForm(p => ({ ...p, strategy: selectedStrategy }))
+    }
+  }, [selectedStrategy])
+
+  const fetchStrats = async () => {
+    try {
+      const resp = await fetch('/api/backtest/strategies')
+      const r = await resp.json()
+      if (r && r.strategies) {
+        setAvailableStrategies(r.strategies.map(s => ({ v: s.id, l: s.label })))
+      }
+    } catch (e) {}
+  }
+
+  useEffect(() => {
+    fetchStrats()
+  }, [])
+
+  const deleteCustomStrat = async (stratId) => {
+    if (!window.confirm(`Are you sure you want to delete custom strategy '${stratId}'?`)) return
+    try {
+      const resp = await fetch(`/api/research/strategy/${stratId}`, { method: 'DELETE' })
+      const r = await resp.json()
+      if (r.success) {
+        setForm(p => ({ ...p, strategy: 'regime_trend_range' }))
+        fetchStrats()
+      } else {
+        alert(r.error || 'Failed to delete strategy')
+      }
+    } catch (e) {
+      alert('Delete request failed: ' + e.message)
+    }
+  }
+
   const run = async () => {
     if (!connected) { setErr('Connect to broker first'); return }
     setLoading(true); setErr('')
@@ -975,14 +1038,28 @@ function BacktestPanel({ connected }) {
     borderRadius:V('radius-sm'), padding:'8px 10px', width:'100%', fontSize:12,
   }
 
+  const isCustomStrategy = (form.strategy || '').startsWith('custom_')
+
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
       <Card>
-        <div style={{ color:V('text-primary'), fontWeight:700, marginBottom:14, fontSize:15 }}>Backtest Configuration</div>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:14 }}>
+          <div style={{ color:V('text-primary'), fontWeight:700, fontSize:15 }}>Backtest Configuration</div>
+          {isCustomStrategy && (
+            <div style={{ display:'flex', gap:8 }}>
+              <StyledButton onClick={() => onSelectStrategy && onSelectStrategy(form.strategy)} variant="secondary" style={{ padding:'4px 10px', fontSize:11 }}>
+                ✏️ Edit in Research Studio
+              </StyledButton>
+              <StyledButton onClick={() => deleteCustomStrat(form.strategy)} variant="danger" style={{ padding:'4px 10px', fontSize:11 }}>
+                🗑️ Delete Strategy
+              </StyledButton>
+            </div>
+          )}
+        </div>
         <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
           {[
             ['Strategy', <select value={form.strategy} onChange={e=>setForm(p=>({...p,strategy:e.target.value}))} style={inputStyle}>
-              {[{v:'regime_trend_range',l:'Regime Trend/Range Optimized'},{v:'regime_reversal',l:'Regime + Reversal Combined'},{v:'regime_trend_v2',l:'Regime Trend V2 — Selective (optimized)'},{v:'regime_trend_v2b',l:'Regime Trend V2-B — Balanced'},{v:'donchian_5m_swing',l:'Donchian 5m Swing (overnight)'},{v:'donchian_5m_intraday',l:'Donchian 5m Intraday'}].map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
+              {availableStrategies.map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
             </select>],
             ['Instrument', <select value={form.instrument} onChange={e=>setForm(p=>({...p,instrument:e.target.value}))} style={inputStyle}>
               {['NIFTY','BANKNIFTY','SENSEX','CRUDEOIL'].map(i=><option key={i}>{i}</option>)}
@@ -1235,7 +1312,7 @@ function SignalJournalPanel({ entries, onRefresh }) {
     const headers = ['Date', 'Strategy', 'Instrument', 'Direction', 'Entry Price', 'SL', 'Target 1', 'Target 2', 'Regime', 'Score', 'Exit Time', 'Exit Price', 'P&L pts', 'P&L INR', 'Exit Reason', 'Status']
     const rows = filteredEntries.map(e => [
       e.entry_time,
-      e.strategy === 'regime_reversal' ? 'Regime + Reversal' : e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy,
+      LIVE_STRATEGY_LABELS[e.strategy] || (e.strategy === 'regime_reversal' ? 'Regime + Reversal' : e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy),
       e.instrument,
       e.direction,
       e.entry_price,
@@ -1294,6 +1371,9 @@ function SignalJournalPanel({ entries, onRefresh }) {
                 }}
               >
                 <option value="ALL">All Strategies</option>
+                <option value="custom_regime_v1_trend_range_final">Regime T/R V1 Final</option>
+                <option value="custom_halftrend_hull_standalone">HalfTrend + Hull</option>
+                <option value="custom_cusum15_nodonchian_cd8">CUSUM 1.5 (No Donchian)</option>
                 <option value="regime_reversal">Regime + Reversal Combined</option>
                 <option value="regime_trend_range">Regime T/R Optimized</option>
                 <option value="regime_trend_v2">Regime Trend V2 — Selective</option>
@@ -1395,7 +1475,7 @@ function SignalJournalPanel({ entries, onRefresh }) {
                 <tr key={i} style={{ borderBottom:`1px solid ${V('border-light')}`, background: i%2===0 ? 'transparent' : V('bg-tertiary') }}>
                   <td style={{ padding:'6px 8px', color:V('text-muted'), whiteSpace:'nowrap', fontSize:10 }}>{toISTDateTime(e.entry_time)}</td>
                   <td style={{ padding:'6px 8px', color:V('text-primary'), fontWeight:500 }}>
-                    {e.strategy === 'regime_reversal' ? 'Regime + Reversal' : e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy}
+                    {LIVE_STRATEGY_LABELS[e.strategy] || (e.strategy === 'regime_reversal' ? 'Regime + Reversal' : e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy)}
                   </td>
                   <td style={{ padding:'6px 8px', color:V('text-primary'), fontWeight:500 }}>{e.instrument}</td>
                   <td style={{ padding:'6px 8px', color:e.direction==='LONG'?V('green'):V('red'), fontWeight:700 }}>{e.direction}</td>
@@ -3756,7 +3836,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
   const d = tradeState?.day_stats
   const displayPnl = todayPnl != null && todayPnl !== 0 ? todayPnl : d?.gross_pnl
 
-  const strategyLabels = { regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
+  const strategyLabels = { ...LIVE_STRATEGY_LABELS, regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
   const [sparkData, setSparkData] = React.useState({ closes: [], pct_change: 0.0 })
   const [logs, setLogs] = React.useState([])
   const [isClosing, setIsClosing] = React.useState(false)
@@ -3902,8 +3982,8 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
     </Card>
   )
 
-  const maSignal = allSignals?.regime_reversal || (strategy === 'regime_reversal' ? signal : null)
-  const rtrSignal = allSignals?.regime_trend_range || (strategy === 'regime_trend_range' ? signal : null)
+  const maSignal = allSignals?.custom_halftrend_hull_standalone || (strategy === 'custom_halftrend_hull_standalone' ? signal : null)
+  const rtrSignal = allSignals?.custom_regime_v1_trend_range_final || (strategy === 'custom_regime_v1_trend_range_final' ? signal : null)
 
   // Risk Budget Horizontal Progress Calculation
   const lossLimit = maxDailyLoss || 1000.0
@@ -3962,8 +4042,9 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
               background:'transparent', color:V('text-primary'), border:'none', fontSize:17, fontWeight:800, marginTop:4, outline:'none', cursor:'pointer', padding:0, width:'100%'
             }}
           >
-            <option value="regime_reversal" style={{background:V('bg-primary')}}>Regime + Reversal Combined</option>
-            <option value="regime_trend_range" style={{background:V('bg-primary')}}>Regime T/R Optimized</option>
+            {LIVE_STRATEGY_OPTIONS.map(o => (
+              <option key={o.v} value={o.v} style={{background:V('bg-primary')}}>{o.l}</option>
+            ))}
           </select>
         </Card>
 
@@ -4106,8 +4187,8 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
 
       {/* Dual strategy signals + Active Position — 3 columns */}
       <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1.2fr', gap:10 }}>
-        {renderSignalCard(maSignal, 'Regime+Reversal Signal')}
-        {renderSignalCard(rtrSignal, 'Regime T/R Signal')}
+        {renderSignalCard(maSignal, 'HalfTrend + Hull Signal')}
+        {renderSignalCard(rtrSignal, 'Regime T/R V1 Final Signal')}
 
         {/* Position card with Panic Exit Button */}
         <Card style={{ display:'flex', flexDirection:'column', justifyContent:'space-between' }}>
@@ -4190,7 +4271,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
 // ── Auto Trade Monitor Page ─────────────────────────────────────────────────
 function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals, capitalState, tradeState, strategy, signal }) {
   const m = window.innerWidth < 768
-  const strategyLabels = { regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
+  const strategyLabels = { ...LIVE_STRATEGY_LABELS, regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
 
   // ── Inactive state ──
   if (!autoTrade) {
@@ -4211,8 +4292,8 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
   }
 
   // ── Compute confidence score ──
-  const maSignal = allSignals?.regime_reversal
-  const rtrSignal = allSignals?.regime_trend_range
+  const maSignal = allSignals?.custom_halftrend_hull_standalone
+  const rtrSignal = allSignals?.custom_regime_v1_trend_range_final
   const activeSignal = signal || maSignal || rtrSignal
 
   // Strategy agreement: do both strategies agree on direction?
@@ -4335,7 +4416,7 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
         <Card style={{ padding:20 }}>
           <div style={{ color:V('text-muted'), fontSize:11, textTransform:'uppercase', fontWeight:600, marginBottom:12 }}>Strategy Agreement</div>
           <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
-            {['regime_reversal', 'regime_trend_range'].map(sid => {
+            {LIVE_REGIME_STRATEGY_IDS.map(sid => {
               const s = allSignals?.[sid]
               const dir = s?.signal
               const dirColor = dir === 'LONG' || dir === 'LONG_EXIT' ? V('green') : dir === 'SHORT' || dir === 'SHORT_EXIT' ? V('red') : V('yellow')
@@ -6189,7 +6270,8 @@ export default function App() {
   const [lotSize,     setLotSize]     = useState(0)
   const [ltp,         setLtp]         = useState(null)
   const [instrument,  setInstrument]  = useState('BANKNIFTY')
-  const [strategy,    setStrategy]    = useState('regime_reversal')
+  const [strategy,    setStrategy]    = useState(LIVE_STRATEGY_OPTIONS[0].v)
+  const [researchLoadReq, setResearchLoadReq] = useState(null)
   const [chartTf,     setChartTf]     = useState('5')
   const [sigHistory,  setSigHistory]  = useState([])
   const [chartSignals, setChartSignals] = useState([])
@@ -6219,7 +6301,7 @@ export default function App() {
   const [optCtxExpiries, setOptCtxExpiries] = useState([])
   const wsRef = useRef(null)
   const instrumentRef = useRef('BANKNIFTY')
-  const strategyRef = useRef('regime_reversal')
+  const strategyRef = useRef(LIVE_STRATEGY_OPTIONS[0].v)
   const fetchChartSignalsRef = useRef(null) // populated later, used by WS handler for instant chart refresh
 
   useEffect(() => { instrumentRef.current = instrument }, [instrument])
@@ -6598,7 +6680,8 @@ export default function App() {
     dashboard: ['Dashboard', 'Overview of your trading system'],
     auto_monitor: ['Auto Trade Monitor', 'Live trade tracking, confidence, and capital utilization'],
     market_ctx: ['Global Cues & Sentiment', 'Live global markets, bias analysis, and news sentiment'],
-    live: ['Live Trading', `${instrument} • ${chartTf === 'DAY' ? 'Daily' : chartTf + 'm'} • ${strategy === 'regime_reversal' ? 'Regime+Reversal' : strategy === 'multi_agent' ? 'Multi-Agent' : 'Regime T/R'}`],
+    live: ['Live Trading', `${instrument} • ${chartTf === 'DAY' ? 'Daily' : chartTf + 'm'} • ${LIVE_STRATEGY_LABELS[strategy] || strategy}`],
+    research_studio: ['Strategy Research Studio', 'Ingest PineScript v5+, AI prompts, or custom Python — Transpile, Validate & Move to Backtesting'],
     backtest: ['Backtest', 'Run historical backtests on your strategies'],
     sig_journal: ['Strategy Signals Log', 'Strategy signal history and theoretical P&L'],
     journal: ['Broker Journal', 'Actual broker execution log'],
@@ -6634,7 +6717,7 @@ export default function App() {
           }}>
             <div style={{ display:'flex', gap:16, alignItems:'center' }}>
               <span style={{ color:V('red'), fontWeight:700 }}>AUTO TRADING ACTIVE</span>
-              <span style={{ color:V('text-muted') }}>Strategy: <span style={{color:V('text-primary'), fontWeight:500}}>{strategy === 'regime_reversal' ? 'Regime + Reversal Combined' : strategy === 'multi_agent' ? 'Multi-Agent Optimized' : 'Regime T/R Optimized'}</span></span>
+              <span style={{ color:V('text-muted') }}>Strategy: <span style={{color:V('text-primary'), fontWeight:500}}>{LIVE_STRATEGY_LABELS[strategy] || strategy}</span></span>
               <span style={{ color:V('text-muted') }}>Order: <span style={{color:V('text-primary'), fontWeight:500}}>NRML</span></span>
               {tradeState?.position ? (
                 <span style={{ color: tradeState.position.direction === 'LONG' ? V('green') : V('red'), fontWeight:600 }}>
@@ -6667,7 +6750,7 @@ export default function App() {
 
           {/* Live Trading has its own header with controls */}
           {tab === 'live' && (
-            <PageHeader title="Live Trading" subtitle={`${instrument} • ${chartTf === 'DAY' ? 'Daily' : chartTf + ' Min'} • ${strategy === 'regime_reversal' ? 'Regime + Reversal Combined' : strategy === 'multi_agent' ? 'Multi-Agent Optimized' : 'Regime T/R Optimized'}`}>
+            <PageHeader title="Live Trading" subtitle={`${instrument} • ${chartTf === 'DAY' ? 'Daily' : chartTf + ' Min'} • ${LIVE_STRATEGY_LABELS[strategy] || strategy}`}>
               <StyledSelect value={instrument} onChange={async (e) => {
                 const val = e.target.value
                 setInstrument(val)
@@ -6696,7 +6779,7 @@ export default function App() {
                 await API.post('/api/settings', { strategy: val })
                 setRefreshChart(r => r + 1)
                 refreshSignal()
-              }} options={[{v:'regime_reversal',l:'Regime + Reversal Combined'},{v:'regime_trend_range',l:'Regime T/R Optimized'}]} style={{border:`1px solid ${V('accent')}`}} />
+              }} options={LIVE_STRATEGY_OPTIONS} style={{border:`1px solid ${V('accent')}`}} />
 
               <StyledSelect
                 value={optCtxExpiry}
@@ -6783,11 +6866,11 @@ export default function App() {
 
                   {/* Col 2: Secondary Strategy Signal */}
                   {(() => {
-                    const otherSignals = Object.entries(allSignals || {}).filter(([k]) => ['regime_reversal','regime_trend_range'].includes(k) && k !== strategy)
+                    const otherSignals = Object.entries(allSignals || {}).filter(([k]) => LIVE_REGIME_STRATEGY_IDS.includes(k) && k !== strategy)
                     if (otherSignals.length > 0) {
                       return otherSignals.map(([k, sig]) => (
                         <ErrorBoundary key={k}>
-                          <CompactSignalPanel signal={sig} ltp={ltp} lastEntry={lastEntries[k]} strategyLabel={{"regime_reversal":"Regime + Reversal Combined","multi_agent":"Multi-Agent Optimized","regime_trend_range":"Regime T/R Optimized","regime_trend_v2":"Regime Trend V2 — Selective","regime_trend_v2b":"Regime Trend V2-B — Balanced","donchian_5m_swing":"Donchian 5m Swing","donchian_5m_intraday":"Donchian 5m Intraday"}[k] || k} />
+                          <CompactSignalPanel signal={sig} ltp={ltp} lastEntry={lastEntries[k]} strategyLabel={LIVE_STRATEGY_LABELS[k] || k} />
                         </ErrorBoundary>
                       ))
                     } else {
@@ -6891,7 +6974,11 @@ export default function App() {
             </div>
           )}
 
-          {tab === 'backtest' && <BacktestPanel connected={connected} />}
+          {tab === 'research_studio' && (
+            <ResearchStudio API={API} onNavigateToBacktest={(sId) => { setStrategy(sId); setTab('backtest'); }} loadRequest={researchLoadReq} />
+          )}
+
+          {tab === 'backtest' && <BacktestPanel connected={connected} selectedStrategy={strategy} onSelectStrategy={(sId) => { setResearchLoadReq({ id: sId, ts: Date.now() }); setTab('research_studio'); }} />}
 
           {tab === 'sig_journal' && (
             <ErrorBoundary>
