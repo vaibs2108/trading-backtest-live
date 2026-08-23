@@ -317,7 +317,7 @@ class RegimeTrendRangeV2HTFHoldKernel(RegimeTrendRangeV2DonchianKernel):
 
     strategy_id = "regime_trend_v2_htfhold"
 
-    def run_backtest(self, frames, initial_capital=500_000, lot_size=15,
+    def run_backtest(self, frames, initial_capital=500_000, lot_size=30,
                       lot_multiplier=1, start_date=None, end_date=None):
         cfg = _get_settings_lazy()
         trail_mult = self._cfg_val(cfg, "trail_mult", self.TRAIL_MULT)
@@ -364,6 +364,9 @@ class RegimeTrendRangeV2HTFHoldKernel(RegimeTrendRangeV2DonchianKernel):
         cooldown_until = -1
         n = len(base)
         start_idx = 80
+        intraday_mode = getattr(cfg, "position_hold_mode", "INTRADAY") != "CARRY_FORWARD"
+        prev_date = None
+        prev_close = None
 
         context = {"cfg": cfg, "df_1h": df_1h, "df_1d": df_1d, "df_1w": df_1w}
 
@@ -380,7 +383,8 @@ class RegimeTrendRangeV2HTFHoldKernel(RegimeTrendRangeV2DonchianKernel):
 
             ts_ist = pd.to_datetime(ts)
             cur_mins = ts_ist.hour * 60 + ts_ist.minute
-            eod_minute = self._eod_exit_minute_for_date(cfg, ts_ist.date())
+            cur_date = ts_ist.date()
+            eod_minute = self._eod_exit_minute_for_date(cfg, cur_date)
 
             if position != "NONE":
 
@@ -411,9 +415,21 @@ class RegimeTrendRangeV2HTFHoldKernel(RegimeTrendRangeV2DonchianKernel):
                         cooldown_until = i + cooldown_bars
                     position = "NONE"
 
-                if cur_mins >= eod_minute:
-                    book(bc, "EOD_EXIT")
-                    continue
+                # EOD handling — only enforced in INTRADAY mode. The
+                # day-boundary check guarantees a position can never silently
+                # roll into a new trading day (which would otherwise happen
+                # for a position opened late enough that no same-day bar
+                # satisfies cur_mins >= eod_minute); CARRY_FORWARD mode skips
+                # both checks entirely and lets SL/trailing/regime-exit
+                # manage the position across days.
+                if intraday_mode:
+                    if prev_date is not None and cur_date != prev_date:
+                        book(prev_close, "EOD_EXIT")
+                    if position != "NONE" and cur_mins >= eod_minute:
+                        book(bc, "EOD_EXIT")
+                        prev_date = cur_date
+                        prev_close = bc
+                        continue
 
                 if position == "LONG" and bl <= sl:
                     real_exit = sl if sl <= bh + 0.01 else bo
@@ -465,12 +481,16 @@ class RegimeTrendRangeV2HTFHoldKernel(RegimeTrendRangeV2DonchianKernel):
                             book(bc, "OPPOSITE_SIGNAL")
 
             if position == "NONE":
-                if cur_mins >= eod_minute:
+                if intraday_mode and cur_mins >= eod_minute:
+                    prev_date = cur_date
+                    prev_close = bc
                     continue
 
                 if i <= cooldown_until:
                     self.on_bar(i, base, row, "NONE", context)
                     regime_counts[self._regime] = regime_counts.get(self._regime, 0) + 1
+                    prev_date = cur_date
+                    prev_close = bc
                     continue
 
                 sig_ev = self.on_bar(i, base, row, "NONE", context)
@@ -486,6 +506,9 @@ class RegimeTrendRangeV2HTFHoldKernel(RegimeTrendRangeV2DonchianKernel):
                     entry_idx = i
                     highest_since_entry = bh
                     lowest_since_entry = bl
+
+            prev_date = cur_date
+            prev_close = bc
 
         if position != "NONE":
             entry_ts_ist = pd.to_datetime(base.iloc[entry_idx]["timestamp"])
@@ -683,7 +706,7 @@ class RegimeTrendRangeV2HalfLifeExitKernel(RegimeTrendRangeV2CUSUMKernel):
             return self.HALFLIFE_DEFAULT_BARS
         return min(max(hl, 3), 200)
 
-    def run_backtest(self, frames, initial_capital=500_000, lot_size=15,
+    def run_backtest(self, frames, initial_capital=500_000, lot_size=30,
                       lot_multiplier=1, start_date=None, end_date=None):
         cfg = _get_settings_lazy()
         trail_mult = self._cfg_val(cfg, "trail_mult", self.TRAIL_MULT)
@@ -732,6 +755,9 @@ class RegimeTrendRangeV2HalfLifeExitKernel(RegimeTrendRangeV2CUSUMKernel):
         cooldown_until = -1
         n = len(base)
         start_idx = 80
+        intraday_mode = getattr(cfg, "position_hold_mode", "INTRADAY") != "CARRY_FORWARD"
+        prev_date = None
+        prev_close = None
 
         context = {"cfg": cfg, "df_1h": df_1h, "df_1d": df_1d, "df_1w": df_1w}
 
@@ -748,7 +774,8 @@ class RegimeTrendRangeV2HalfLifeExitKernel(RegimeTrendRangeV2CUSUMKernel):
 
             ts_ist = pd.to_datetime(ts)
             cur_mins = ts_ist.hour * 60 + ts_ist.minute
-            eod_minute = self._eod_exit_minute_for_date(cfg, ts_ist.date())
+            cur_date = ts_ist.date()
+            eod_minute = self._eod_exit_minute_for_date(cfg, cur_date)
 
             if position != "NONE":
 
@@ -780,9 +807,18 @@ class RegimeTrendRangeV2HalfLifeExitKernel(RegimeTrendRangeV2CUSUMKernel):
                         cooldown_until = i + cooldown_bars
                     position = "NONE"
 
-                if cur_mins >= eod_minute:
-                    book(bc, "EOD_EXIT")
-                    continue
+                # EOD handling — only enforced in INTRADAY mode; see identical
+                # comment in RegimeTrendRangeV2HTFHoldKernel.run_backtest()
+                # above. CARRY_FORWARD mode skips both checks and lets SL/
+                # trailing/regime-exit manage the position across days.
+                if intraday_mode:
+                    if prev_date is not None and cur_date != prev_date:
+                        book(prev_close, "EOD_EXIT")
+                    if position != "NONE" and cur_mins >= eod_minute:
+                        book(bc, "EOD_EXIT")
+                        prev_date = cur_date
+                        prev_close = bc
+                        continue
 
                 if position == "LONG" and bl <= sl:
                     real_exit = sl if sl <= bh + 0.01 else bo
@@ -839,12 +875,16 @@ class RegimeTrendRangeV2HalfLifeExitKernel(RegimeTrendRangeV2CUSUMKernel):
                             book(bc, "OPPOSITE_SIGNAL")
 
             if position == "NONE":
-                if cur_mins >= eod_minute:
+                if intraday_mode and cur_mins >= eod_minute:
+                    prev_date = cur_date
+                    prev_close = bc
                     continue
 
                 if i <= cooldown_until:
                     self.on_bar(i, base, row, "NONE", context)
                     regime_counts[self._regime] = regime_counts.get(self._regime, 0) + 1
+                    prev_date = cur_date
+                    prev_close = bc
                     continue
 
                 context_start = max(0, i - 80)
@@ -865,6 +905,9 @@ class RegimeTrendRangeV2HalfLifeExitKernel(RegimeTrendRangeV2CUSUMKernel):
                     entry_idx = i
                     highest_since_entry = bh
                     lowest_since_entry = bl
+
+            prev_date = cur_date
+            prev_close = bc
 
         if position != "NONE":
             entry_ts_ist = pd.to_datetime(base.iloc[entry_idx]["timestamp"])
@@ -1217,3 +1260,127 @@ class RegimeTrendRangeV2CUSUMCappedSLKernel(RegimeTrendRangeV2HalfLifeExitKernel
         if self.DISABLE_DONCHIAN:
             return None
         return super()._donchian_entry(df_slice, row, regime, atr)
+
+
+class RegimeTrendRangeV2CUSUMPlusRawHalfTrendKernel(RegimeTrendRangeV2CUSUMCappedSLKernel):
+    """CUSUM 1.5 (untouched, exactly as the live custom_cusum15_nodonchian_cd8
+    strategy) PLUS raw, UNFILTERED HalfTrend added as an additional entry
+    trigger: fires on every HalfTrend structural flip, no Hull confirmation,
+    no regime-classifier gate, no orchestrator quality/momentum gate --
+    checked first each bar; if it does not fire, falls through to CUSUM
+    1.5's complete existing entry chain (pullback -> CUSUM -> range)
+    unchanged. HalfTrend's own stop is "SL mode A":
+    (lowest low / highest high of the last 15 bars) -/+ 1.5xATR(14) --
+    NOT the same construction CUSUM's own entries use, which keeps its
+    original flat-ATR-plus-120pt-cap stop untouched.
+
+    Full 13-month validated result (BankNifty 5m, 1 lot=30, backtest-page
+    default sizing), tuned on 2025-07-01..2026-01-31 and CONFIRMED on the
+    untouched 2026-02-01..2026-08-12 holdout before being kept:
+      n=601 trades, PF 1.84, net +710,379 rs, maxDD -6.16%, +23,679.3 pts
+      (vs CUSUM 1.5 alone: n=325, PF 2.37, net +632,889 rs, maxDD -7.92%,
+      +21,096.3 pts -- this combo trades ~85% more often for +12.2% more
+      net P&L and a materially BETTER (not worse) drawdown).
+
+    What was tried and explicitly REJECTED after proper train/validate
+    checking (each looked promising on the tuning window and did NOT
+    survive the untouched holdout, or was a real profit/risk trade-off
+    rather than a clean improvement -- kept OUT of this class):
+      - Regime-gating HalfTrend's entry (2 different classifiers tried:
+        the shared 15-bar RegimeDetectionAgent, and ADX+Choppiness) --
+        both reduce net P&L substantially; the regime gate is doing real
+        work filtering noise, not just blocking good trades.
+      - Skipping the regime-based REGIME_EXIT for HalfTrend positions --
+        modest net gain, materially worse drawdown in every window.
+      - HT_AMPLITUDE=5/6 instead of 4 -- looked like a clean win on the
+        tuning window, drawdown improvement reversed hard on holdout.
+      - An ATR-bar-expansion entry filter, and three different signal-
+        quality filters (distance to the HalfTrend line, efficiency
+        ratio of the run-up, ATR-channel clearance) -- all either did
+        nothing or reduced net P&L at every threshold tried.
+      - A SuperTrend(10,3)-based exit replacing REGIME_EXIT/
+        OPPOSITE_SIGNAL for HalfTrend positions -- real trade-off (higher
+        net, meaningfully worse drawdown), not a clean improvement.
+      - Applying the same SL mode A formula to CUSUM's own entries too --
+        net improvement on the tuning window reversed on holdout, net
+        wash over the full 13 months.
+
+    NOTE ON TRANSACTION COSTS: the trade count here (601) is much higher
+    than CUSUM 1.5 alone (325) -- the shared engine's own cost estimator
+    (_estimate_round_trip_cost, futures-style: brokerage + STT + exchange
+    txn + GST + stamp + ~2pt/side slippage) puts total estimated round-
+    trip friction at roughly Rs 335K over the 13 months for this
+    strategy, meaningfully eroding the gross P&L above. That estimator
+    assumes FUTURES-style STT on full index notional; if this is traded
+    via options instead, the real cost basis is different (likely much
+    smaller, since option premium notional is a fraction of index
+    notional) and has not yet been reconciled against live trading costs
+    -- treat the gross backtest P&L above as the honest starting point
+    and confirm real costs before sizing this for live use.
+
+    NOT YET LIVE-CAPABLE. This is a backtest-page-only promotion per an
+    explicit request to check results across timeframes before any
+    further step; live_capable stays False here deliberately.
+    """
+
+    strategy_id = "regime_trend_v2_cusum_plus_raw_halftrend"
+    HT_AMPLITUDE = 4
+    HT_CHANNEL_DEVIATION = 2
+    HT_ATR_LENGTH = 40
+    HT_SL_LOOKBACK = 15
+    HT_SL_ATR_MULT = 1.5
+
+    @staticmethod
+    def _compute_atr14(df_slice):
+        import numpy as np
+        highs = df_slice["high"].values.astype(float)
+        lows = df_slice["low"].values.astype(float)
+        closes = df_slice["close"].values.astype(float)
+        n = len(highs)
+        prev_close = np.empty(n)
+        prev_close[0] = closes[0]
+        prev_close[1:] = closes[:-1]
+        tr = np.maximum(highs - lows, np.maximum(np.abs(highs - prev_close), np.abs(lows - prev_close)))
+        return pd.Series(tr).ewm(alpha=1.0 / 14, adjust=False).mean().values
+
+    def on_bar(self, bar_idx, base_df, row, position, context):
+        if position == "NONE":
+            from .regime_agents.halftrend_hull import compute_halftrend
+
+            context_start = max(0, bar_idx - 80)
+            df_slice = base_df.iloc[context_start:bar_idx + 1]
+            close = float(row.get("close", 0))
+            atr = float(row.get("atr", close * 0.002))
+            if pd.isna(atr) or atr < 1:
+                atr = close * 0.002
+
+            ht = compute_halftrend(df_slice, amplitude=self.HT_AMPLITUDE,
+                                    channel_deviation=self.HT_CHANNEL_DEVIATION,
+                                    atr_length=self.HT_ATR_LENGTH)
+            if ht is not None:
+                highs = df_slice["high"].values.astype(float)
+                lows = df_slice["low"].values.astype(float)
+                lb15 = min(self.HT_SL_LOOKBACK, len(df_slice))
+                atr14 = self._compute_atr14(df_slice)[-1]
+                cur_ts = pd.Timestamp(row["timestamp"])
+                ts_str = cur_ts.strftime("%Y-%m-%d %H:%M:%S")
+
+                if ht["buy_signal"][-1]:
+                    sl = float(lows[-lb15:].min()) - self.HT_SL_ATR_MULT * atr14
+                    return SignalEvent(
+                        signal="LONG", direction="LONG", timestamp=ts_str, strategy_id=self.strategy_id,
+                        entry_price=close, sl=round(sl, 2), target1=round(close + atr * 1.5, 2),
+                        target2=round(close + atr * 3.0, 2),
+                        reasons=["Raw unfiltered HalfTrend flip, SL mode A, no regime gate"],
+                        regime="TRENDING_UP", trade_source="HALFTREND_RAW", atr=atr, weighted_score=1.0,
+                    )
+                elif ht["sell_signal"][-1]:
+                    sl = float(highs[-lb15:].max()) + self.HT_SL_ATR_MULT * atr14
+                    return SignalEvent(
+                        signal="SHORT", direction="SHORT", timestamp=ts_str, strategy_id=self.strategy_id,
+                        entry_price=close, sl=round(sl, 2), target1=round(close - atr * 1.5, 2),
+                        target2=round(close - atr * 3.0, 2),
+                        reasons=["Raw unfiltered HalfTrend flip, SL mode A, no regime gate"],
+                        regime="TRENDING_DOWN", trade_source="HALFTREND_RAW", atr=atr, weighted_score=1.0,
+                    )
+        return super().on_bar(bar_idx, base_df, row, position, context)

@@ -198,7 +198,7 @@ class RegimeTrendKernel(StrategyKernel):
     # ═════════════════════════════════════════════════════════════════════════
 
     def run_backtest(self, frames: dict, initial_capital: float = 500_000,
-                     lot_size: int = 15, lot_multiplier: int = 1,
+                     lot_size: int = 30, lot_multiplier: int = 1,
                      start_date: Optional[str] = None,
                      end_date: Optional[str] = None) -> dict:
         """Backtest with regime-specific trailing SL, breakeven, EOD exits.
@@ -256,6 +256,9 @@ class RegimeTrendKernel(StrategyKernel):
         lowest_since_entry = 99999999.0
         n = len(base)
         start_idx = 80
+        intraday_mode = getattr(cfg, "position_hold_mode", "INTRADAY") != "CARRY_FORWARD"
+        prev_date = None
+        prev_close = None
 
         context = {"cfg": cfg, "df_1h": df_1h, "df_1d": df_1d, "df_1w": df_1w}
 
@@ -297,10 +300,15 @@ class RegimeTrendKernel(StrategyKernel):
                     })
                     position = "NONE"
 
-                # ── 0. END OF DAY EXIT ──────────────────────────────────
-                if cur_mins >= eod_minute:
-                    book(bc, "EOD_EXIT")
-                    continue
+                # ── 0. END OF DAY EXIT — only enforced in INTRADAY mode ──
+                if intraday_mode:
+                    if prev_date is not None and cur_date != prev_date:
+                        book(prev_close, "EOD_EXIT")
+                    if position != "NONE" and cur_mins >= eod_minute:
+                        book(bc, "EOD_EXIT")
+                        prev_date = cur_date
+                        prev_close = bc
+                        continue
 
                 # ── 1. STOP LOSS HIT ────────────────────────────────────
                 # Real-fill check: only book AT the sl level if price actually
@@ -370,7 +378,9 @@ class RegimeTrendKernel(StrategyKernel):
 
             # ── LOOK FOR NEW ENTRY ──────────────────────────────────────
             if position == "NONE":
-                if cur_mins >= eod_minute:
+                if intraday_mode and cur_mins >= eod_minute:
+                    prev_date = cur_date
+                    prev_close = bc
                     continue
 
                 sig_ev = self.on_bar(i, base, row, "NONE", context)
@@ -384,6 +394,9 @@ class RegimeTrendKernel(StrategyKernel):
                     entry_idx = i
                     highest_since_entry = bh
                     lowest_since_entry = bl
+
+            prev_date = cur_date
+            prev_close = bc
 
         # ── INCLUDE OPEN POSITION ───────────────────────────────────────
         if position != "NONE":

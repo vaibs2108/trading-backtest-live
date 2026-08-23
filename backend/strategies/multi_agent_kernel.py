@@ -46,7 +46,7 @@ class MultiAgentV3Kernel(StrategyKernel):
         return None
 
     def run_backtest(self, frames: dict, initial_capital: float = 500_000,
-                     lot_size: int = 15, lot_multiplier: int = 1,
+                     lot_size: int = 30, lot_multiplier: int = 1,
                      start_date: Optional[str] = None,
                      end_date: Optional[str] = None) -> dict:
         return root_strategy.run_backtest(frames, initial_capital, lot_size, lot_multiplier, start_date, end_date)

@@ -206,7 +206,7 @@ class RegimeReversalKernel(StrategyKernel):
         return None
 
     def run_backtest(self, frames: dict, initial_capital: float = 500_000,
-                     lot_size: int = 15, lot_multiplier: int = 1,
+                     lot_size: int = 30, lot_multiplier: int = 1,
                      start_date: Optional[str] = None,
                      end_date: Optional[str] = None) -> dict:
         from .regime_reversal_strategy import run_backtest as reversal_run_backtest

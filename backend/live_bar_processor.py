@@ -463,6 +463,27 @@ class Cusum15LiveProcessor(BacktestDiffProcessor):
     strategy_id = "custom_cusum15_nodonchian_cd8"
 
 
+class AlphaComboLiveProcessor(BacktestDiffProcessor):
+    """Alpha Combo (CUSUM 1.25 Tuned) -- CUSUM 1.5/No-Donchian/CD8 with the
+    CUSUM threshold loosened to 1.25; beat the CUSUM 1.5 baseline on every
+    metric in every train/validate/full window. Default live strategy,
+    promoted 2026-08-22 after that strategy also beat every dual-engine
+    pyramid variant tried in the same research session."""
+    strategy_id = "custom_alpha_combo_cusum125"
+
+
+class TimeGatedAlphaComboLiveProcessor(BacktestDiffProcessor):
+    """Time-Gated Alpha Combo -- Alpha Combo with new entries blocked during
+    two intraday "trap" windows (10:00-10:45 AM, 1:00-1:45 PM); existing
+    positions still managed normally through those windows. Promoted to
+    live 2026-08-23 after train/validate/full discipline plus a deep
+    trade-level audit (chronological/overlap check, zero trap-window
+    entries confirmed empirically, independent stats recompute, and a
+    signal-reversal falsification test). BankNifty-only validation -- see
+    STRATEGY_REGISTRY.md at the repo root."""
+    strategy_id = "custom_time_gated_alpha_combo"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SINGLETON INSTANCES — created lazily, on first use.
 # Only strategies actually driven by the live loop get a processor instance;
@@ -509,6 +530,12 @@ def get_halftrend_hull_processor() -> HalfTrendHullLiveProcessor:
 
 def get_cusum15_processor() -> Cusum15LiveProcessor:
     return _get_processor(Cusum15LiveProcessor)
+
+def get_alpha_combo_processor() -> AlphaComboLiveProcessor:
+    return _get_processor(AlphaComboLiveProcessor)
+
+def get_time_gated_alpha_combo_processor() -> TimeGatedAlphaComboLiveProcessor:
+    return _get_processor(TimeGatedAlphaComboLiveProcessor)
 
 def reset_all_processors():
     """Reset the processors that are actually in use — call at daily boundary."""

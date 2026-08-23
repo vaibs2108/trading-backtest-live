@@ -328,7 +328,7 @@ def get_current_signal(frames: dict, position: str = "NONE") -> dict:
 
 
 def run_backtest(frames: dict, initial_capital: float = 500_000,
-                 lot_size: int = 15, lot_multiplier: int = 1,
+                 lot_size: int = 30, lot_multiplier: int = 1,
                  start_date: Optional[str] = None,
                  end_date: Optional[str] = None) -> dict:
     """Combined regime trend + regression reversal backtest."""
@@ -399,6 +399,9 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
     regime_counts = {"TRENDING_UP": 0, "TRENDING_DOWN": 0, "SIDEWAYS": 0, "TRANSITION": 0}
     n = len(base)
     start_idx = 80
+    intraday_mode = getattr(cfg, "position_hold_mode", "INTRADAY") != "CARRY_FORWARD"
+    prev_date = None
+    prev_close = None
 
     def book(exit_px, reason, idx):
         nonlocal position, trade_source
@@ -435,6 +438,7 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
 
         ts_ist = pd.to_datetime(ts)
         cur_mins = ts_ist.hour * 60 + ts_ist.minute
+        cur_date = ts_ist.date()
 
         context_start = max(0, i - 80)
         df_slice = base.iloc[context_start:i + 1]
@@ -452,11 +456,17 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
         # ════════════════════════════════════════════════════════════════
         if position != "NONE":
 
-            # ── 0. EOD EXIT ────────────────────────────────────────────
-            if cur_mins >= eod_minute:
-                book(bc, "EOD_EXIT", i)
-                last_regime_direction = "NONE"
-                continue
+            # ── 0. EOD EXIT — only enforced in INTRADAY mode ────────────
+            if intraday_mode:
+                if prev_date is not None and cur_date != prev_date:
+                    book(prev_close, "EOD_EXIT", i)
+                    last_regime_direction = "NONE"
+                if position != "NONE" and cur_mins >= eod_minute:
+                    book(bc, "EOD_EXIT", i)
+                    last_regime_direction = "NONE"
+                    prev_date = cur_date
+                    prev_close = bc
+                    continue
 
             # ── 1. SL HIT ─────────────────────────────────────────────
             # No `continue` — falls through to flat section where agents
@@ -538,6 +548,8 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                         sl = bc + 1.5 * atr_v  # SL above entry for SHORT
                         highest_since_entry = bh
                         lowest_since_entry = bl
+                        prev_date = cur_date
+                        prev_close = bc
                         continue
 
                     elif position == "SHORT" and bot_sig[i]:
@@ -549,6 +561,8 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                         sl = bc - 1.5 * atr_v  # SL below entry for LONG
                         highest_since_entry = bh
                         lowest_since_entry = bl
+                        prev_date = cur_date
+                        prev_close = bc
                         continue
 
             # If position was closed above (SL/REGIME_EXIT), fall through
@@ -559,7 +573,9 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
         #  LOOK FOR NEW ENTRY (only when flat)
         # ════════════════════════════════════════════════════════════════
         if position == "NONE":
-            if cur_mins >= eod_minute:
+            if intraday_mode and cur_mins >= eod_minute:
+                prev_date = cur_date
+                prev_close = bc
                 continue
 
             # ALWAYS run regime agents when flat — keeps state in sync
@@ -582,6 +598,8 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                     lowest_since_entry = bl
                 else:
                     last_regime_direction = "NONE"
+                prev_date = cur_date
+                prev_close = bc
                 continue
 
             # Priority 1: Check reversal signals (quick scalp opportunity)
@@ -593,6 +611,8 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                 sl = bc - 1.5 * atr_v  # SL below entry for LONG
                 highest_since_entry = bh
                 lowest_since_entry = bl
+                prev_date = cur_date
+                prev_close = bc
                 continue
 
             elif top_sig[i]:
@@ -603,6 +623,8 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                 sl = bc + 1.5 * atr_v  # SL above entry for SHORT
                 highest_since_entry = bh
                 lowest_since_entry = bl
+                prev_date = cur_date
+                prev_close = bc
                 continue
 
             # Priority 2: Check regime signal (already computed above)
@@ -616,6 +638,9 @@ def run_backtest(frames: dict, initial_capital: float = 500_000,
                 lowest_since_entry = bl
                 last_regime_direction = sig.signal
                 last_regime_sl = sig.sl
+
+        prev_date = cur_date
+        prev_close = bc
 
     # ── Open position marker ──
     if position != "NONE":

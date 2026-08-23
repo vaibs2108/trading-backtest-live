@@ -35,7 +35,9 @@ _data_health_state = {
     "staleness_seconds": 0,
     "broker_failures": 0,
     "last_check_time": None,
+    "stale_poll_count": 0,  # consecutive polls over threshold (hysteresis, avoids flapping alerts)
 }
+_STALE_CONFIRM_POLLS = 3  # require this many consecutive stale polls before alerting (mirrors broker_failures pattern)
 
 # ── Application-level start/stop control ────────────────────────────────────
 _app_running = True  # When False, polling loop and data fetching are paused
@@ -413,6 +415,7 @@ class BacktestRequest(BaseModel):
     initial_capital: float = 500_000
     lot_multiplier: int = 1
     strategy: Optional[str] = None  # override active strategy for this backtest
+    hold_mode: str = "INTRADAY"  # INTRADAY | CARRY_FORWARD — position EOD handling
 
 class ManualTradeRequest(BaseModel):
     action: str   # LONG | SHORT | EXIT
@@ -985,10 +988,13 @@ async def run_backtest(req: BacktestRequest):
     bt_strategy = req.strategy or cfg.strategy
     original_strategy = cfg.strategy
     original_instrument = cfg.instrument
+    original_hold_mode = cfg.position_hold_mode
     if bt_strategy != original_strategy:
         cfg.strategy = bt_strategy
     if req.instrument != original_instrument:
         cfg.instrument = req.instrument
+    bt_hold_mode = req.hold_mode if req.hold_mode in ("INTRADAY", "CARRY_FORWARD") else "INTRADAY"
+    cfg.position_hold_mode = bt_hold_mode
 
     try:
         result = await asyncio.to_thread(
@@ -1006,11 +1012,13 @@ async def run_backtest(req: BacktestRequest):
     finally:
         cfg.strategy = original_strategy
         cfg.instrument = original_instrument
+        cfg.position_hold_mode = original_hold_mode
 
     if not isinstance(result, dict):
         result = {"error": "Invalid backtest result"}
 
     result["strategy_used"] = bt_strategy
+    result["hold_mode_used"] = bt_hold_mode
     return _sanitise_floats(result)
 
 
@@ -2322,6 +2330,13 @@ _TRAIL_PARAMS = {
     "custom_regime_v1_trend_range_final": {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
     "custom_halftrend_hull_standalone":   {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
     "custom_cusum15_nodonchian_cd8":      {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
+    # Alpha Combo inherits TRAIL_MULT=3.5/BE_TRIGGER=2.0 unchanged from the same
+    # CUSUM15PlusRawHalfTrendKernel lineage as the CD8 row above (only
+    # CUSUM_THRESHOLD_ATR differs, 1.25 vs 1.5) -- same trail/BE shape applies.
+    "custom_alpha_combo_cusum125":        {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
+    # Time-Gated Alpha Combo is Alpha Combo plus an entry-time filter only --
+    # trail/BE params are untouched, same values apply.
+    "custom_time_gated_alpha_combo":      {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
 }
 
 # Cooldown-after-loss bar counts, keyed by strategy_id. CUSUM's 8-bar
@@ -2333,6 +2348,12 @@ _COOLDOWN_BARS = {
     "custom_regime_v1_trend_range_final": 4,
     "custom_halftrend_hull_standalone": 4,
     "custom_cusum15_nodonchian_cd8": 8,
+    # Alpha Combo inherits COOLDOWN_BARS=8 unchanged from CUSUM15PlusRawHalfTrendKernel,
+    # same as the CD8 row above.
+    "custom_alpha_combo_cusum125": 8,
+    # Time-Gated Alpha Combo inherits the same COOLDOWN_BARS=8 (only adds an
+    # entry-time filter, doesn't touch cooldown).
+    "custom_time_gated_alpha_combo": 8,
 }
 
 
@@ -2568,6 +2589,7 @@ async def _signal_polling_loop():
 
                 from live_bar_processor import (
                     get_regime_v1_final_processor, get_halftrend_hull_processor, get_cusum15_processor,
+                    get_alpha_combo_processor, get_time_gated_alpha_combo_processor,
                 )
 
                 _lot_size = broker.get_lot_size(cfg.instrument)
@@ -2575,15 +2597,24 @@ async def _signal_polling_loop():
 
                 _all_strat_sigs = {}
 
-                # Three PRODUCTION strategies run live: the 3 research
+                # Five PRODUCTION strategies run live: the original 3 research
                 # strategies validated in scratch/research_v1/ (Regime T/R
                 # V1 Final, HalfTrend+Hull Standalone, CUSUM 1.5/No-Donchian/
-                # CD8), promoted from exploration in place of the prior
-                # regime_reversal/regime_trend_range/multi_agent trio, which
-                # remain registered for the Backtest page but are no longer
-                # evaluated in the live loop. V2 / V2-B / Donchian also stay
-                # backtest-only, as before.
+                # CD8), Alpha Combo (CUSUM 1.25 Tuned) -- the strategy that
+                # beat CUSUM 1.5 and every dual-engine pyramid variant under
+                # train/validate/full discipline, promoted 2026-08-22 and the
+                # default (see settings.json / config.py Settings.strategy)
+                # -- and Time-Gated Alpha Combo, promoted 2026-08-23 after the
+                # same discipline plus a deep trade-level audit (BankNifty-only
+                # validation, see STRATEGY_REGISTRY.md). regime_trend_range/
+                # multi_agent remain registered for the Backtest page but are
+                # no longer evaluated in the live loop; regime_reversal was
+                # removed from the registry entirely on 2026-08-23 (worst
+                # drawdown of any tested strategy, see STRATEGY_REGISTRY.md).
+                # V2 / V2-B / Donchian also stay backtest-only, as before.
                 _proc_list = [
+                    ("custom_alpha_combo_cusum125", get_alpha_combo_processor()),
+                    ("custom_time_gated_alpha_combo", get_time_gated_alpha_combo_processor()),
                     ("custom_regime_v1_trend_range_final", get_regime_v1_final_processor()),
                     ("custom_halftrend_hull_standalone", get_halftrend_hull_processor()),
                     ("custom_cusum15_nodonchian_cd8", get_cusum15_processor()),
@@ -2621,33 +2652,59 @@ async def _signal_polling_loop():
                             sig_dict["instrument"] = cfg.instrument
 
                             if _live_sig.signal_type == "ENTRY":
+                                _tid = _trace_id(_strat_id, _live_sig.signal, _live_sig.time)
+                                _trace(_tid, "DETECTED", f"path=processor strategy={_strat_id} dir={_live_sig.signal} "
+                                                          f"entry={_live_sig.entry_price} sl={_live_sig.sl} sig_time={_live_sig.time}")
                                 _add_signal_to_history(sig_dict)
                                 # Invalidate chart cache so next fetch gets fresh backtest with this signal
                                 _chart_signals_cache.clear()
                                 add_activity_log(f"[{_strat_id.upper()}] Processor Entry: {_live_sig.signal} @ {_live_sig.entry_price}")
                                 logger.info(f"[{_strat_id}] Processor Entry: {_live_sig.signal} @ {_live_sig.entry_price} SL={_live_sig.sl}")
+                                # Diagnostic (2026-08-22 audit): a phantom entry was found in Telegram
+                                # history whose "Entry:" price never matched any real market data,
+                                # while its exit's price exactly matched its OWN (already-wrong) SL --
+                                # pointing at stale in-memory state rather than a data/timing issue.
+                                # Root cause couldn't be pinned down after the fact with no logs from
+                                # that moment. Log raw state on every entry so a recurrence is
+                                # catchable with real evidence instead of reconstructed days later.
+                                try:
+                                    _last5 = frames.get("5")
+                                    _last5_bars = (
+                                        _last5.tail(3)[["timestamp", "open", "high", "low", "close"]].to_dict("records")
+                                        if _last5 is not None and not _last5.empty else []
+                                    )
+                                    logger.info(
+                                        f"[{_strat_id}] ENTRY diagnostic: sig_dict={sig_dict} "
+                                        f"proc_state=(position={_processor.position}, entry_price={_processor.entry_price}, "
+                                        f"sl={_processor.sl}, target1={_processor.target1}, target2={_processor.target2}, "
+                                        f"prev_trade_keys_n={len(_processor._prev_trade_keys)}, prev_open_key={_processor._prev_open_key}) "
+                                        f"last5_bars={_last5_bars}"
+                                    )
+                                except Exception as _diag_err:
+                                    logger.debug(f"Entry diagnostic logging failed: {_diag_err}")
                                 # Notify frontend instantly with complete signal marker data via WebSocket
                                 await ws_manager.broadcast({"type": "signal_event", "data": sig_dict})
                                 await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": _strat_id, "signal": _live_sig.signal}})
-                                # Send Telegram in background (non-blocking) for active strategy
+                                # Send Telegram in background (non-blocking) for active strategy --
+                                # skip stale/historical-replay signals so a data-gap catch-up burst
+                                # doesn't alert as if each old signal just happened live.
                                 if _strat_id == cfg.strategy:
-                                    asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
+                                    _entry_sig_age = _signal_age_minutes(_live_sig.time)
+                                    if _entry_sig_age is None or _entry_sig_age <= 10.0:
+                                        _trace(_tid, "TELEGRAM", "sending")
+                                        asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
+                                    else:
+                                        _trace(_tid, "TELEGRAM", f"skipped, age={_entry_sig_age:.1f}m")
+                                        logger.info(f"[{_strat_id}] Telegram entry alert skipped — signal {_entry_sig_age:.1f} mins old")
 
                                 # Instant order execution for active strategy (1-2s latency matching backtest)
                                 if _strat_id == cfg.strategy and (not tm.position or tm.position.instrument != cfg.instrument):
                                     ok, reason = True, "OK"
                                     if cfg.auto_trade:
                                         # Signal freshness check: skip historical replay signals (>10 mins old)
-                                        try:
-                                            _parsed_sig_time = pd.to_datetime(_live_sig.time)
-                                            if hasattr(_parsed_sig_time, "tzinfo") and _parsed_sig_time.tzinfo is not None:
-                                                _parsed_sig_time = _parsed_sig_time.tz_convert("Asia/Kolkata").tz_localize(None)
-                                            _now_ist_naive = datetime.now(_IST).replace(tzinfo=None)
-                                            _sig_age = (_now_ist_naive - _parsed_sig_time).total_seconds() / 60.0
-                                            if _sig_age > 10.0:
-                                                ok, reason = False, f"Historical replay signal skipped ({_sig_age:.1f} mins old)"
-                                        except Exception as _age_err:
-                                            logger.debug(f"Signal age check error: {_age_err}")
+                                        _sig_age = _signal_age_minutes(_live_sig.time)
+                                        if _sig_age is not None and _sig_age > 10.0:
+                                            ok, reason = False, f"Historical replay signal skipped ({_sig_age:.1f} mins old)"
 
                                         if ok:
                                             ok, reason = tm.can_trade
@@ -2669,8 +2726,11 @@ async def _signal_polling_loop():
                                             cooldown_mins = cooldown_bars * 5
                                             if elapsed_mins < cooldown_mins:
                                                 ok, reason = False, f"Cooldown active for {cooldown_mins - elapsed_mins:.1f} mins"
+                                    _trace(_tid, "ORDER_ATTEMPT", f"path=processor auto_trade={cfg.auto_trade} ok={ok} reason={reason}")
                                     if ok:
                                         result = await asyncio.to_thread(_execute_order, sig_dict, cfg, _live_sig.signal)
+                                        _trace(_tid, "BROKER_RESULT", f"success={result.get('success')} "
+                                                                       f"order_id={result.get('order_id','')} error={result.get('error','')}")
                                         if result.get("success"):
                                             tm.reset_order_failures()
                                             await ws_manager.broadcast({"type": "trade_opened", "data": result})
@@ -2688,34 +2748,80 @@ async def _signal_polling_loop():
                                     logger.error(f"Failed to open journal for {_strat_id}: {_sj_err}")
 
                             elif _live_sig.signal_type == "EXIT":
+                                _tid = _trace_id(_strat_id, _live_sig.signal, _live_sig.time)
+                                _trace(_tid, "DETECTED", f"path=processor strategy={_strat_id} dir={_live_sig.signal} "
+                                                          f"exit={_live_sig.exit_price} reason={_live_sig.exit_reason} sig_time={_live_sig.time}")
                                 _add_signal_to_history(sig_dict)
                                 # Invalidate chart cache so next fetch gets fresh backtest with this signal
                                 _chart_signals_cache.clear()
                                 logger.info(f"[{_strat_id}] Processor Exit: {_live_sig.signal} ({_live_sig.exit_reason}) @ {_live_sig.exit_price}")
+                                # Diagnostic (2026-08-22 audit) -- same reasoning as the entry diagnostic above.
+                                try:
+                                    logger.info(
+                                        f"[{_strat_id}] EXIT diagnostic: sig_dict={sig_dict} "
+                                        f"tm_position=(exists={tm.position is not None}, "
+                                        f"strategy={getattr(tm.position, 'strategy', None)}, "
+                                        f"order_id={getattr(tm.position, 'order_id', None)}, "
+                                        f"sl={getattr(tm.position, 'sl', None)}, entry_price={getattr(tm.position, 'entry_price', None)})"
+                                    )
+                                except Exception as _diag_err:
+                                    logger.debug(f"Exit diagnostic logging failed: {_diag_err}")
                                 # Notify frontend instantly via WebSocket (both marker push + cache refresh)
                                 await ws_manager.broadcast({"type": "signal_event", "data": sig_dict})
                                 await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": _strat_id, "signal": _live_sig.signal}})
-                                # Send Telegram in background (non-blocking) for active strategy
-                                if _strat_id == cfg.strategy:
-                                    asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
+                                # Ownership check moved up here, BEFORE the Telegram send (previously
+                                # it only ran further below, right before the broker-close attempt).
+                                # A strategy's own kernel detects exits purely from its own internal
+                                # diff state -- completely decoupled from tm.position -- so if the
+                                # currently-tracked real position belongs to a different strategy (or
+                                # is a DHAN_SYNC broker-carried position), this strategy's "exit"
+                                # doesn't correspond to anything real happening to that position. Left
+                                # unchecked, that produced contradictory duplicate alerts: e.g. one
+                                # exit reason from this processor's own logic, a different reason/price
+                                # moments later from the position's rightful owner (or the generic
+                                # position monitor) actually closing it.
+                                _pos = tm.position if (tm.position and tm.position.instrument == cfg.instrument) else None
+                                _owns_position = bool(
+                                    _pos and not _pos.order_id.startswith("DHAN_SYNC_")
+                                    and (not _pos.strategy or _pos.strategy == _strat_id)
+                                )
+                                _conflicting_real_position = bool(_pos and not _owns_position)
+
+                                # Send Telegram in background (non-blocking) for active strategy.
+                                # - Owns the position: always alert, regardless of detection delay --
+                                #   never suppress information about capital that's actually moving.
+                                # - No position at all: virtual/journal-only signal, freshness-gated
+                                #   (a stale catch-up burst shouldn't alert as if live).
+                                # - A REAL position exists but belongs to someone else: suppress
+                                #   entirely -- this signal doesn't describe anything real, at any age.
+                                if _strat_id == cfg.strategy and _conflicting_real_position:
+                                    _trace(_tid, "TELEGRAM", f"suppressed, position belongs to '{_pos.strategy or 'broker_sync'}'")
+                                    logger.info(
+                                        f"[{_strat_id}] Telegram exit alert suppressed — current position "
+                                        f"{_pos.symbol} belongs to '{_pos.strategy or 'broker_sync'}', not this strategy"
+                                    )
+                                elif _strat_id == cfg.strategy:
+                                    _exit_sig_age = _signal_age_minutes(_live_sig.time)
+                                    if _owns_position or _exit_sig_age is None or _exit_sig_age <= 10.0:
+                                        _trace(_tid, "TELEGRAM", "sending")
+                                        asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
+                                    else:
+                                        _trace(_tid, "TELEGRAM", f"skipped, age={_exit_sig_age:.1f}m")
+                                        logger.info(f"[{_strat_id}] Telegram exit alert skipped (no real position) — signal {_exit_sig_age:.1f} mins old")
 
                                 # Execute broker exit for active strategy trade if open
-                                if _strat_id == cfg.strategy and tm.position and tm.position.instrument == cfg.instrument:
-                                    pos = tm.position
+                                if _strat_id == cfg.strategy and _pos is not None:
+                                    pos = _pos
                                     # Ownership guard: only close a position this strategy actually
                                     # opened. Without this, a broker-synced carry position (or a
                                     # position opened by a different strategy) sitting in the same
                                     # single tracking slot could get closed by a signal that was never
                                     # meant for it — this happened for real on 2026-07-27, where a
                                     # regime_trend_range exit closed an unrelated Dhan carry position.
-                                    if pos.order_id.startswith("DHAN_SYNC_") or (pos.strategy and pos.strategy != _strat_id):
-                                        logger.warning(
-                                            f"[{_strat_id}] EXIT signal ({_live_sig.signal}) ignored — "
-                                            f"current position {pos.symbol} belongs to "
-                                            f"'{pos.strategy or 'broker_sync'}', not this strategy. "
-                                            f"Refusing to close a position this strategy didn't open."
-                                        )
-                                        continue
+                                    if not _owns_position:
+                                        _trace(_tid, "ORDER_ATTEMPT", "skipped, position not owned by this strategy")
+                                        continue  # already logged above
+                                    _trace(_tid, "ORDER_ATTEMPT", f"path=processor auto_trade={cfg.auto_trade} closing {pos.symbol}")
                                     logger.info(f"Processor EXIT ({_live_sig.signal}) for active strategy — closing position {pos.symbol}")
                                     if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
                                         if getattr(pos, "sl_order_id", None):
@@ -2725,6 +2831,7 @@ async def _signal_polling_loop():
                                                 logger.warning(f"Could not cancel broker SL on processor exit: {_sl_c_err}")
                                             pos.sl_order_id = None
                                         _proc_exit = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
+                                        _trace(_tid, "BROKER_RESULT", f"success={_proc_exit.get('success')} error={_proc_exit.get('error','')}")
                                         if not _proc_exit.get("success"):
                                             logger.error(f"Processor EXIT FAILED for {pos.symbol}: {_proc_exit.get('error')}")
                                             try:
@@ -2748,6 +2855,7 @@ async def _signal_polling_loop():
                                             get_capital_tracker().record_trade_pnl(rec.get("pnl", 0.0))
                                         await ws_manager.broadcast({"type": "trade_closed", "data": rec})
                                     else:
+                                        _trace(_tid, "BROKER_RESULT", "paper close, no broker call")
                                         ltp_idx = (await asyncio.to_thread(broker.get_ltp, pos.instrument)) or _live_sig.exit_price
                                         pnl_exit_price = _safe_pnl_exit_price(pos, ltp_idx)
                                         _recently_closed_symbols[pos.symbol] = datetime.now(_IST)
@@ -2800,10 +2908,15 @@ async def _signal_polling_loop():
                     _close_dt = now.replace(hour=_close_h, minute=_close_m, second=0, microsecond=0)
                     _mins_to_close = (_close_dt - now).total_seconds() / 60
                     if 0 < _mins_to_close <= _squareoff_mins:
-                        logger.info(f"Auto square-off: {_mins_to_close:.0f} mins to close, squaring off position")
                         pos = tm.position
+                        _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", pos.entry_time)
+                        _trace(_tid, "DETECTED", f"path=auto_squareoff strategy={cfg.strategy} "
+                                                  f"mins_to_close={_mins_to_close:.0f} pos={pos.symbol}")
+                        logger.info(f"Auto square-off: {_mins_to_close:.0f} mins to close, squaring off position")
                         if not pos.order_id.startswith("PAPER_"):
+                            _trace(_tid, "ORDER_ATTEMPT", f"path=auto_squareoff closing {pos.symbol}")
                             _sq_exit = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
+                            _trace(_tid, "BROKER_RESULT", f"success={_sq_exit.get('success')} error={_sq_exit.get('error','')}")
                             if not _sq_exit.get("success"):
                                 logger.error(f"Auto-squareoff exit FAILED: {_sq_exit.get('error')}. Position kept open.")
                                 try:
@@ -2849,6 +2962,7 @@ async def _signal_polling_loop():
                             logger.error(f"Square-off logging error: {_sq_err}")
                         # Telegram exit alert for auto square-off
                         try:
+                            _trace(_tid, "TELEGRAM", "sending")
                             send_telegram_exit_alert(pos, ltp, "AUTO_SQUAREOFF", rec.get("pnl", 0.0), index_exit_price=ltp)
                         except Exception as _tg_err:
                             logger.warning(f"Telegram square-off alert failed: {_tg_err}")
@@ -2871,6 +2985,9 @@ async def _signal_polling_loop():
                     # Re-entry in the new direction requires fresh 2-poll confirmation.
                     elif tm.position and tm.position.instrument == sig.get("instrument") and tm.position.direction != sig_direction:
                         pos = tm.position
+                        _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", sig_ts)
+                        _trace(_tid, "DETECTED", f"path=legacy_opposite_signal strategy={cfg.strategy} "
+                                                  f"closing={pos.direction} new_signal={sig_direction} sig_time={sig_ts}")
                         logger.info(f"Opposite signal ({sig_direction}) while in {pos.direction} — exiting only (no auto-flip)")
 
                         # --- FIX: Do NOT close DHAN_SYNC positions internally when auto_trade is OFF ---
@@ -2888,8 +3005,10 @@ async def _signal_polling_loop():
                             _last_telegram_signal_key = ("", "")
                             continue  # skip — can't act on broker, don't close locally
 
+                        _trace(_tid, "ORDER_ATTEMPT", f"path=legacy_opposite_signal auto_trade={cfg.auto_trade} closing {pos.symbol}")
                         if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
                             _opp_exit = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
+                            _trace(_tid, "BROKER_RESULT", f"success={_opp_exit.get('success')} error={_opp_exit.get('error','')}")
                             if not _opp_exit.get("success"):
                                 logger.error(f"Opposite-signal exit FAILED: {_opp_exit.get('error')}. Position kept open.")
                                 try:
@@ -2926,6 +3045,7 @@ async def _signal_polling_loop():
                         except Exception as _fl_err:
                             logger.error(f"Opposite-signal exit logging error: {_fl_err}")
                         try:
+                            _trace(_tid, "TELEGRAM", "sending")
                             send_telegram_exit_alert(pos, ltp, exit_reason, rec.get("pnl", 0.0), index_exit_price=ltp)
                         except Exception as _tg_err:
                             logger.warning(f"Telegram opposite-exit alert failed: {_tg_err}")
@@ -2956,9 +3076,25 @@ async def _signal_polling_loop():
                                 logger.info(f"Signal buffered for confirmation: {sig_direction} at {sig_ts}")
 
                         if should_enter:
+                            _tid = _trace_id(cfg.strategy, sig_direction, sig_ts)
+                            _trace(_tid, "DETECTED", f"path=legacy strategy={cfg.strategy} dir={sig_direction} sig_time={sig_ts}")
                             ok = True
                             reason = "OK"
                             if cfg.auto_trade:
+                                # Signal freshness check: `sig` reflects the processor's CURRENT
+                                # state (self.position), not a fresh event -- if it's been showing
+                                # LONG/SHORT for a while (e.g. accumulated while auto_trade was OFF)
+                                # and _last_telegram_signal_key gets reset for any reason (backend
+                                # restart, an opposite-signal exit, first poll after auto_trade is
+                                # turned on), the very next poll would otherwise treat that stale
+                                # signal as brand new and place a REAL order for an entry price that
+                                # may be many minutes old -- a real incident, not hypothetical. Same
+                                # 10-minute cutoff as the newer bar-by-bar processor path uses.
+                                _sig_age = _signal_age_minutes(sig_ts)
+                                if _sig_age is not None and _sig_age > 10.0:
+                                    ok, reason = False, f"Historical replay signal skipped ({_sig_age:.1f} mins old)"
+
+                            if ok and cfg.auto_trade:
                                 ok, reason = tm.can_trade
                                 if ok:
                                     ct_ok, ct_reason = get_capital_tracker().can_trade()
@@ -2983,8 +3119,11 @@ async def _signal_polling_loop():
                                     if elapsed_mins < cooldown_mins:
                                         ok = False
                                         reason = f"Cooldown: same direction ({sig_direction}) blocked for {cooldown_mins - elapsed_mins:.1f} more mins"
+                            _trace(_tid, "ORDER_ATTEMPT", f"path=legacy auto_trade={cfg.auto_trade} ok={ok} reason={reason}")
                             if ok:
                                 result = await asyncio.to_thread(_execute_order, sig, cfg, sig_direction)
+                                _trace(_tid, "BROKER_RESULT", f"success={result.get('success')} "
+                                                               f"order_id={result.get('order_id','')} error={result.get('error','')}")
                                 if result.get("success"):
                                     tm.reset_order_failures()
                                     await ws_manager.broadcast({"type": "trade_opened", "data": result})
@@ -3239,16 +3378,21 @@ async def _signal_polling_loop():
                                     logger.error(f"Failed to log model exit signal: {ex_err}")
 
                         if exit_triggered:
+                            _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", pos.entry_time)
+                            _trace(_tid, "DETECTED", f"path=position_monitor strategy={cfg.strategy} "
+                                                      f"reason={exit_reason} pos={pos.symbol} entry_time={pos.entry_time}")
                             # Only place real broker exit order in live auto-trade mode
                             if cfg.auto_trade and not pos.order_id.startswith("PAPER_") and exit_reason != "BROKER_SL_HIT":
+                                _trace(_tid, "ORDER_ATTEMPT", f"path=position_monitor auto_trade={cfg.auto_trade} closing {pos.symbol}")
                                 if getattr(pos, "sl_order_id", None):
                                     try:
                                         await asyncio.to_thread(broker.cancel_broker_sl, pos.sl_order_id)
                                     except Exception as sl_cancel_err:
                                         logger.warning(f"Could not cancel broker SL: {sl_cancel_err}")
                                     pos.sl_order_id = None
-                                
+
                                 exit_result = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
+                                _trace(_tid, "BROKER_RESULT", f"success={exit_result.get('success')} error={exit_result.get('error','')}")
                                 if exit_result.get("success"):
                                     logger.info(f"SL/target EXIT order placed successfully for {pos.symbol} ({exit_reason})")
                                 else:
@@ -3283,6 +3427,7 @@ async def _signal_polling_loop():
                                 _last_alert = _manual_exit_alert_last_sent.get(pos.order_id)
                                 if _last_alert is None or (_now_alert - _last_alert).total_seconds() >= 900:
                                     _manual_exit_alert_last_sent[pos.order_id] = _now_alert
+                                    _trace(_tid, "TELEGRAM", f"MANUAL_EXIT_NEEDED reminder sent, reason={exit_reason}")
                                     try:
                                         _send_telegram_alert_wrapper(
                                             f"\u26a0\ufe0f MANUAL EXIT NEEDED\n"
@@ -4594,6 +4739,46 @@ def _build_alert_sig(sig: dict, cfg, symbol: str, direction: str) -> dict:
 
     return alert_sig
 
+def _trace_id(strategy_id: str, direction: str, sig_time) -> str:
+    """Short, stable id for one signal's end-to-end lifecycle. Deterministic
+    from (strategy, direction, time) -- the same natural key already used for
+    signal dedup elsewhere -- so independent code paths that touch the "same"
+    signal (detection, Telegram, order execution, broker result) all produce
+    the identical id without needing to pass a generated value between them.
+    `grep 'TRACE\\[<id>\\]' backend/logs/app.log` reconstructs the full
+    lifecycle of any one trade signal in order. Built 2026-08-23 after a real
+    incident (a stale signal fired a live order the moment auto_trade was
+    turned on) took far longer to diagnose than it should have because no
+    single log line tied detection -> Telegram -> order -> broker result
+    together for the same signal."""
+    import hashlib
+    key = f"{strategy_id}|{direction}|{sig_time}"
+    return hashlib.md5(key.encode()).hexdigest()[:8]
+
+
+def _trace(trace_id: str, stage: str, detail: str = "") -> None:
+    """One standardized, greppable log line per pipeline stage."""
+    logger.info(f"TRACE[{trace_id}] {stage}: {detail}" if detail else f"TRACE[{trace_id}] {stage}")
+
+
+def _signal_age_minutes(sig_time) -> Optional[float]:
+    """Age of a signal's timestamp in minutes, or None if unparseable.
+    Shared by both the auto-trade order-execution freshness gate and the
+    Telegram alert freshness gate below -- previously only order execution
+    had this check, so a catch-up burst of historical/replay signals (e.g.
+    after a data gap) correctly skipped placing orders but still fired a
+    Telegram alert for every stale signal as if it were live. Both paths
+    now use the same >10-minute cutoff."""
+    try:
+        parsed = pd.to_datetime(sig_time)
+        if hasattr(parsed, "tzinfo") and parsed.tzinfo is not None:
+            parsed = parsed.tz_convert("Asia/Kolkata").tz_localize(None)
+        now_naive = datetime.now(_IST).replace(tzinfo=None)
+        return (now_naive - parsed).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
 def _check_data_staleness(frames: dict, cfg) -> None:
     """Check if candle data is stale and update health state."""
     global _data_health_state
@@ -4644,21 +4829,30 @@ def _check_data_staleness(frames: dict, cfg) -> None:
 
         was_stale = _data_health_state["is_stale"]
         if staleness_sec > threshold_sec:
-            _data_health_state["is_stale"] = True
-            if not was_stale:
-                logger.warning(
-                    f"DATA STALE: Last 5min candle is {staleness_sec/60:.1f} min old "
-                    f"(threshold: {cfg.data_stale_threshold_min} min). "
-                    "To disable this check for off-hours testing, set data_stale_threshold_min to 0 in settings."
-                )
-                try:
-                    _send_telegram_alert_wrapper(
-                        f"\u26a0\ufe0f DATA STALE: Last candle {staleness_sec/60:.1f} min old. Check broker connection.",
-                        cfg.telegram_bot_token, cfg.telegram_chat_id
+            # Hysteresis: require _STALE_CONFIRM_POLLS consecutive stale readings
+            # before flagging/alerting. A single borderline poll (e.g. right at a
+            # candle boundary, or mid-HTF-cache-cycle) is normal, not a real
+            # outage -- alerting on every such blip is what caused this check to
+            # get disabled entirely in the past. Only sustained staleness counts.
+            _data_health_state["stale_poll_count"] += 1
+            if _data_health_state["stale_poll_count"] >= _STALE_CONFIRM_POLLS:
+                _data_health_state["is_stale"] = True
+                if not was_stale:
+                    logger.warning(
+                        f"DATA STALE: Last 5min candle is {staleness_sec/60:.1f} min old "
+                        f"(threshold: {cfg.data_stale_threshold_min} min, confirmed over "
+                        f"{_data_health_state['stale_poll_count']} consecutive polls). "
+                        "To disable this check for off-hours testing, set data_stale_threshold_min to 0 in settings."
                     )
-                except Exception:
-                    pass
+                    try:
+                        _send_telegram_alert_wrapper(
+                            f"\u26a0\ufe0f DATA STALE: Last candle {staleness_sec/60:.1f} min old. Check broker connection.",
+                            cfg.telegram_bot_token, cfg.telegram_chat_id
+                        )
+                    except Exception:
+                        pass
         else:
+            _data_health_state["stale_poll_count"] = 0
             _data_health_state["is_stale"] = False
             if was_stale:
                 logger.info("Data freshness restored")
@@ -4668,6 +4862,42 @@ _htf_cache = {}
 _rest_5m_cache: dict = {}  # instrument -> REST 5m base (volume-bearing)       # cached higher-TF frames: {instrument: {"1D": df, "60": df, "15": df}}
 _htf_cache_ts = 0.0   # last time HTF were fetched
 _htf_poll_count = 0   # cycle counter for periodic HTF refresh
+
+def _fetch_5m_rest_with_freshness_retry(instrument: str, from_d: str, today: str, now_ist) -> Optional[pd.DataFrame]:
+    """Fetch 5m candles via the historical REST API and, if the result is
+    already >7 minutes stale (matching the live-feed path's freshness guard
+    at _fetch_all_frames' "Freshness guard" block above), retry once after a
+    short pause -- covers transient lag right at a candle-close boundary.
+    Always logs if the result is still stale after the retry, so staleness is
+    visible in logs/health-state regardless of what data_stale_threshold_min
+    is set to. This closes the gap where only the live-feed-merge path had
+    any freshness handling; the pure-REST fallback (live feed down, or not
+    enough live candles yet) previously had none at all."""
+    import time as _time_mod
+
+    def _age_min(df):
+        if df is None or len(df) == 0:
+            return None
+        last_ts = pd.to_datetime(df["timestamp"].max())
+        now_naive = datetime.now(_IST).replace(tzinfo=None)
+        return (now_naive - last_ts).total_seconds() / 60.0
+
+    df = broker.get_historical_data(instrument, "5", from_d, today)
+    age = _age_min(df)
+    if age is not None and age > 7:
+        logger.debug(f"5m REST fetch stale ({age:.1f} min old) — retrying once")
+        _time_mod.sleep(1.0)
+        retry_df = broker.get_historical_data(instrument, "5", from_d, today)
+        retry_age = _age_min(retry_df)
+        if retry_age is not None and (age is None or retry_age < age):
+            df, age = retry_df, retry_age
+        if age is not None and age > 7:
+            logger.warning(
+                f"5m REST data still {age:.1f} min old after retry — "
+                f"broker's historical API itself appears delayed, not an app-side gap."
+            )
+    return df
+
 
 def _fetch_all_frames(instrument: str) -> dict:
     """Fetch all timeframes needed for the strategy.
@@ -4760,7 +4990,7 @@ def _fetch_all_frames(instrument: str) -> dict:
         else:
             # Fallback to historical API
             from_d = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
-            df = broker.get_historical_data(instrument, "5", from_d, today)
+            df = _fetch_5m_rest_with_freshness_retry(instrument, from_d, today, now_ist)
             if df is not None and len(df) >= 30:
                 frames["5"] = df
             _time_mod.sleep(0.3)
@@ -4779,7 +5009,10 @@ def _fetch_all_frames(instrument: str) -> dict:
         # No live feed — fetch from historical API (original behavior)
         for tf_key, days in [("5", 30), ("1", 5)]:
             from_d = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
-            df = broker.get_historical_data(instrument, tf_key, from_d, today)
+            if tf_key == "5":
+                df = _fetch_5m_rest_with_freshness_retry(instrument, from_d, today, now_ist)
+            else:
+                df = broker.get_historical_data(instrument, tf_key, from_d, today)
             if df is not None and len(df) >= 30:
                 frames[tf_key] = df
             _time_mod.sleep(0.3)
@@ -4808,7 +5041,15 @@ def _fetch_frames_range(instrument: str, from_date: str, to_date: str) -> dict:
     except Exception:
         daily_from_date = from_date
 
-    for tf_key, tf_dhan in [("1D","DAY"),("60","60"),("15","15"),("5","5"),("1","1")]:
+    # NOTE: "1" (1-minute) is deliberately NOT fetched here. No strategy in
+    # backend/strategies/ reads frames["1"]/m1_st/m1_srsi_k/m1_srsi_d --
+    # build_merged_table() already has a documented fallback for its
+    # absence (base["m1_st"] = base.get("supertrend_dir", 0), etc.). For a
+    # multi-month backtest range, fetching 1-minute BankNifty data can mean
+    # hundreds of thousands of rows across several 90-day chunks -- this
+    # was making backtest requests take 5-10+ minutes (sometimes timing
+    # out) for date ranges that otherwise complete in well under a minute.
+    for tf_key, tf_dhan in [("1D","DAY"),("60","60"),("15","15"),("5","5")]:
         query_from = daily_from_date if tf_key == "1D" else from_date
         logger.info(f"[Backtest] Fetching {tf_key} data: {query_from} -> {to_date_inclusive}")
         df = broker.get_historical_data(instrument, tf_dhan, query_from, to_date_inclusive)

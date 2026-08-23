@@ -250,7 +250,7 @@ class StrategyKernel(ABC):
         self._lock = threading.Lock()
 
     def safe_run_backtest(self, frames: dict, initial_capital: float = 500_000,
-                          lot_size: int = 15, lot_multiplier: int = 1,
+                          lot_size: int = 30, lot_multiplier: int = 1,
                           start_date: Optional[str] = None,
                           end_date: Optional[str] = None) -> dict:
         """Thread-safe wrapper around run_backtest to prevent state race conditions.
@@ -340,7 +340,7 @@ class StrategyKernel(ABC):
 
     @abstractmethod
     def run_backtest(self, frames: dict, initial_capital: float = 500_000,
-                     lot_size: int = 15, lot_multiplier: int = 1,
+                     lot_size: int = 30, lot_multiplier: int = 1,
                      start_date: Optional[str] = None,
                      end_date: Optional[str] = None) -> dict:
         """Run a full backtest over historical frames.
@@ -397,12 +397,6 @@ def init_kernels():
         logger.error(f"Failed to register Donchian kernels: {e}")
 
     try:
-        from strategies.regime_reversal_kernel import RegimeReversalKernel
-        register_kernel(RegimeReversalKernel())
-    except Exception as e:
-        logger.error(f"Failed to register RegimeReversalKernel: {e}")
-
-    try:
         from strategies.multi_agent_kernel import MultiAgentV3Kernel
         register_kernel(MultiAgentV3Kernel())
     except Exception as e:
@@ -422,17 +416,34 @@ def init_kernels():
                         spec = importlib.util.spec_from_file_location(mod_name, mod_path)
                         mod = importlib.util.module_from_spec(spec)
                         spec.loader.exec_module(mod)
+                        candidates = []
                         for item_name in dir(mod):
                             obj = getattr(mod, item_name)
                             if isinstance(obj, type) and issubclass(obj, StrategyKernel) and obj is not StrategyKernel:
-                                try:
-                                    inst = obj()
-                                    register_kernel(inst)
-                                    if file_strat_id and file_strat_id != inst.strategy_id:
-                                        _kernel_registry[file_strat_id] = inst
-                                        logger.info(f"Registered custom kernel alias: {file_strat_id} -> {inst.strategy_id}")
-                                except Exception as ex:
-                                    logger.warning(f"Could not instantiate custom kernel {item_name}: {ex}")
+                                if getattr(obj, "__module__", "") == mod_name:
+                                    candidates.append(obj)
+                        
+                        if candidates:
+                            primary_cls = None
+                            for c in candidates:
+                                if getattr(c, "strategy_id", "") == file_strat_id:
+                                    primary_cls = c
+                                    break
+                            if not primary_cls:
+                                for c in candidates:
+                                    if not c.__name__.startswith("_"):
+                                        primary_cls = c
+                                        break
+                            if not primary_cls:
+                                primary_cls = candidates[-1]
+
+                            try:
+                                inst = primary_cls()
+                                register_kernel(inst)
+                                _kernel_registry[file_strat_id] = inst
+                                logger.info(f"Registered custom kernel: {file_strat_id} -> {type(inst).__name__} ({inst.strategy_id})")
+                            except Exception as ex:
+                                logger.warning(f"Could not instantiate custom kernel {primary_cls.__name__}: {ex}")
                     except Exception as ex:
                         logger.warning(f"Could not load custom strategy {fname}: {ex}")
     except Exception as e:
@@ -460,14 +471,32 @@ def reload_custom_kernels():
                 spec = importlib.util.spec_from_file_location(mod_name, mod_path)
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
+                candidates = []
                 for item_name in dir(mod):
                     obj = getattr(mod, item_name)
                     if isinstance(obj, type) and issubclass(obj, StrategyKernel) and obj is not StrategyKernel:
-                        inst = obj()
-                        register_kernel(inst)
-                        if file_strat_id and file_strat_id != inst.strategy_id:
-                            _kernel_registry[file_strat_id] = inst
-                            logger.info(f"Registered custom kernel alias: {file_strat_id} -> {inst.strategy_id}")
+                        if getattr(obj, "__module__", "") == mod_name:
+                            candidates.append(obj)
+                
+                if candidates:
+                    # Prefer candidate where strategy_id matches file_strat_id or class name without leading underscore
+                    primary_cls = None
+                    for c in candidates:
+                        if getattr(c, "strategy_id", "") == file_strat_id:
+                            primary_cls = c
+                            break
+                    if not primary_cls:
+                        for c in candidates:
+                            if not c.__name__.startswith("_"):
+                                primary_cls = c
+                                break
+                    if not primary_cls:
+                        primary_cls = candidates[-1]
+
+                    inst = primary_cls()
+                    register_kernel(inst)
+                    _kernel_registry[file_strat_id] = inst
+                    logger.info(f"Registered custom kernel: {file_strat_id} -> {type(inst).__name__} ({inst.strategy_id})")
             except Exception as ex:
                 logger.warning(f"Could not load custom strategy {fname}: {ex}")
 

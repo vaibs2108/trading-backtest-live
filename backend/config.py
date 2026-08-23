@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     dhan_access_token: str = ""
 
     # ── Strategy Selection ─────────────────────────────────────────────────
-    strategy: str = "multi_agent"    # regime_reversal | regime_trend_range | multi_agent
+    strategy: str = "custom_alpha_combo_cusum125"    # default live strategy (see live_bar_processor.py _proc_list for all 4 live-capable options)
 
     # ── Instrument Settings ────────────────────────────────────────────────
     instrument: str = "BANKNIFTY"          # NIFTY | BANKNIFTY | SENSEX
@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     max_daily_profit: float = 15000.0    # Rs. stop trading after this profit
     auto_trade: bool = False             # master switch for live execution
     product_type: str = "NRML"           # NRML | MIS (Carry Forward vs. Intraday)
+    position_hold_mode: str = "INTRADAY"  # INTRADAY | CARRY_FORWARD — backtest engine
+                                           # EOD handling (per-backtest-request override
+                                           # from the Backtest page; distinct from the
+                                           # live-order product_type above)
     confirm_signals: bool = False        # whether to require 2 consecutive polls before entry
     auto_square_off_minutes: int = 10    # minutes before market close to auto square-off
     auto_kill_switch: bool = False       # auto-disable after consecutive failures

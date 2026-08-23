@@ -24,7 +24,7 @@ def get_current_signal(frames: dict, position: str = "NONE") -> dict:
 
 
 def run_backtest(frames: dict, initial_capital: float = 500_000,
-                 lot_size: int = 15, lot_multiplier: int = 1,
+                 lot_size: int = 30, lot_multiplier: int = 1,
                  start_date=None, end_date=None) -> dict:
     """Route to active kernel's run_backtest."""
     strat = get_settings().strategy

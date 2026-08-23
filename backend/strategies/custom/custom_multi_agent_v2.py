@@ -22,7 +22,7 @@ class MultiAgentV2Kernel(StrategyKernel):
     live_capable = True
 
     def run_backtest(self, frames: dict, initial_capital: float = 500_000,
-                     lot_size: int = 15, lot_multiplier: int = 1,
+                     lot_size: int = 30, lot_multiplier: int = 1,
                      start_date: str = None, end_date: str = None) -> dict:
         cfg = get_settings()
         

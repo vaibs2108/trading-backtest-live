@@ -129,7 +129,7 @@ class DonchianSwingKernel(StrategyKernel):
     # ── run_backtest: the full engine ────────────────────────────────────
 
     def run_backtest(self, frames: dict, initial_capital: float = 500_000,
-                     lot_size: int = 15, lot_multiplier: int = 1,
+                     lot_size: int = 30, lot_multiplier: int = 1,
                      start_date: Optional[str] = None,
                      end_date: Optional[str] = None) -> dict:
         cfg = get_settings()

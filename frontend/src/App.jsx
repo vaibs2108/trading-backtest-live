@@ -17,18 +17,29 @@ const API = {
 }
 
 // ── Live Trading strategies ────────────────────────────────────────────────
-// The 3 research strategies promoted to Live Trading, replacing the prior
-// regime_reversal / regime_trend_range / multi_agent trio (those remain
-// selectable on the Backtest page, just no longer live). Single source of
-// truth for every dropdown/label surface that shows live strategy options.
+// Alpha Combo (CUSUM 1.25 Tuned) is the DEFAULT (index 0) -- promoted
+// 2026-08-22 after beating the CUSUM 1.5 baseline and every dual-engine
+// pyramid variant tried this research session under train/validate/full
+// discipline. Time-Gated Alpha Combo (index 1) is Alpha Combo plus an
+// entry-time filter, promoted 2026-08-23 after the same discipline plus a
+// deep trade-level audit -- BankNifty-only validation, see
+// STRATEGY_REGISTRY.md at the repo root. The other 3 are the research
+// strategies promoted earlier. regime_trend_range / multi_agent remain
+// selectable on the Backtest page, just no longer live; regime_reversal was
+// removed from the app entirely on 2026-08-23 (worst drawdown of any
+// strategy tested -- see STRATEGY_REGISTRY.md). Single source of truth for
+// every dropdown/label surface that shows live strategy options.
 const LIVE_STRATEGY_OPTIONS = [
+  { v: 'custom_alpha_combo_cusum125', l: 'Alpha Combo (CUSUM 1.25)' },
+  { v: 'custom_time_gated_alpha_combo', l: 'Time-Gated Alpha Combo' },
   { v: 'custom_regime_v1_trend_range_final', l: 'Regime T/R V1 Final' },
   { v: 'custom_halftrend_hull_standalone', l: 'HalfTrend + Hull' },
   { v: 'custom_cusum15_nodonchian_cd8', l: 'CUSUM 1.5 (No Donchian)' },
 ]
 const LIVE_STRATEGY_LABELS = Object.fromEntries(LIVE_STRATEGY_OPTIONS.map(o => [o.v, o.l]))
-// All 3 are regime-classifier-based, so the regime badge (TRENDING_UP/DOWN/
-// SIDEWAYS, confidence, playbook) should render for all of them.
+// All 5 are regime-classifier-based (Alpha Combo and Time-Gated Alpha Combo
+// share the same RegimeTrendRangeV2 lineage as the other 3), so the regime badge
+// (TRENDING_UP/DOWN/SIDEWAYS, confidence, playbook) should render for all of them.
 const LIVE_REGIME_STRATEGY_IDS = LIVE_STRATEGY_OPTIONS.map(o => o.v)
 
 // ── Theme Hook ──────────────────────────────────────────────────────────────
@@ -365,7 +376,7 @@ function LiveChart({ instrument, timeframe, signals, strategy, refreshChart, the
           const isLongExit = s.signal === 'LONG_EXIT'
           const isEntry = isLong || isShort
           const isExit = isShortExit || isLongExit
-          const p = s.strategy === 'custom_regime_v1_trend_range_final' ? 'V' : s.strategy === 'custom_halftrend_hull_standalone' ? 'H' : s.strategy === 'custom_cusum15_nodonchian_cd8' ? 'C' : (s.strategy === 'broker_sync' ? 'B' : 'M')
+          const p = s.strategy === 'custom_alpha_combo_cusum125' ? 'A' : s.strategy === 'custom_time_gated_alpha_combo' ? 'T' : s.strategy === 'custom_regime_v1_trend_range_final' ? 'V' : s.strategy === 'custom_halftrend_hull_standalone' ? 'H' : s.strategy === 'custom_cusum15_nodonchian_cd8' ? 'C' : (s.strategy === 'broker_sync' ? 'B' : 'M')
           const up = isLong || isShortExit
           const t = Math.floor(new Date(s.time).getTime()/1000) + 19800
           return {
@@ -949,7 +960,7 @@ function SettingsPanel({ onSaved }) {
 // ── Backtest Panel ──────────────────────────────────────────────────────────
 function BacktestPanel({ connected, selectedStrategy, onSelectStrategy }) {
   const m = window.innerWidth < 768
-  const [form, setForm] = useState({ instrument:'BANKNIFTY', from_date:'', to_date:'', initial_capital:500000, lot_multiplier:1, strategy: selectedStrategy || 'regime_reversal' })
+  const [form, setForm] = useState({ instrument:'BANKNIFTY', from_date:'', to_date:'', initial_capital:500000, lot_multiplier:1, strategy: selectedStrategy || 'regime_reversal', hold_mode:'INTRADAY' })
   const [result, setResult] = useState(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState('')
@@ -1067,6 +1078,10 @@ function BacktestPanel({ connected, selectedStrategy, onSelectStrategy }) {
             ['From Date', <input type="date" value={form.from_date} onChange={e=>setForm(p=>({...p,from_date:e.target.value}))} style={inputStyle} />],
             ['To Date', <input type="date" value={form.to_date} onChange={e=>setForm(p=>({...p,to_date:e.target.value}))} style={inputStyle} />],
             ['Capital (₹)', <input type="number" value={form.initial_capital} onChange={e=>setForm(p=>({...p,initial_capital:Number(e.target.value)}))} style={inputStyle} />],
+            ['Position Holding', <select value={form.hold_mode} onChange={e=>setForm(p=>({...p,hold_mode:e.target.value}))} style={inputStyle}>
+              <option value="INTRADAY">Intraday (close by EOD time)</option>
+              <option value="CARRY_FORWARD">Carry Forward (allow overnight)</option>
+            </select>],
           ].map(([label, input]) => (
             <div key={label}>
               <div style={{ color:V('text-muted'), fontSize:11, marginBottom:4, fontWeight:500 }}>{label}</div>
@@ -1371,10 +1386,11 @@ function SignalJournalPanel({ entries, onRefresh }) {
                 }}
               >
                 <option value="ALL">All Strategies</option>
+                <option value="custom_alpha_combo_cusum125">Alpha Combo (CUSUM 1.25)</option>
+                <option value="custom_time_gated_alpha_combo">Time-Gated Alpha Combo</option>
                 <option value="custom_regime_v1_trend_range_final">Regime T/R V1 Final</option>
                 <option value="custom_halftrend_hull_standalone">HalfTrend + Hull</option>
                 <option value="custom_cusum15_nodonchian_cd8">CUSUM 1.5 (No Donchian)</option>
-                <option value="regime_reversal">Regime + Reversal Combined</option>
                 <option value="regime_trend_range">Regime T/R Optimized</option>
                 <option value="regime_trend_v2">Regime Trend V2 — Selective</option>
                 <option value="regime_trend_v2b">Regime Trend V2-B — Balanced</option>
@@ -3984,6 +4000,8 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
 
   const maSignal = allSignals?.custom_halftrend_hull_standalone || (strategy === 'custom_halftrend_hull_standalone' ? signal : null)
   const rtrSignal = allSignals?.custom_regime_v1_trend_range_final || (strategy === 'custom_regime_v1_trend_range_final' ? signal : null)
+  const alphaComboSignal = allSignals?.custom_alpha_combo_cusum125 || (strategy === 'custom_alpha_combo_cusum125' ? signal : null)
+  const timeGatedSignal = allSignals?.custom_time_gated_alpha_combo || (strategy === 'custom_time_gated_alpha_combo' ? signal : null)
 
   // Risk Budget Horizontal Progress Calculation
   const lossLimit = maxDailyLoss || 1000.0
@@ -4185,11 +4203,16 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
         <MetricBox label="Win / Loss" value={`${d?.wins||0} / ${d?.losses||0}`} color={V('text-primary')} sub={lotSize ? `Lot: ${lotSize}` : (d?.total_trades > 0 ? `${((d?.wins/d?.total_trades)*100).toFixed(0)}% WR` : '—')} />
       </div>
 
-      {/* Dual strategy signals + Active Position — 3 columns */}
-      <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1.2fr', gap:10 }}>
+      {/* Four live-strategy signal tiles, responsive wrap */}
+      <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(auto-fit, minmax(220px, 1fr))', gap:10, marginBottom:10 }}>
+        {renderSignalCard(alphaComboSignal, 'Alpha Combo Signal')}
+        {renderSignalCard(timeGatedSignal, 'Time-Gated Alpha Combo Signal')}
         {renderSignalCard(maSignal, 'HalfTrend + Hull Signal')}
         {renderSignalCard(rtrSignal, 'Regime T/R V1 Final Signal')}
+      </div>
 
+      {/* Active Position */}
+      <div style={{ display:'grid', gridTemplateColumns: '1fr', gap:10 }}>
         {/* Position card with Panic Exit Button */}
         <Card style={{ display:'flex', flexDirection:'column', justifyContent:'space-between' }}>
           <div style={{ color:V('text-muted'), fontSize:11, textTransform:'uppercase', fontWeight:500, marginBottom:8 }}>Active Position</div>
