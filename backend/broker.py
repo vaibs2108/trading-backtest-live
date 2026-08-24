@@ -730,7 +730,11 @@ def get_option_symbol(instrument: str, direction: str, expiry: int = 0,
             inst_type = "OPTIDX"
         elif instrument == "CRUDEOIL":
             exchange = "MCX"
-            inst_type = "OPTCOM"
+            # Dhan's scrip master tags MCX commodity options as "OPTFUT"
+            # (options-on-futures) -- "OPTCOM" never appears in the real data,
+            # confirmed against Dependencies/all_instrument CSV (2,084 real
+            # CRUDEOIL/CRUDEOILM OPTFUT rows with real strikes/expiries).
+            inst_type = "OPTFUT"
 
         df_opt = df[
             (df['SEM_EXM_EXCH_ID'] == exchange) &
@@ -786,6 +790,44 @@ def get_option_symbol(instrument: str, direction: str, expiry: int = 0,
 
         if not match.empty:
             custom_symbol = match.iloc[0]['SEM_CUSTOM_SYMBOL']
+            # Liquidity fallback (2026-08-24): confirmed directly against live
+            # Dhan data that MCX commodity option strikes can exist in the
+            # scrip master with zero live quote at all (deep ITM/OTM CrudeOil
+            # strikes tested 0.0 LTP; nearby strikes had real premiums). Walk
+            # to progressively wider nearby strikes of the SAME option type
+            # and use the first one with a real live quote, closest to the
+            # originally configured strike. For NSE index options (BankNifty
+            # etc.) the configured strike has essentially always had a live
+            # quote in practice, so this check passes on its first try and
+            # returns the exact same symbol as before -- no behavior change
+            # there. If nothing nearby is liquid either, falls back to the
+            # originally configured strike/symbol, identical to pre-fallback
+            # behavior (downstream code already skips entry safely on a
+            # zero-premium symbol).
+            if get_option_ltp(custom_symbol) > 0:
+                return custom_symbol, int(target_strike)
+
+            max_radius = 6
+            for radius in range(1, max_radius + 1):
+                for cand_index in (target_index - radius, target_index + radius):
+                    if cand_index < 0 or cand_index >= len(sorted_strikes):
+                        continue
+                    cand_strike = sorted_strikes[cand_index]
+                    cand_match = df_expiry[
+                        (df_expiry['SEM_OPTION_TYPE'] == option_type) &
+                        (df_expiry['SEM_STRIKE_PRICE'] == cand_strike)
+                    ]
+                    if cand_match.empty:
+                        continue
+                    cand_symbol = cand_match.iloc[0]['SEM_CUSTOM_SYMBOL']
+                    if get_option_ltp(cand_symbol) > 0:
+                        logger.info(
+                            f"get_option_symbol: configured strike {target_strike} ({instrument}) "
+                            f"had no live quote, using nearby liquid strike {cand_strike} instead "
+                            f"({cand_symbol})"
+                        )
+                        return cand_symbol, int(cand_strike)
+
             return custom_symbol, int(target_strike)
 
         logger.error(f"No option contract matching {option_type} strike {target_strike} for expiry {expiry_date}")

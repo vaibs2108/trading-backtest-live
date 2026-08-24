@@ -204,6 +204,18 @@ _cached_frames_instrument: str = ""
 # Cached chart_signals backtest result — avoids re-running backtest on every page load
 _chart_signals_cache: dict = {}  # {strategy: {"signals": [...], "ts": float}}
 
+# In-flight chart_signals computations, keyed the same as the cache above.
+# The backtest here can take 30-95s (full-history recompute, worse for
+# instruments with longer sessions like MCX CrudeOil), while the frontend's
+# safety-net poll fires every 10s -- without this, each poll that lands
+# before the previous computation finishes starts its OWN redundant 30-95s
+# recompute on top of the ones already running. This only changes whether a
+# duplicate concurrent request waits for the existing computation instead of
+# starting a new one -- the computation itself, its inputs, and its result
+# are completely unchanged, and no live-trading/signal-detection code path
+# is touched.
+_chart_signals_inflight: dict = {}  # {cache_key: asyncio.Task}
+
 import math
 
 def _clean_nan_values(obj):
@@ -472,7 +484,16 @@ def _get_active_entries(cfg, tm) -> dict:
     except Exception as e_journal:
         logger.warning(f"Failed to load active entries from journal: {e_journal}")
 
-    if tm.position and tm.position.instrument == cfg.instrument:
+    # Only overlay tm.position onto the active strategy's tile when it's
+    # ACTUALLY that strategy's own position. Previously this ran unconditionally
+    # on tm.position.instrument alone, so a broker-synced position (strategy=
+    # "broker_sync", e.g. a carry position imported from Dhan that's unrelated
+    # to any live strategy's own signal) got mislabeled under whichever
+    # strategy happened to be active -- a real incident (2026-08-24): the
+    # Time-Gated Alpha Combo tile showed a stuck DHAN_SYNC SHORT position as
+    # if it were that strategy's own active signal, while the strategy's real
+    # signal (LONG, correctly on the chart) was a completely different trade.
+    if tm.position and tm.position.instrument == cfg.instrument and tm.position.strategy == cfg.strategy:
         active_entries[cfg.strategy] = {
             "signal": tm.position.direction,
             "entry": getattr(tm.position, "index_entry_price", 0.0) or tm.position.entry_price,
@@ -526,9 +547,16 @@ async def get_status():
     lot = broker.get_lot_size(cfg.instrument)
     ltp = (await asyncio.to_thread(broker.get_ltp, cfg.instrument)) if broker.is_connected() else None
 
-    # Compute Live P&L from TradeManager's tracked position
+    # Compute Live P&L from TradeManager's tracked position.
+    # "Position P&L" / "Today's P&L" are meant to reflect the real broker
+    # account only (2026-08-24 fix) -- journal_stats.gross_pnl below already
+    # excludes paper trades (journal_manager.py filters trade_id startswith
+    # "PAPER_"), but this open-position component didn't, so a paper trade
+    # could show as live P&L on the dashboard even with a real, unrelated
+    # broker loss sitting unshown. Excluding PAPER_ positions here makes both
+    # tiles real-broker-only, consistent with the journal-derived figure.
     live_pnl = 0.0
-    if tm.position and tm.position.instrument == cfg.instrument:
+    if tm.position and tm.position.instrument == cfg.instrument and not tm.position.order_id.startswith("PAPER_"):
         pos = tm.position
         if pos.order_id.startswith("PAPER_"):
             # Paper mode: use index LTP for P&L
@@ -1257,6 +1285,39 @@ async def get_live_feed_status():
     return get_live_feed().get_status()
 
 
+def _build_chart_signals_from_result(result: dict, strat: str, inst: str, days: int) -> list:
+    """Convert a raw backtest result's trade list into chart entry/exit markers,
+    filtered to the last `days` days. Extracted verbatim from get_chart_signals
+    so it can be shared between the cache-hit and in-flight-compute paths."""
+    signals = []
+    raw_trades = result.get("trades", [])
+    cutoff_date = (datetime.now(_IST) - timedelta(days=days)).date()
+    for t in raw_trades:
+        entry_time = str(t.get("entry_time", ""))
+        exit_time = str(t.get("exit_time", ""))
+        direction = t.get("direction", "")
+        try:
+            if pd.to_datetime(entry_time).date() < cutoff_date:
+                continue
+        except Exception:
+            continue
+        signals.append({
+            "signal": direction, "time": entry_time,
+            "entry": t.get("entry_price", 0), "sl": t.get("sl", 0),
+            "target1": t.get("target1", 0), "target2": t.get("target2", 0),
+            "strategy": strat,
+        })
+        if exit_time:
+            signals.append({
+                "signal": f"{direction}_EXIT", "time": exit_time,
+                "entry": t.get("exit_price", 0), "close": t.get("exit_price", 0),
+                "exit_price": t.get("exit_price", 0), "reason": t.get("exit_reason", ""),
+                "pnl": t.get("pnl", 0), "pnl_pts": t.get("pnl_pts", 0),
+                "strategy": strat,
+            })
+    return signals
+
+
 @app.get("/api/chart_signals")
 async def get_chart_signals(strategy: Optional[str] = None, instrument: Optional[str] = None, days: int = 10):
     """Run backtest for the selected strategy and return entry/exit markers for chart overlay.
@@ -1292,62 +1353,68 @@ async def get_chart_signals(strategy: Optional[str] = None, instrument: Optional
     if _bt_cache and (_now - _bt_cache["ts"]) < _cache_ttl:
         signals = list(_bt_cache["result"].get("signals", []))
     else:
-        # Use cached frames from the polling loop if available and fresh (< 3 min)
-        _cache_age = _now - _cached_frames_ts
-        if _cached_frames and _cached_frames_instrument == inst and _cache_age < 180:
-            frames = _cached_frames
+        # Reuse an already-running computation for this exact strategy+instrument
+        # instead of starting a duplicate. The backtest below can take 30-95s;
+        # the frontend's safety-net poll fires every 10s, so without this a slow
+        # instrument (e.g. MCX CrudeOil's longer session) could end up with
+        # several redundant full recomputes stacked up concurrently. This only
+        # dedupes concurrent requests for the identical (strat, inst) pair -- the
+        # computation itself, its inputs, and its result are unchanged.
+        _inflight = _chart_signals_inflight.get(cache_key)
+        if _inflight is not None and not _inflight.done():
+            try:
+                signals = list(await _inflight)
+            except Exception:
+                signals = []
         else:
-            frames = await asyncio.to_thread(_fetch_all_frames, inst)
+            async def _compute_chart_signals():
+                # Use cached frames from the polling loop if available and fresh (< 3 min)
+                _cache_age = _t.time() - _cached_frames_ts
+                if _cached_frames and _cached_frames_instrument == inst and _cache_age < 180:
+                    frames = _cached_frames
+                else:
+                    frames = await asyncio.to_thread(_fetch_all_frames, inst)
 
-        if frames:
-            def _run_bt():
-                try:
-                    import strategy_router
-                    # Run for the REQUESTED strategy and instrument — override cfg
-                    # for the duration of this call so router executes correctly.
-                    _orig_strat = cfg.strategy
-                    _orig_inst = cfg.instrument
-                    if strat != _orig_strat:
-                        cfg.strategy = strat
-                    if inst != _orig_inst:
-                        cfg.instrument = inst
-                    try:
-                        return strategy_router.run_backtest(frames)
-                    finally:
-                        cfg.strategy = _orig_strat
-                        cfg.instrument = _orig_inst
-                except Exception as e:
-                    logger.error(f"chart_signals backtest error ({strat} for {inst}): {e}")
-                    return None
+                _sigs = []
+                if frames:
+                    def _run_bt():
+                        try:
+                            import strategy_router
+                            # Run for the REQUESTED strategy and instrument — override cfg
+                            # for the duration of this call so router executes correctly.
+                            _orig_strat = cfg.strategy
+                            _orig_inst = cfg.instrument
+                            if strat != _orig_strat:
+                                cfg.strategy = strat
+                            if inst != _orig_inst:
+                                cfg.instrument = inst
+                            try:
+                                return strategy_router.run_backtest(frames)
+                            finally:
+                                cfg.strategy = _orig_strat
+                                cfg.instrument = _orig_inst
+                        except Exception as e:
+                            logger.error(f"chart_signals backtest error ({strat} for {inst}): {e}")
+                            return None
 
-            result = await asyncio.to_thread(_run_bt)
-            if result:
-                raw_trades = result.get("trades", [])
-                cutoff_date = (datetime.now(_IST) - timedelta(days=days)).date()
-                for t in raw_trades:
-                    entry_time = str(t.get("entry_time", ""))
-                    exit_time = str(t.get("exit_time", ""))
-                    direction = t.get("direction", "")
-                    try:
-                        if pd.to_datetime(entry_time).date() < cutoff_date:
-                            continue
-                    except Exception:
-                        continue
-                    signals.append({
-                        "signal": direction, "time": entry_time,
-                        "entry": t.get("entry_price", 0), "sl": t.get("sl", 0),
-                        "target1": t.get("target1", 0), "target2": t.get("target2", 0),
-                        "strategy": strat,
-                    })
-                    if exit_time:
-                        signals.append({
-                            "signal": f"{direction}_EXIT", "time": exit_time,
-                            "entry": t.get("exit_price", 0), "close": t.get("exit_price", 0),
-                            "exit_price": t.get("exit_price", 0), "reason": t.get("exit_reason", ""),
-                            "pnl": t.get("pnl", 0), "pnl_pts": t.get("pnl_pts", 0),
-                            "strategy": strat,
-                        })
-                _chart_signals_cache[cache_key] = {"result": {"signals": signals, "strategy": strat, "instrument": inst}, "ts": _now}
+                    result = await asyncio.to_thread(_run_bt)
+                    if result:
+                        _sigs = _build_chart_signals_from_result(result, strat, inst, days)
+                        _chart_signals_cache[cache_key] = {
+                            "result": {"signals": _sigs, "strategy": strat, "instrument": inst},
+                            "ts": _t.time(),
+                        }
+                return _sigs
+
+            _task = asyncio.ensure_future(_compute_chart_signals())
+            _chart_signals_inflight[cache_key] = _task
+            try:
+                signals = list(await _task)
+            except Exception:
+                signals = []
+            finally:
+                if _chart_signals_inflight.get(cache_key) is _task:
+                    del _chart_signals_inflight[cache_key]
 
     # Sort all markers chronologically by timestamp
     def _norm_ts(ts_val) -> str:
@@ -2656,8 +2723,6 @@ async def _signal_polling_loop():
                                 _trace(_tid, "DETECTED", f"path=processor strategy={_strat_id} dir={_live_sig.signal} "
                                                           f"entry={_live_sig.entry_price} sl={_live_sig.sl} sig_time={_live_sig.time}")
                                 _add_signal_to_history(sig_dict)
-                                # Invalidate chart cache so next fetch gets fresh backtest with this signal
-                                _chart_signals_cache.clear()
                                 add_activity_log(f"[{_strat_id.upper()}] Processor Entry: {_live_sig.signal} @ {_live_sig.entry_price}")
                                 logger.info(f"[{_strat_id}] Processor Entry: {_live_sig.signal} @ {_live_sig.entry_price} SL={_live_sig.sl}")
                                 # Diagnostic (2026-08-22 audit): a phantom entry was found in Telegram
@@ -2682,15 +2747,27 @@ async def _signal_polling_loop():
                                     )
                                 except Exception as _diag_err:
                                     logger.debug(f"Entry diagnostic logging failed: {_diag_err}")
-                                # Notify frontend instantly with complete signal marker data via WebSocket
-                                await ws_manager.broadcast({"type": "signal_event", "data": sig_dict})
-                                await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": _strat_id, "signal": _live_sig.signal}})
+                                # Freshness check (2026-08-24 audit): a rolling-window backtest re-diff
+                                # can "rediscover" a days-old trade as if it were new (data-gap catch-up
+                                # burst). Telegram was already gated on this; the chart broadcast/cache
+                                # invalidation was not, so stale replays were showing up as live markers
+                                # on the chart even though nothing new had actually happened. Gate both
+                                # on the same freshness check.
+                                _entry_sig_age = _signal_age_minutes(_live_sig.time)
+                                _entry_is_fresh = _entry_sig_age is None or _entry_sig_age <= 10.0
+                                if _entry_is_fresh:
+                                    # Invalidate chart cache so next fetch gets fresh backtest with this signal
+                                    _chart_signals_cache.clear()
+                                    # Notify frontend instantly with complete signal marker data via WebSocket
+                                    await ws_manager.broadcast({"type": "signal_event", "data": sig_dict})
+                                    await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": _strat_id, "signal": _live_sig.signal}})
+                                else:
+                                    _trace(_tid, "CHART", f"skipped, age={_entry_sig_age:.1f}m (historical replay, not pushed to chart)")
                                 # Send Telegram in background (non-blocking) for active strategy --
                                 # skip stale/historical-replay signals so a data-gap catch-up burst
                                 # doesn't alert as if each old signal just happened live.
                                 if _strat_id == cfg.strategy:
-                                    _entry_sig_age = _signal_age_minutes(_live_sig.time)
-                                    if _entry_sig_age is None or _entry_sig_age <= 10.0:
+                                    if _entry_is_fresh:
                                         _trace(_tid, "TELEGRAM", "sending")
                                         asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
                                     else:
@@ -2752,8 +2829,6 @@ async def _signal_polling_loop():
                                 _trace(_tid, "DETECTED", f"path=processor strategy={_strat_id} dir={_live_sig.signal} "
                                                           f"exit={_live_sig.exit_price} reason={_live_sig.exit_reason} sig_time={_live_sig.time}")
                                 _add_signal_to_history(sig_dict)
-                                # Invalidate chart cache so next fetch gets fresh backtest with this signal
-                                _chart_signals_cache.clear()
                                 logger.info(f"[{_strat_id}] Processor Exit: {_live_sig.signal} ({_live_sig.exit_reason}) @ {_live_sig.exit_price}")
                                 # Diagnostic (2026-08-22 audit) -- same reasoning as the entry diagnostic above.
                                 try:
@@ -2766,10 +2841,7 @@ async def _signal_polling_loop():
                                     )
                                 except Exception as _diag_err:
                                     logger.debug(f"Exit diagnostic logging failed: {_diag_err}")
-                                # Notify frontend instantly via WebSocket (both marker push + cache refresh)
-                                await ws_manager.broadcast({"type": "signal_event", "data": sig_dict})
-                                await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": _strat_id, "signal": _live_sig.signal}})
-                                # Ownership check moved up here, BEFORE the Telegram send (previously
+                                # Ownership check moved up here, BEFORE the chart broadcast/Telegram send (previously
                                 # it only ran further below, right before the broker-close attempt).
                                 # A strategy's own kernel detects exits purely from its own internal
                                 # diff state -- completely decoupled from tm.position -- so if the
@@ -2786,6 +2858,19 @@ async def _signal_polling_loop():
                                     and (not _pos.strategy or _pos.strategy == _strat_id)
                                 )
                                 _conflicting_real_position = bool(_pos and not _owns_position)
+                                _exit_sig_age = _signal_age_minutes(_live_sig.time)
+                                _exit_is_fresh = _exit_sig_age is None or _exit_sig_age <= 10.0
+
+                                # Chart broadcast/cache: same rule as Telegram below (owns it -> always
+                                # show; conflicts with a real position -> never show, it doesn't
+                                # describe anything real; otherwise gated on freshness so a rolling-
+                                # window catch-up burst doesn't paint a days-old exit as live).
+                                if _owns_position or (not _conflicting_real_position and _exit_is_fresh):
+                                    _chart_signals_cache.clear()
+                                    await ws_manager.broadcast({"type": "signal_event", "data": sig_dict})
+                                    await ws_manager.broadcast({"type": "chart_signals_updated", "data": {"strategy": _strat_id, "signal": _live_sig.signal}})
+                                else:
+                                    _trace(_tid, "CHART", f"skipped, age={_exit_sig_age}m conflicting={_conflicting_real_position} (not pushed to chart)")
 
                                 # Send Telegram in background (non-blocking) for active strategy.
                                 # - Owns the position: always alert, regardless of detection delay --
@@ -2801,8 +2886,7 @@ async def _signal_polling_loop():
                                         f"{_pos.symbol} belongs to '{_pos.strategy or 'broker_sync'}', not this strategy"
                                     )
                                 elif _strat_id == cfg.strategy:
-                                    _exit_sig_age = _signal_age_minutes(_live_sig.time)
-                                    if _owns_position or _exit_sig_age is None or _exit_sig_age <= 10.0:
+                                    if _owns_position or _exit_is_fresh:
                                         _trace(_tid, "TELEGRAM", "sending")
                                         asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
                                     else:
@@ -2985,10 +3069,6 @@ async def _signal_polling_loop():
                     # Re-entry in the new direction requires fresh 2-poll confirmation.
                     elif tm.position and tm.position.instrument == sig.get("instrument") and tm.position.direction != sig_direction:
                         pos = tm.position
-                        _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", sig_ts)
-                        _trace(_tid, "DETECTED", f"path=legacy_opposite_signal strategy={cfg.strategy} "
-                                                  f"closing={pos.direction} new_signal={sig_direction} sig_time={sig_ts}")
-                        logger.info(f"Opposite signal ({sig_direction}) while in {pos.direction} — exiting only (no auto-flip)")
 
                         # --- FIX: Do NOT close DHAN_SYNC positions internally when auto_trade is OFF ---
                         # If auto_trade is OFF we can't send a broker exit order, so closing locally
@@ -2996,14 +3076,35 @@ async def _signal_polling_loop():
                         # creating an infinite close/import loop that floods the logs.
                         _is_dhan_sync = getattr(pos, "order_id", "").startswith("DHAN_SYNC_")
                         if not cfg.auto_trade and _is_dhan_sync:
-                            logger.warning(
-                                f"Opposite signal ({sig_direction}) vs DHAN_SYNC {pos.direction} {pos.symbol} "
-                                f"— auto_trade OFF, skipping internal close to avoid re-import loop. "
-                                f"Manage this position manually on Dhan."
-                            )
+                            # Throttle: this condition stays true every poll for as long as
+                            # the opposite signal persists and the position stays open --
+                            # without a throttle this re-logs (and re-traces) every ~15s
+                            # indefinitely. Confirmed in production (2026-08-24): the same
+                            # event logged continuously for 4+ minutes straight. Reuses the
+                            # same once-per-15-min throttle as the MANUAL_EXIT_NEEDED
+                            # reminder -- identical underlying situation (a DHAN_SYNC
+                            # position needing manual intervention), just detected via a
+                            # different code path.
+                            _now_alert = datetime.now(_IST)
+                            _last_alert = _manual_exit_alert_last_sent.get(pos.order_id)
+                            if _last_alert is None or (_now_alert - _last_alert).total_seconds() >= 900:
+                                _manual_exit_alert_last_sent[pos.order_id] = _now_alert
+                                _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", sig_ts)
+                                _trace(_tid, "DETECTED", f"path=legacy_opposite_signal strategy={cfg.strategy} "
+                                                          f"closing={pos.direction} new_signal={sig_direction} sig_time={sig_ts}")
+                                logger.warning(
+                                    f"Opposite signal ({sig_direction}) vs DHAN_SYNC {pos.direction} {pos.symbol} "
+                                    f"— auto_trade OFF, skipping internal close to avoid re-import loop. "
+                                    f"Manage this position manually on Dhan."
+                                )
                             _pending_telegram_signal = sig
                             _last_telegram_signal_key = ("", "")
                             continue  # skip — can't act on broker, don't close locally
+
+                        _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", sig_ts)
+                        _trace(_tid, "DETECTED", f"path=legacy_opposite_signal strategy={cfg.strategy} "
+                                                  f"closing={pos.direction} new_signal={sig_direction} sig_time={sig_ts}")
+                        logger.info(f"Opposite signal ({sig_direction}) while in {pos.direction} — exiting only (no auto-flip)")
 
                         _trace(_tid, "ORDER_ATTEMPT", f"path=legacy_opposite_signal auto_trade={cfg.auto_trade} closing {pos.symbol}")
                         if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
@@ -5130,11 +5231,30 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
                 entry_price = broker.get_option_ltp(symbol)
             except Exception as e:
                 logger.warning(f"Could not fetch option LTP for paper entry: {e}")
-        
-        if entry_price == 0.0:
-            entry_price = sig.get("entry", 0.0)
-        if entry_price == 0.0:
-            entry_price = broker.get_ltp(cfg.instrument) or 0.0
+
+        if cfg.trade_mode == "OPTIONS":
+            # Do NOT fall back to sig.get("entry") or index LTP here -- those
+            # are index-level prices (~57000), not option premiums (~500-2000).
+            # A real incident (2026-08-21) confirmed this: a paper LONG opened
+            # outside market hours, when option LTP was unavailable, recorded
+            # entry_price=57734.8 (the index price) and later closed against a
+            # real option premium of 2180.75 -- producing a nonsensical
+            # -Rs.16,66,981 "loss" that corrupted the journal and (via
+            # record_cooldown_loss, which isn't gated by auto_trade) triggered
+            # a real cooldown block on a live strategy. Mirrors the safe
+            # fallback already used at close time in _safe_pnl_exit_price():
+            # skip rather than record a price we know is in the wrong unit.
+            if entry_price == 0.0:
+                logger.warning(
+                    f"Could not resolve option premium for paper entry ({symbol}) -- "
+                    f"skipping paper entry rather than recording a corrupted price."
+                )
+                return {"success": False, "error": "Option premium unavailable — paper entry skipped to avoid corrupted P&L"}
+        else:
+            if entry_price == 0.0:
+                entry_price = sig.get("entry", 0.0)
+            if entry_price == 0.0:
+                entry_price = broker.get_ltp(cfg.instrument) or 0.0
             
         # For OPTIONS: convert index-level SL/T1/T2 from the signal into option-premium levels.
         # The polling loop compares INDEX LTP vs pos.sl/target1/target2 for hit detection,

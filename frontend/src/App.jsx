@@ -774,7 +774,12 @@ function DhanTradePanel({ position, tradeSignal, onExit, ltp, instrument }) {
 function DayStats({ state, balance, livePnl, todayPnl, lotSize }) {
   const m = window.innerWidth < 768
   const d = state?.day_stats
-  const displayPnl = todayPnl != null && todayPnl !== 0 ? todayPnl : d?.gross_pnl
+  // Backend always keeps day_stats.gross_pnl in sync with today_pnl, so the
+  // fallback used to read d?.gross_pnl when todayPnl was 0 -- but "0" is a
+  // legitimate value (no P&L today), not "not loaded yet", and that fallback
+  // could surface a stale/unfiltered day_stats snapshot instead. Use
+  // todayPnl directly.
+  const displayPnl = todayPnl
   return (
     <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
       <MetricBox label="Balance" value={`₹${fmt(balance)}`} color={V('accent')} />
@@ -3850,7 +3855,12 @@ function PerformancePanel({ theme }) {
 function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, todayPnl, lotSize, tradeState, signal, strategy, instrument, ltp, capitalState, dataHealth, toggleAppRunning, allSignals, lastEntries, telegramConfigured, refreshSettings, maxDailyLoss, maxDailyProfit }) {
   const m = window.innerWidth < 768
   const d = tradeState?.day_stats
-  const displayPnl = todayPnl != null && todayPnl !== 0 ? todayPnl : d?.gross_pnl
+  // Backend always keeps day_stats.gross_pnl in sync with today_pnl, so the
+  // fallback used to read d?.gross_pnl when todayPnl was 0 -- but "0" is a
+  // legitimate value (no P&L today), not "not loaded yet", and that fallback
+  // could surface a stale/unfiltered day_stats snapshot instead. Use
+  // todayPnl directly.
+  const displayPnl = todayPnl
 
   const strategyLabels = { ...LIVE_STRATEGY_LABELS, regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
   const [sparkData, setSparkData] = React.useState({ closes: [], pct_change: 0.0 })
