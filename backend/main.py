@@ -371,7 +371,7 @@ def _safe_pnl_exit_price(pos, index_ltp: float) -> float:
 
 _exit_signal_logged_for_position: str = ""  # order_id for which we already logged an exit signal this position lifetime
 _exit_telegram_sent_for_position: str = ""  # order_id for which we already sent an exit alert this position lifetime
-_manual_exit_alert_last_sent: dict = {}  # order_id -> datetime of last "MANUAL EXIT NEEDED" reminder (DHAN_SYNC + auto_trade=OFF), capped to one reminder per 15 min
+_manual_exit_alert_last_sent: dict = {}  # order_id -> datetime of last "MANUAL EXIT NEEDED" reminder (DHAN_SYNC + auto_trade=OFF), capped to one reminder per hour
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -1438,6 +1438,40 @@ async def get_signal_journal_endpoint():
     return {"entries": entries}
 
 
+@app.get("/api/cas_alerts")
+async def get_cas_alerts_endpoint(mode: Optional[str] = None):
+    """CAS scanner fired alerts, today. mode: 'cas_window' | 'undercurrent' | omitted for both."""
+    import cas_scanner
+    state = cas_scanner.get_state()
+    if mode == "cas_window":
+        return {"alerts": state["alerts_a"]}
+    if mode == "undercurrent":
+        return {"alerts": state["alerts_b"]}
+    return {"alerts_cas_window": state["alerts_a"], "alerts_undercurrent": state["alerts_b"]}
+
+
+@app.get("/api/cas_at_risk")
+async def get_cas_at_risk_endpoint():
+    """CAS scanner Mode A: current at-risk shortlist (stock options only)."""
+    import cas_scanner
+    return {"at_risk": cas_scanner.get_state()["at_risk"]}
+
+
+@app.get("/api/cas_undercurrent")
+async def get_cas_undercurrent_endpoint():
+    """CAS scanner Mode B: current undercurrent-flagged list (stocks + indices)."""
+    import cas_scanner
+    return {"undercurrent": cas_scanner.get_state()["undercurrent"]}
+
+
+@app.get("/api/cas_heatmap")
+async def get_cas_heatmap_endpoint():
+    """CAS scanner Mode B: per-underlying heatmap over the full F&O universe,
+    with streak continuity across sweeps -- see cas_scanner.build_heatmap()."""
+    import cas_scanner
+    return {"heatmap": cas_scanner.get_state()["heatmap"]}
+
+
 @app.delete("/api/signal_journal")
 async def clear_signal_journal_endpoint():
     signal_journal_manager.clear_journal()
@@ -1966,6 +2000,25 @@ async def startup_event():
         except Exception as _ouf_err:
             logger.warning(f"Could not start Order Update feed: {_ouf_err}")
 
+    # Start the CAS spike scanner -- fully independent of broker.py's
+    # connection/rate-limiter, uses its own dedicated credentials
+    # (cfg.dhan_cas_*). No-ops on its own if those aren't configured, so
+    # this is always safe to call regardless of main broker connection state.
+    try:
+        import cas_scanner
+        _main_loop = asyncio.get_event_loop()
+
+        def _cas_ws_broadcast(msg: dict):
+            asyncio.run_coroutine_threadsafe(ws_manager.broadcast(msg), _main_loop)
+
+        def _cas_telegram(message: str):
+            _send_telegram_alert_wrapper(message, cfg.telegram_bot_token, cfg.telegram_chat_id)
+
+        cas_scanner.set_broadcast_hooks(_cas_ws_broadcast, _cas_telegram)
+        cas_scanner.start()
+    except Exception as _cas_err:
+        logger.warning(f"Could not start CAS scanner: {_cas_err}")
+
     # Start live market feed for near-instant signal processing
     if broker.is_connected():
         try:
@@ -2047,6 +2100,12 @@ async def shutdown_event():
     try:
         import order_update_feed
         order_update_feed.stop()
+    except Exception:
+        pass
+    # Stop CAS scanner
+    try:
+        import cas_scanner
+        cas_scanner.stop()
     except Exception:
         pass
     try:
@@ -2266,12 +2325,21 @@ def _check_virtual_exits(ltp: float, cfg, frames=None, latest_candle_ts: str = N
                     "reasons": [f"Virtual exit triggered: {exit_reason} (LTP: {ltp})"]
                 }
                 
-                # Log to history
+                # Log to history -- unconditional, all strategies: the dashboard's
+                # multi-strategy panel and journal/performance pages need every
+                # strategy's virtual history regardless of which one is active.
                 _add_signal_to_history(exit_sig)
                 logger.info(f"[{strat_id}] Virtual Exit {exit_reason} logged to history")
-                
-                # Send Telegram alert for virtual exit
-                if cfg.telegram_bot_token and cfg.telegram_chat_id:
+
+                # Send Telegram alert for virtual exit -- ACTIVE STRATEGY ONLY
+                # (2026-08-28, explicit user request: this loop runs for every
+                # strategy's virtual journal entry, but was sending Telegram for
+                # ALL of them regardless of which one is actually selected on the
+                # Live Trading page -- inconsistent with the processor entry/exit
+                # path (main.py ~line 2828/2941), which already gates Telegram on
+                # `_strat_id == cfg.strategy`. History/journal logging above stays
+                # unconditional; only the alert itself is restricted.
+                if strat_id == cfg.strategy and cfg.telegram_bot_token and cfg.telegram_chat_id:
                     try:
                         _sig_emoji = "🚪"
                         _sig_msg = (
@@ -3522,11 +3590,12 @@ async def _signal_polling_loop():
                                 # Reminder cooldown: this condition stays true every single poll
                                 # cycle until the user actually closes the position on Dhan, so
                                 # without a cooldown this alert fires every ~15s and floods
-                                # Telegram. Send it once, then only again every 15 minutes as a
-                                # reminder — not on every cycle.
+                                # Telegram. Send it once, then only again every 1 hour as a
+                                # reminder — not on every cycle. Widened from 15 min to 1 hour
+                                # (2026-08-28, explicit user request).
                                 _now_alert = datetime.now(_IST)
                                 _last_alert = _manual_exit_alert_last_sent.get(pos.order_id)
-                                if _last_alert is None or (_now_alert - _last_alert).total_seconds() >= 900:
+                                if _last_alert is None or (_now_alert - _last_alert).total_seconds() >= 3600:
                                     _manual_exit_alert_last_sent[pos.order_id] = _now_alert
                                     _trace(_tid, "TELEGRAM", f"MANUAL_EXIT_NEEDED reminder sent, reason={exit_reason}")
                                     try:
@@ -3535,7 +3604,7 @@ async def _signal_polling_loop():
                                             f"{pos.direction} {pos.symbol}\n"
                                             f"Reason: {exit_reason} (LTP: {ltp})\n"
                                             f"Auto-trade is OFF — please exit on Dhan manually!\n"
-                                            f"(Reminder every 15 min until closed)",
+                                            f"(Reminder every 1 hour until closed)",
                                             cfg.telegram_bot_token, cfg.telegram_chat_id
                                         )
                                     except Exception:
@@ -3560,13 +3629,25 @@ async def _signal_polling_loop():
                             if cfg.strategy in _COOLDOWN_BARS and rec.get("pnl", 0.0) <= 0.0:
                                 record_cooldown_loss(pos.direction)
 
-                            # Log exit fill slippage
-                            # For SL/T2 hits: expected = the SL/T2 level, actual = ltp at exit
-                            _expected_exit = exit_price  # index-level SL/T2 hit price
-                            if exit_reason == "SL_HIT" and pos.sl > 0:
-                                _expected_exit = pos.sl
-                            elif exit_reason == "T2_HIT" and pos.target2 > 0:
-                                _expected_exit = pos.target2
+                            # Log exit fill slippage.
+                            # For SL/T2 hits: expected = the SL/T2 level, actual = ltp at exit.
+                            # exit_price/pos.sl/pos.target2 are always INDEX-level (the hit
+                            # detection compares index LTP against them), but pnl_price is the
+                            # PREMIUM for OPTIONS mode -- comparing them produced a nonsensical
+                            # logged "slippage" (confirmed live, 2026-08-26, e.g.
+                            # expected=57930.35 actual=1326.60 => -97.71%). No premium-level
+                            # "expected at exit" is tracked anywhere in this path, so for
+                            # OPTIONS mode there's nothing valid to compare pnl_price against --
+                            # fall back to 0 logged slippage rather than mixing units, same
+                            # reasoning as the entry-side fix just above.
+                            if pos.trade_mode == "OPTIONS":
+                                _expected_exit = pnl_price
+                            else:
+                                _expected_exit = exit_price  # index-level SL/T2 hit price
+                                if exit_reason == "SL_HIT" and pos.sl > 0:
+                                    _expected_exit = pos.sl
+                                elif exit_reason == "T2_HIT" and pos.target2 > 0:
+                                    _expected_exit = pos.target2
                             slippage_tracker.log_exit_fill(
                                 symbol=pos.symbol,
                                 direction=pos.direction,
@@ -4498,9 +4579,11 @@ def send_telegram_entry_alert(sig: dict, result: dict):
         option_line = f"Option: {sym_display}{prem_str}\n"
     strike_str = f"Strike: {strike} {opt_type}\n" if strike else ""
 
-    # Confidence score breakdown matching screenshot style
+    # Confidence score -- only meaningful for multi-agent-scored strategies;
+    # plain strategy-based kernels always report weighted_score=0.0, so
+    # "Score: 0/15" is boilerplate, not information. Omit when not scored.
     score_val = int(sig.get("weighted_score", 0.0) * 15)
-    score_str = f"Score: {score_val}/15"
+    score_str = f" | Score: {score_val}/15" if sig.get("weighted_score", 0.0) > 0 else ""
 
     # Score breakdown details
     breakdown_parts = []
@@ -4519,30 +4602,40 @@ def send_telegram_entry_alert(sig: dict, result: dict):
 
     breakdown_str = "\n".join(f"• {p}" for p in breakdown_parts)
 
-    # Detailed reasons from agents
-    reasons_parts = []
-    if sig.get("reasons"):
-        reasons_parts = [f"• {r}" for r in sig["reasons"][:5]]
-    reasons_str = "\n".join(reasons_parts) if reasons_parts else "• No detailed reasons provided."
+    # Detailed reasons from agents. Simple strategy-based kernels (Time-Gated,
+    # Regime V1, etc.) don't populate this beyond a generic "Source: STRATEGY"
+    # placeholder -- that's not an actual reason, so treat it the same as "no
+    # reasons" rather than printing it as if it were meaningful content.
+    real_reasons = [
+        r for r in (sig.get("reasons") or [])
+        if str(r).strip().lower() != "source: strategy"
+    ]
+    reasons_str = "\n".join(f"• {r}" for r in real_reasons[:5])
 
-    # Build Markdown message — index prices as main, option info as supplementary
-    msg = (
-        f"⚡📝 {msg_type} — {instrument} {direction} {scalp_type}\n"
-        f"Time: {datetime.now(_IST).strftime('%H:%M:%S')} IST | {score_str}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{strike_str}"
-        f"{option_line}"
+    # Build Markdown message — index prices as main, option info as supplementary.
+    # Consensus Breakdown / Agent Reasons only apply to the multi-agent-scored
+    # strategies; for plain strategy-based kernels both are always empty, so
+    # skip those sections entirely instead of showing an empty header (2026-08-25).
+    msg_parts = [
+        f"⚡📝 {msg_type} — {instrument} {direction} {scalp_type}",
+        f"Time: {datetime.now(_IST).strftime('%H:%M:%S')} IST{score_str}",
+        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"{strike_str}{option_line}"
         f"Index Entry: Rs.{sig.get('entry', 0.0):,.2f} | Qty: {qty}\n"
         f"SL: Rs.{sig.get('sl', 0.0):,.2f}\n"
         f"Target 1: Rs.{sig.get('target1', 0.0):,.2f} (Breakeven Trail)\n"
-        f"Target 2: Rs.{sig.get('target2', 0.0):,.2f}\n\n"
-        f"📈 *Consensus Breakdown:*\n"
-        f"{breakdown_str}\n\n"
-        f"🤖 *Agent Reasons:*\n"
-        f"{reasons_str}\n\n"
-        f"• ML Prob: {int(sig.get('ml_prob', 0.0)*100)}% (Threshold: {cfg.ml_threshold:.2f})\n"
-        f"• Entry Slippage: Rs.{result.get('entry_slippage', 0.0):,.2f}"
-    )
+        f"Target 2: Rs.{sig.get('target2', 0.0):,.2f}",
+    ]
+    if breakdown_str:
+        msg_parts.append(f"📈 *Consensus Breakdown:*\n{breakdown_str}")
+    if reasons_str:
+        msg_parts.append(f"🤖 *Agent Reasons:*\n{reasons_str}")
+    footer_lines = []
+    if sig.get("ml_prob", 0.0) > 0:
+        footer_lines.append(f"• ML Prob: {int(sig['ml_prob']*100)}% (Threshold: {cfg.ml_threshold:.2f})")
+    footer_lines.append(f"• Entry Slippage: Rs.{result.get('entry_slippage', 0.0):,.2f}")
+    msg_parts.append("\n".join(footer_lines))
+    msg = "\n\n".join(msg_parts)
     
     try:
         _send_telegram_alert_wrapper(
@@ -5390,11 +5483,22 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
             import threading as _threading
             _threading.Thread(target=_post_entry_verify, daemon=True, name="PostEntryVerify").start()
 
-        # Log entry fill slippage
+        # Log entry fill slippage.
+        # Paper OPTIONS entries have no "expected_price" key (result comes
+        # from the paper path above, not broker.place_entry_order) -- the old
+        # fallback to sig.get("entry") is the INDEX-level signal price, while
+        # actual_price=entry_price is the PREMIUM. Comparing them produced a
+        # nonsensical logged "slippage" (confirmed live, 2026-08-26). A paper
+        # fill has no real broker round-trip to slip against anyway, so the
+        # honest value is 0 -- expected == actual -- same reasoning already
+        # applied to the entry-price fallback itself just above (2026-08-21).
+        _expected_entry_slip = result.get("expected_price")
+        if _expected_entry_slip is None:
+            _expected_entry_slip = entry_price if cfg.trade_mode == "OPTIONS" else sig.get("entry", 0)
         slippage_tracker.log_entry_fill(
             symbol=result["symbol"],
             direction=direction,
-            expected_price=result.get("expected_price", sig.get("entry", 0)),
+            expected_price=_expected_entry_slip,
             actual_price=entry_price,
             qty=result["qty"],
             order_id=result["order_id"],

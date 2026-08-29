@@ -159,6 +159,7 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
     { id:'journal',         icon:<BookOpen size={18}/>,        label:'Broker Journal' },
     { id:'performance',     icon:<BarChart2 size={18}/>,       label:'Performance' },
     { id:'research_studio', icon:<Code2 size={18}/>,           label:'Research Studio' },
+    { id:'cas',             icon:<AlertCircle size={18}/>,     label:'CAS' },
   ]
 
   const sideW = collapsed ? 64 : 240
@@ -1521,6 +1522,358 @@ function SignalJournalPanel({ entries, onRefresh }) {
           </div>
         )}
       </Card>
+    </div>
+  )
+}
+
+// ── CAS Spike Scanner Page ──────────────────────────────────────────────────
+// Two independent modes, each its own section: Mode A ("CAS Window",
+// 15:05-15:28 IST, stock options only) and Mode B ("Undercurrent", all day,
+// stocks + indices). See STRATEGY_REGISTRY.md / the CAS scanner plan for the
+// full research behind both.
+const _FLOW_SHORT = {
+  long_buildup: 'Long Buildup',
+  short_buildup: 'Short Buildup',
+  short_covering: 'Short Covering',
+  long_unwinding: 'Long Unwinding',
+  flat: 'Flat',
+}
+
+// Detail-column text for a Mode B candidate -- accumulated Vol/OI over the
+// persistence window (not an instantaneous snapshot, per the 2026-08-26
+// redesign), or the OI-concentration-trend magnitude for that trigger type.
+function _casDetail(c) {
+  if (c.trigger === 'oi_concentration_trend') {
+    return `${c.concentration_trend_pct > 0 ? '+' : ''}${c.concentration_trend_pct} pts`
+  }
+  const ratio = c.zero_baseline_oi ? '∞' : `${c.accumulation_ratio}x`
+  const mins = c.minutes_tracked != null ? ` over ${c.minutes_tracked}m` : ''
+  const cluster = c.cluster_neighbors ? ` · ${c.cluster_neighbors} nbr` : ''
+  const flow = c.flow ? ` · ${_FLOW_SHORT[c.flow] || c.flow}` : ''
+  return `${ratio}${mins}${cluster}${flow}`
+}
+
+function CasAlertsPage({ alertsA, alertsB, alertsC, atRisk, undercurrent, heatmap }) {
+  const [subTab, setSubTab] = useState('alerts')
+  const m = window.innerWidth < 768
+
+  const pillStyle = (active) => ({
+    padding: '6px 16px', borderRadius: 20, fontSize: 13, fontWeight: 600, cursor: 'pointer',
+    background: active ? 'color-mix(in srgb, #6366f1 18%, transparent)' : 'transparent',
+    color: active ? '#6366f1' : V('text-muted'),
+    border: `1px solid ${active ? 'color-mix(in srgb, #6366f1 35%, transparent)' : V('border')}`,
+  })
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+      <div style={{ display:'flex', gap:8 }}>
+        <div style={pillStyle(subTab === 'alerts')} onClick={() => setSubTab('alerts')}>Alerts</div>
+        <div style={pillStyle(subTab === 'heatmap')} onClick={() => setSubTab('heatmap')}>Heatmap</div>
+      </div>
+      {subTab === 'heatmap' ? <CasHeatmapTab heatmap={heatmap} /> : <CasAlertsTab alertsA={alertsA} alertsB={alertsB} alertsC={alertsC} atRisk={atRisk} undercurrent={undercurrent} />}
+    </div>
+  )
+}
+
+function CasAlertsTab({ alertsA, alertsB, alertsC, atRisk, undercurrent }) {
+  const m = window.innerWidth < 768
+  const nowIst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }))
+  const t = nowIst.getHours() * 60 + nowIst.getMinutes()
+  const windowActive = t >= (15 * 60 + 5) && t <= (15 * 60 + 28)
+
+  const thStyle = { textAlign:'left', padding:'8px 10px', color:V('text-muted'), fontSize:11, textTransform:'uppercase', letterSpacing:'0.05em', borderBottom:`1px solid ${V('border')}` }
+  const tdStyle = { padding:'8px 10px', borderBottom:`1px solid ${V('border-light')}`, fontSize:13 }
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:20 }}>
+      {/* ── Mode A: CAS Window ── */}
+      <Card>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14, flexWrap:'wrap', gap:10 }}>
+          <div>
+            <div style={{ fontSize:16, fontWeight:700, color:V('text-primary') }}>CAS Window</div>
+            <div style={{ fontSize:12, color:V('text-muted') }}>Stock options only · near-worthless + expiring soon · reactive alerting only 15:05-15:28 IST</div>
+          </div>
+          <span style={{
+            padding:'4px 12px', borderRadius:20, fontSize:11, fontWeight:600,
+            background: windowActive ? 'color-mix(in srgb, #22c55e 18%, transparent)' : V('bg-tertiary'),
+            color: windowActive ? '#22c55e' : V('text-muted'),
+            border: `1px solid ${windowActive ? 'color-mix(in srgb, #22c55e 35%, transparent)' : V('border')}`,
+          }}>{windowActive ? '● Active now' : 'Inactive (visibility only)'}</span>
+        </div>
+
+        <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(3,1fr)', gap:10, marginBottom:16 }}>
+          <MetricBox label="Fired Alerts Today" value={alertsA.length} color={alertsA.length ? '#ef4444' : V('text-primary')} />
+          <MetricBox label="At-Risk Shortlist" value={atRisk.length} sub="updates every ~5 min" />
+          <MetricBox label="Top Risk Score" value={atRisk[0] ? atRisk[0].score.toFixed(0) : '—'} sub={atRisk[0] ? `${atRisk[0].symbol} ${atRisk[0].strike}${atRisk[0].option_type}` : ''} />
+        </div>
+
+        {alertsA.length > 0 && (
+          <div style={{ overflowX:'auto', marginBottom:16 }}>
+            <table style={{ width:'100%', borderCollapse:'collapse' }}>
+              <thead><tr>
+                {['Time','Symbol','Strike/Type','Expiry','Premium Before → Peak','% Spike'].map(h => <th key={h} style={thStyle}>{h}</th>)}
+              </tr></thead>
+              <tbody>
+                {alertsA.slice(0, 50).map((a, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{a.time}</td>
+                    <td style={tdStyle}>{a.symbol}</td>
+                    <td style={tdStyle}>{a.strike}{a.option_type}</td>
+                    <td style={tdStyle}>{a.expiry}</td>
+                    <td style={tdStyle}>₹{a.premium_before?.toFixed(2)} → ₹{a.premium_peak?.toFixed(2)}</td>
+                    <td style={{...tdStyle, color:'#ef4444', fontWeight:600}}>+{a.pct_move}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div style={{ fontSize:12, color:V('text-muted'), marginBottom:8, fontWeight:600 }}>At-Risk Shortlist (structural — visible before anything fires)</div>
+        <div style={{ overflowX:'auto' }}>
+          <table style={{ width:'100%', borderCollapse:'collapse' }}>
+            <thead><tr>
+              {['Symbol','Strike/Type','Expiry (days)','Premium','% OTM / OI Share'].map(h => <th key={h} style={thStyle}>{h}</th>)}
+            </tr></thead>
+            <tbody>
+              {atRisk.length === 0 && <tr><td colSpan={5} style={{...tdStyle, color:V('text-muted'), textAlign:'center'}}>Nothing at risk right now</td></tr>}
+              {atRisk.slice(0, 30).map((c, i) => (
+                <tr key={i}>
+                  <td style={tdStyle}>{c.symbol}</td>
+                  <td style={tdStyle}>{c.strike}{c.option_type}</td>
+                  <td style={tdStyle}>{c.expiry} ({c.days_to_expiry}d)</td>
+                  <td style={tdStyle}>₹{c.premium?.toFixed(2)}</td>
+                  <td style={tdStyle}>{c.near_atm ? 'Near-ATM' : `${(Math.abs(c.strike - c.spot)/c.spot*100).toFixed(1)}% away`} · OI {c.oi_share_pct}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {/* ── Mode C: Index Burst ── */}
+      <Card>
+        <div style={{ fontSize:16, fontWeight:700, color:V('text-primary'), marginBottom:2 }}>Index Burst</div>
+        <div style={{ fontSize:12, color:V('text-muted'), marginBottom:14 }}>NIFTY/BANKNIFTY/SENSEX only · same Vol/OI accumulation signal as Undercurrent, but a much shorter confirm window (minutes, not 30) · fires immediately, not digest-batched</div>
+
+        <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(1,1fr)', gap:10, marginBottom:16 }}>
+          <MetricBox label="Fired Alerts Today" value={alertsC.length} color={alertsC.length ? '#f59e0b' : V('text-primary')} />
+        </div>
+
+        <div style={{ overflowX:'auto' }}>
+          <table style={{ width:'100%', borderCollapse:'collapse' }}>
+            <thead><tr>
+              {['Time','Symbol','Strike/Type','Trigger','Detail','Bias','Confidence'].map(h => <th key={h} style={thStyle}>{h}</th>)}
+            </tr></thead>
+            <tbody>
+              {alertsC.length === 0 && <tr><td colSpan={7} style={{...tdStyle, color:V('text-muted'), textAlign:'center'}}>No index bursts fired today</td></tr>}
+              {alertsC.slice(0, 50).map((a, i) => (
+                <tr key={i}>
+                  <td style={tdStyle}>{a.time}</td>
+                  <td style={tdStyle}>{a.symbol}</td>
+                  <td style={tdStyle}>{a.strike ? `${a.strike}${a.option_type}` : '—'}</td>
+                  <td style={tdStyle}>{a.trigger === 'oi_concentration_trend' ? 'OI buildup' : 'Vol/OI accumulation'}</td>
+                  <td style={tdStyle}>{_casDetail(a)}</td>
+                  <td style={{...tdStyle, color: a.bias === 'bullish' ? '#22c55e' : a.bias === 'bearish' ? '#ef4444' : V('text-muted'), fontWeight:600}}>{a.bias ? a.bias[0].toUpperCase()+a.bias.slice(1) : '—'}</td>
+                  <td style={tdStyle}>{a.confidence}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {/* ── Mode B: Undercurrent ── */}
+      <Card>
+        <div style={{ fontSize:16, fontWeight:700, color:V('text-primary'), marginBottom:2 }}>Undercurrent</div>
+        <div style={{ fontSize:12, color:V('text-muted'), marginBottom:14 }}>Fired alerts: stocks only (indices have their own Index Burst alerting above) · currently-flagged list below still spans stocks + indices · Volume/OI ratio, building OI concentration, IV-skew · runs all day, not CAS-specific</div>
+
+        <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(2,1fr)', gap:10, marginBottom:16 }}>
+          <MetricBox label="Fired Alerts Today" value={alertsB.length} color={alertsB.length ? '#f59e0b' : V('text-primary')} />
+          <MetricBox label="Currently Flagged" value={undercurrent.length} sub="updates every ~5 min" />
+        </div>
+
+        {alertsB.length > 0 && (
+          <div style={{ overflowX:'auto', marginBottom:16 }}>
+            <table style={{ width:'100%', borderCollapse:'collapse' }}>
+              <thead><tr>
+                {['Time','Symbol','Strike/Type','Trigger','Detail','Bias','Confidence'].map(h => <th key={h} style={thStyle}>{h}</th>)}
+              </tr></thead>
+              <tbody>
+                {alertsB.slice(0, 50).map((a, i) => (
+                  <tr key={i}>
+                    <td style={tdStyle}>{a.time}</td>
+                    <td style={tdStyle}>{a.symbol}</td>
+                    <td style={tdStyle}>{a.strike ? `${a.strike}${a.option_type}` : '—'}</td>
+                    <td style={tdStyle}>{a.trigger === 'oi_concentration_trend' ? 'OI buildup' : 'Vol/OI accumulation'}</td>
+                    <td style={tdStyle}>{_casDetail(a)}</td>
+                    <td style={{...tdStyle, color: a.bias === 'bullish' ? '#22c55e' : a.bias === 'bearish' ? '#ef4444' : V('text-muted'), fontWeight:600}}>{a.bias ? a.bias[0].toUpperCase()+a.bias.slice(1) : '—'}</td>
+                    <td style={tdStyle}>{a.confidence}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div style={{ fontSize:12, color:V('text-muted'), marginBottom:8, fontWeight:600 }}>Currently Flagged</div>
+        <div style={{ overflowX:'auto' }}>
+          <table style={{ width:'100%', borderCollapse:'collapse' }}>
+            <thead><tr>
+              {['Symbol','Strike/Type','Trigger','Detail','Bias','Confidence'].map(h => <th key={h} style={thStyle}>{h}</th>)}
+            </tr></thead>
+            <tbody>
+              {undercurrent.length === 0 && <tr><td colSpan={6} style={{...tdStyle, color:V('text-muted'), textAlign:'center'}}>Nothing flagged right now</td></tr>}
+              {undercurrent.slice(0, 30).map((c, i) => (
+                <tr key={i}>
+                  <td style={tdStyle}>{c.symbol}</td>
+                  <td style={tdStyle}>{c.strike ? `${c.strike}${c.option_type}` : '—'}</td>
+                  <td style={tdStyle}>{c.trigger === 'oi_concentration_trend' ? 'OI buildup' : 'Vol/OI accumulation'}</td>
+                  <td style={tdStyle}>{_casDetail(c)}</td>
+                  <td style={{...tdStyle, color: c.bias === 'bullish' ? '#22c55e' : c.bias === 'bearish' ? '#ef4444' : V('text-muted'), fontWeight:600}}>{c.bias ? c.bias[0].toUpperCase()+c.bias.slice(1) : '—'}</td>
+                  <td style={tdStyle}>{c.confidence}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      <div style={{ fontSize:11, color:V('text-muted'), textAlign:'center', padding:'4px 0' }}>
+        Awareness only — no automated trading action is taken from either mode.
+      </div>
+    </div>
+  )
+}
+
+// Per-underlying heatmap over the FULL F&O universe (not just currently-flagged
+// names), with streak continuity across sweeps -- a state view, complementing
+// the point-in-time Telegram alert stream so it's clear what's still active
+// right now vs what fired once and stopped.
+function CasHeatmapTab({ heatmap }) {
+  const [filter, setFilter] = useState('')
+  const [selected, setSelected] = useState(null)
+  const m = window.innerWidth < 768
+
+  const list = heatmap || []
+  const filtered = filter
+    ? list.filter(h => h.symbol.toUpperCase().includes(filter.toUpperCase()))
+    : list
+  // Active cells first (longest-running streak first), then inactive alphabetically.
+  const sorted = [...filtered].sort((a, b) => {
+    if (a.active !== b.active) return a.active ? -1 : 1
+    if (a.active) return b.streak_minutes - a.streak_minutes
+    return a.symbol.localeCompare(b.symbol)
+  })
+
+  const cellColor = (h) => {
+    if (!h.active) return { bg: V('bg-tertiary'), fg: V('text-muted'), border: V('border') }
+    if (h.dominant_bias === 'bullish') {
+      const k = Math.min(Math.abs(h.net_score) / 3, 1)
+      return { bg: `color-mix(in srgb, #22c55e ${10 + k * 35}%, transparent)`, fg: '#22c55e', border: 'color-mix(in srgb, #22c55e 45%, transparent)' }
+    }
+    if (h.dominant_bias === 'bearish') {
+      const k = Math.min(Math.abs(h.net_score) / 3, 1)
+      return { bg: `color-mix(in srgb, #ef4444 ${10 + k * 35}%, transparent)`, fg: '#ef4444', border: 'color-mix(in srgb, #ef4444 45%, transparent)' }
+    }
+    return { bg: 'color-mix(in srgb, #f59e0b 20%, transparent)', fg: '#f59e0b', border: 'color-mix(in srgb, #f59e0b 45%, transparent)' }
+  }
+
+  const activeCount = list.filter(h => h.active).length
+  const bullCount = list.filter(h => h.dominant_bias === 'bullish').length
+  const bearCount = list.filter(h => h.dominant_bias === 'bearish').length
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+      <Card>
+        <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(3,1fr)', gap:10, marginBottom:16 }}>
+          <MetricBox label="Currently Active" value={activeCount} sub={`of ${list.length} F&O underlyings`} />
+          <MetricBox label="Bullish Lean" value={bullCount} color={bullCount ? '#22c55e' : V('text-primary')} />
+          <MetricBox label="Bearish Lean" value={bearCount} color={bearCount ? '#ef4444' : V('text-primary')} />
+        </div>
+
+        <input
+          type="text" placeholder="Filter by symbol..." value={filter}
+          onChange={e => setFilter(e.target.value)}
+          style={{
+            width:'100%', padding:'8px 12px', marginBottom:14, borderRadius:8, fontSize:13,
+            background:V('bg-tertiary'), border:`1px solid ${V('border')}`, color:V('text-primary'),
+          }}
+        />
+
+        <div style={{
+          display:'grid', gridTemplateColumns: `repeat(auto-fill, minmax(${m ? 90 : 110}px, 1fr))`, gap:6,
+          maxHeight: 560, overflowY: 'auto', paddingRight: 4,
+        }}>
+          {sorted.map(h => {
+            const c = cellColor(h)
+            return (
+              <div
+                key={h.symbol}
+                onClick={() => setSelected(h)}
+                title={h.active ? `${h.symbol}: ${h.dominant_bias}, ${h.streak_minutes}m` : h.symbol}
+                style={{
+                  background: c.bg, color: c.fg, border: `1px solid ${c.border}`,
+                  borderRadius: 6, padding: '8px 6px', cursor: 'pointer', textAlign: 'center',
+                  display:'flex', flexDirection:'column', gap: 2,
+                }}
+              >
+                <div style={{ fontSize: 11, fontWeight: 700, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{h.symbol}</div>
+                {h.active && <div style={{ fontSize: 10, opacity: 0.85 }}>{h.streak_minutes}m</div>}
+              </div>
+            )
+          })}
+          {sorted.length === 0 && (
+            <div style={{ gridColumn: '1 / -1', textAlign:'center', color:V('text-muted'), padding: 20 }}>
+              {list.length === 0 ? 'Waiting for the first sweep...' : 'No symbols match that filter'}
+            </div>
+          )}
+        </div>
+      </Card>
+
+      {selected && (
+        <Card>
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:10 }}>
+            <div style={{ fontSize:15, fontWeight:700, color:V('text-primary') }}>{selected.symbol}</div>
+            <div style={{ cursor:'pointer', color:V('text-muted'), fontSize:13 }} onClick={() => setSelected(null)}>Close ✕</div>
+          </div>
+          {selected.active ? (
+            <>
+              <div style={{ fontSize:13, color:V('text-muted'), marginBottom:12 }}>
+                Dominant bias: <span style={{ color: selected.dominant_bias === 'bullish' ? '#22c55e' : selected.dominant_bias === 'bearish' ? '#ef4444' : '#f59e0b', fontWeight:600 }}>
+                  {selected.dominant_bias[0].toUpperCase() + selected.dominant_bias.slice(1)}
+                </span> · continuous for {selected.streak_minutes}m ({selected.sweep_count} sweeps) · {selected.bullish_count} bullish leg{selected.bullish_count===1?'':'s'}, {selected.bearish_count} bearish leg{selected.bearish_count===1?'':'s'}
+              </div>
+              <div style={{ overflowX:'auto' }}>
+                <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                  <thead><tr>
+                    {['Strike/Type','Trigger','Detail','Bias','Confidence'].map(hd => (
+                      <th key={hd} style={{ textAlign:'left', padding:'8px 10px', color:V('text-muted'), fontSize:11, textTransform:'uppercase', letterSpacing:'0.05em', borderBottom:`1px solid ${V('border')}` }}>{hd}</th>
+                    ))}
+                  </tr></thead>
+                  <tbody>
+                    {selected.strikes.map((s, i) => (
+                      <tr key={i}>
+                        <td style={{ padding:'8px 10px', borderBottom:`1px solid ${V('border-light')}`, fontSize:13 }}>{s.strike ? `${s.strike}${s.option_type}` : '—'}</td>
+                        <td style={{ padding:'8px 10px', borderBottom:`1px solid ${V('border-light')}`, fontSize:13 }}>{s.trigger === 'oi_concentration_trend' ? 'OI buildup' : 'Vol/OI accumulation'}</td>
+                        <td style={{ padding:'8px 10px', borderBottom:`1px solid ${V('border-light')}`, fontSize:13 }}>{_casDetail(s)}</td>
+                        <td style={{ padding:'8px 10px', borderBottom:`1px solid ${V('border-light')}`, fontSize:13, color: s.bias === 'bullish' ? '#22c55e' : s.bias === 'bearish' ? '#ef4444' : V('text-muted'), fontWeight:600 }}>{s.bias ? s.bias[0].toUpperCase()+s.bias.slice(1) : '—'}</td>
+                        <td style={{ padding:'8px 10px', borderBottom:`1px solid ${V('border-light')}`, fontSize:13 }}>{s.confidence}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : (
+            <div style={{ fontSize:13, color:V('text-muted') }}>Nothing flagged for {selected.symbol} right now.</div>
+          )}
+        </Card>
+      )}
+
+      <div style={{ fontSize:11, color:V('text-muted'), textAlign:'center', padding:'4px 0' }}>
+        Updates every ~5 min · streak resets on a bias flip or a gap in flagging · Awareness only — no automated trading action is taken.
+      </div>
     </div>
   )
 }
@@ -6312,6 +6665,12 @@ export default function App() {
   const [allSignals,  setAllSignals]  = useState({})
   const [lastEntries, setLastEntries] = useState({})
   const [sigJournal,  setSigJournal]  = useState([])
+  const [casAlertsA,  setCasAlertsA]  = useState([])  // Mode A (CAS Window) fired alerts
+  const [casAlertsB,  setCasAlertsB]  = useState([])  // Mode B (Undercurrent, stock-sourced) fired alerts
+  const [casAlertsC,  setCasAlertsC]  = useState([])  // Mode C (Index Burst) fired alerts
+  const [casAtRisk,   setCasAtRisk]   = useState([])  // Mode A live shortlist
+  const [casUndercurrent, setCasUndercurrent] = useState([])  // Mode B live flagged list
+  const [casHeatmap, setCasHeatmap] = useState([])  // Mode B per-underlying heatmap, full F&O universe
   const [autoTrade,   setAutoTrade]   = useState(false)
   const [showSettings,setShowSettings]= useState(false)
   const [showConnect, setShowConnect] = useState(false)
@@ -6410,6 +6769,15 @@ export default function App() {
                 fetchChartSignalsRef.current && fetchChartSignalsRef.current()
               }
             }
+            if (msg.type === 'cas_alert') {
+              const a = msg.data
+              if (a.mode === 'cas_window') setCasAlertsA(prev => [a, ...prev])
+              else if (a.mode === 'undercurrent') setCasAlertsB(prev => [a, ...prev])
+              else if (a.mode === 'index_burst') setCasAlertsC(prev => [a, ...prev])
+            }
+            if (msg.type === 'cas_at_risk_update') { setCasAtRisk(msg.data || []) }
+            if (msg.type === 'cas_undercurrent_update') { setCasUndercurrent(msg.data || []) }
+            if (msg.type === 'cas_heatmap_update') { setCasHeatmap(msg.data || []) }
             if (msg.type === 'init') {
               setConnected(msg.data.connected)
               if (msg.data.signal && (!msg.data.signal.instrument || msg.data.signal.instrument === instrumentRef.current))
@@ -6556,6 +6924,35 @@ export default function App() {
       }
       fetchSJ()
       const id = setInterval(fetchSJ, 5000)
+      return () => clearInterval(id)
+    }
+    if (tab === 'cas') {
+      // Fallback poll -- covers a missed WS message or the page being opened
+      // after alerts already fired today. Real-time updates come instantly
+      // via the 'cas_alert'/'cas_at_risk_update'/'cas_undercurrent_update'
+      // WebSocket pushes above.
+      const fetchCas = async () => {
+        const [alerts, atRisk, undercurrent, heatmap] = await Promise.all([
+          API.get('/api/cas_alerts').catch(()=>null),
+          API.get('/api/cas_at_risk').catch(()=>null),
+          API.get('/api/cas_undercurrent').catch(()=>null),
+          API.get('/api/cas_heatmap').catch(()=>null),
+        ])
+        if (alerts) {
+          setCasAlertsA(alerts.alerts_cas_window || [])
+          // alerts_undercurrent holds both stock-sourced (Mode B) and
+          // index-sourced (Mode C) alerts -- backend tags each with "mode"
+          // so they can be split back apart here.
+          const bAll = alerts.alerts_undercurrent || []
+          setCasAlertsB(bAll.filter(a => a.mode !== 'index_burst'))
+          setCasAlertsC(bAll.filter(a => a.mode === 'index_burst'))
+        }
+        if (atRisk) setCasAtRisk(atRisk.at_risk || [])
+        if (undercurrent) setCasUndercurrent(undercurrent.undercurrent || [])
+        if (heatmap) setCasHeatmap(heatmap.heatmap || [])
+      }
+      fetchCas()
+      const id = setInterval(fetchCas, 10000)
       return () => clearInterval(id)
     }
   }, [tab, fetchJournal])
@@ -6721,6 +7118,7 @@ export default function App() {
     performance: ['Performance', 'Analytics, equity curve, and system health'],
     research: ['Research', 'Factor research pipeline — PCA, RMT, lead-lag analysis'],
     settings: ['Settings', 'Configure system settings, strategy parameters, risk thresholds, and API keys'],
+    cas: ['CAS', 'CAS-window spike detection (15:05-15:28, stock options) and all-day undercurrent scanning (stocks + indices)'],
   }
 
   return (
@@ -7025,8 +7423,11 @@ export default function App() {
             </ErrorBoundary>
           )}
 
-
-
+          {tab === 'cas' && (
+            <ErrorBoundary>
+              <CasAlertsPage alertsA={casAlertsA} alertsB={casAlertsB} alertsC={casAlertsC} atRisk={casAtRisk} undercurrent={casUndercurrent} heatmap={casHeatmap} />
+            </ErrorBoundary>
+          )}
 
 
           {tab === 'journal' && (

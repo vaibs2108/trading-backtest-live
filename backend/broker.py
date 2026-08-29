@@ -353,6 +353,31 @@ def _get_ltp_data(symbols) -> dict:
         return {}
 
 
+def _sorted_by_nearest_future_expiry(match: pd.DataFrame) -> pd.DataFrame:
+    """Sort a scrip-master slice by SEM_EXPIRY_DATE ascending, filtering out
+    already-lapsed rows first.
+
+    Confirmed live (2026-08-26): NSE's scrip master kept a stock-options
+    series listed for a day after it expired, so a plain sort-ascending
+    picked the just-lapsed date and caused real missed trades
+    (get_option_symbol, fixed the same day). MCX's FUTCOM listing happened to
+    already have the expired contract purged when checked, but the raw
+    sort-ascending pattern here carries the identical risk if that ever lags
+    the way NSE's did -- filtering is a no-op whenever everything listed is
+    still genuinely upcoming, so it costs nothing on the days nothing has
+    lapsed. Falls back to the unfiltered sort (with a warning) only if every
+    listed row has already lapsed, rather than returning nothing.
+    """
+    if match.empty:
+        return match
+    today_str = datetime.now().date().isoformat()
+    future = match[match['SEM_EXPIRY_DATE'].astype(str).str.split(" ").str[0] >= today_str]
+    if future.empty:
+        logger.warning("_sorted_by_nearest_future_expiry: every listed expiry has already lapsed -- falling back to unfiltered sort")
+        future = match
+    return future.sort_values(by='SEM_EXPIRY_DATE')
+
+
 def get_ltp(instrument: str) -> Optional[float]:
     global _ltp_cache, _ltp_cache_time
     import pytz
@@ -371,7 +396,7 @@ def get_ltp(instrument: str) -> Optional[float]:
                 ((df_master['SM_SYMBOL_NAME'] == sym_idx) | (df_master['SEM_TRADING_SYMBOL'].str.startswith(sym_idx)))
             ]
             if not match.empty:
-                active_sym = str(match.sort_values(by='SEM_EXPIRY_DATE').iloc[0]['SEM_TRADING_SYMBOL'])
+                active_sym = str(_sorted_by_nearest_future_expiry(match).iloc[0]['SEM_TRADING_SYMBOL'])
                 ltps = _get_ltp_data([active_sym])
                 val = ltps.get(active_sym)
             else:
@@ -412,23 +437,52 @@ _option_ltp_cache = {}
 _option_ltp_cache_time = {}
 
 def get_option_ltp(symbol: str) -> float:
-    """Fetch live option premium LTP directly from Dhan with 2s caching."""
+    """Fetch live option premium LTP directly from Dhan with 2s caching.
+
+    Retries on an empty/zero result before falling back to the last
+    known-good cached value. Confirmed live (2026-08-26): Dhan's ticker_data
+    intermittently returns an empty result for a real, liquid, actively-held
+    NSE_FNO symbol -- a single request returning {} moments after (and
+    before) other requests for the same symbol succeeded normally, so it's
+    a transient blip, not a broken symbol. Without a retry, every caller
+    (_safe_pnl_exit_price in particular) silently fell back to a stand-in
+    price for as long as the blip lasted -- one real trade saw this on every
+    poll for its entire ~10-minute hold, closing at its own entry price
+    despite the index having moved, producing a meaningless PnL. A recent
+    cached quote, even slightly stale, is a far better estimate than 0.
+
+    Widened from 1 retry to 3 (2026-08-27): the single-retry version still
+    failed on every poll for a live position for 2+ minutes straight (~9
+    consecutive polls). Reproduced directly: even attempts spaced a full 3s
+    apart failed twice before succeeding on the third -- this is the same
+    "needs multiple retry rounds, not just one" pattern already confirmed to
+    work for the CAS scanner's own option_chain calls (84 -> 35 -> 14 -> 7 ->
+    0 failures across 4 rounds), not something a single quick retry bridges."""
     if not symbol:
         return 0.0
     now = _time.time()
     if symbol in _option_ltp_cache and symbol in _option_ltp_cache_time:
         if now - _option_ltp_cache_time[symbol] < 2.0:
             return _option_ltp_cache[symbol]
-    try:
-        ltps = _get_ltp_data([symbol])
-        val = ltps.get(symbol, 0.0)
-        if val > 0:
-            _option_ltp_cache[symbol] = val
-            _option_ltp_cache_time[symbol] = now
-        return val
-    except Exception as e:
-        logger.error(f"get_option_ltp error for {symbol}: {e}")
-        return _option_ltp_cache.get(symbol, 0.0)
+    max_attempts = 4
+    for attempt in range(max_attempts):
+        try:
+            ltps = _get_ltp_data([symbol])
+            val = ltps.get(symbol, 0.0)
+            if val > 0:
+                _option_ltp_cache[symbol] = val
+                _option_ltp_cache_time[symbol] = now
+                return val
+        except Exception as e:
+            logger.error(f"get_option_ltp error for {symbol}: {e}")
+        if attempt < max_attempts - 1:
+            _time.sleep(0.5)
+    if symbol in _option_ltp_cache:
+        logger.warning(
+            f"get_option_ltp: live fetch failed {max_attempts} times for {symbol}, "
+            f"using stale cached value {_option_ltp_cache[symbol]}"
+        )
+    return _option_ltp_cache.get(symbol, 0.0)
 
 
 def get_index_security_id(symbol: str) -> Optional[str]:
@@ -467,7 +521,7 @@ def get_feed_subscription(instrument: str):
                  (df_master['SEM_TRADING_SYMBOL'].str.startswith(symbol + '-')))
             ]
             if not match.empty:
-                row = match.sort_values(by='SEM_EXPIRY_DATE').iloc[0]
+                row = _sorted_by_nearest_future_expiry(match).iloc[0]
                 return str(row['SEM_SMST_SECURITY_ID']), "MCX_COMM"
             logger.error(f"get_feed_subscription: no FUTCOM found for {symbol}")
             return None
@@ -534,7 +588,7 @@ def get_historical_data(
                     ((df_master['SM_SYMBOL_NAME'] == symbol) | (df_master['SEM_TRADING_SYMBOL'].str.startswith(symbol + '-')))
                 ]
                 if not match.empty:
-                    match = match.sort_values(by='SEM_EXPIRY_DATE')
+                    match = _sorted_by_nearest_future_expiry(match)
                     row = match.iloc[0]
                     sec_id = str(row['SEM_SMST_SECURITY_ID'])
                     exch_seg = "MCX_COMM"
@@ -747,7 +801,20 @@ def get_option_symbol(instrument: str, direction: str, expiry: int = 0,
             logger.error(f"No expiries found for option {instrument}")
             return None, None
 
-        expiry_date = expiries[min(expiry, len(expiries) - 1)]
+        # The scrip master CSV keeps a just-lapsed expiry series listed for a
+        # day after it expires (confirmed live 2026-08-26: BANKNIFTY's
+        # 2026-08-25 monthly was still expiries[0] the morning after it
+        # expired), so the raw sorted-unique minimum can point at a dead,
+        # unpriceable contract -- this is what caused 3 real LONG signals to
+        # be skipped this morning ("Option premium unavailable"). Filter to
+        # only expiries that haven't lapsed yet.
+        today = datetime.now().date()
+        future_expiries = [e for e in expiries if pd.Timestamp(e).date() >= today]
+        if not future_expiries:
+            logger.error(f"No future (non-lapsed) expiries found for option {instrument}")
+            return None, None
+
+        expiry_date = future_expiries[min(expiry, len(future_expiries) - 1)]
         df_expiry = df_opt[df_opt['SEM_EXPIRY_DATE'] == expiry_date]
 
         sorted_strikes = sorted(df_expiry['SEM_STRIKE_PRICE'].unique())

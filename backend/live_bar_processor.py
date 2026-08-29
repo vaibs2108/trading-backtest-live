@@ -98,6 +98,40 @@ def _to_ist_iso(ts) -> str:
     return t.isoformat()
 
 
+# Root-cause fix (2026-08-25) for the "stale replay" issue: as the rolling
+# 300-bar eval window slides forward, a kernel's own indicator/regime state
+# near the window's older edge isn't perfectly stable -- the same historical
+# bar can go from "not a trade" to "a trade" between polls purely because the
+# window's warm-up context for it changed, with no change in the underlying
+# market data. That made the diff below occasionally "discover" a trade from
+# days ago and report it as brand new. main.py already had downstream
+# age-gates (Telegram, chart) that caught this before it reached the user,
+# but the diff itself had no such check, so the same stale rediscovery could
+# repeat indefinitely every time the window happened to flicker again.
+# STALE_ENTRY_MAX_AGE_MIN is deliberately generous (not the 10-min cutoff
+# main.py uses for order execution/alerts) -- normal poll-cycle detection
+# latency measured up to ~8 min in practice, and unlike the downstream gates
+# (which just skip an alert for an otherwise-still-tracked signal), silently
+# dropping the ENTRY here also removes it from consideration forever on the
+# next poll. A wide margin protects against ever discarding a genuine signal
+# while still comfortably catching rediscoveries that are actually hours to
+# days old.
+STALE_ENTRY_MAX_AGE_MIN = 60.0
+
+
+def _bar_age_minutes(bar_time) -> Optional[float]:
+    """Age of a bar's own timestamp in minutes, or None if unparseable."""
+    try:
+        import pytz
+        parsed = pd.to_datetime(bar_time)
+        if getattr(parsed, "tzinfo", None) is not None:
+            parsed = parsed.tz_convert("Asia/Kolkata").tz_localize(None)
+        now_naive = pd.Timestamp.now(tz=pytz.timezone("Asia/Kolkata")).tz_localize(None)
+        return (now_naive - parsed).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # GENERIC BACKTEST-DIFF PROCESSOR (base class)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -268,21 +302,34 @@ class BacktestDiffProcessor:
                     f"reason={t.get('exit_reason')} @ {t.get('exit_price', 0)}"
                 )
 
-            # New trade not seen before?
+            # New trade not seen before? Only trust it as a genuine live
+            # signal if its own bar is recent -- a "new" trade whose entry
+            # is actually old is a rediscovered rolling-window artifact, not
+            # real news (see STALE_ENTRY_MAX_AGE_MIN above). current_keys
+            # already includes it either way, so it's folded into known
+            # state and never reconsidered again regardless.
             if key not in self._prev_trade_keys:
-                signals_out.append(self._entry_from_trade(t))
-                logger.info(
-                    f"[{self.strategy_id}] ENTRY {t['direction']} "
-                    f"@ {t.get('entry_price', 0)} SL={t.get('sl', 0)} "
-                    f"source={t.get('source', '?')}"
-                )
-                # If already closed on the same bar, also emit exit
-                if not is_open and t.get("exit_time"):
-                    signals_out.append(self._exit_from_trade(t, qty))
+                _age = _bar_age_minutes(t["entry_time"])
+                if _age is not None and _age > STALE_ENTRY_MAX_AGE_MIN:
                     logger.info(
-                        f"[{self.strategy_id}] Immediate EXIT {t['direction']} "
-                        f"reason={t.get('exit_reason')} (same bar)"
+                        f"[{self.strategy_id}] Suppressed stale rediscovered "
+                        f"{t['direction']} entry_time={t['entry_time']} "
+                        f"age={_age:.1f}m (not emitted as live signal)"
                     )
+                else:
+                    signals_out.append(self._entry_from_trade(t))
+                    logger.info(
+                        f"[{self.strategy_id}] ENTRY {t['direction']} "
+                        f"@ {t.get('entry_price', 0)} SL={t.get('sl', 0)} "
+                        f"source={t.get('source', '?')}"
+                    )
+                    # If already closed on the same bar, also emit exit
+                    if not is_open and t.get("exit_time"):
+                        signals_out.append(self._exit_from_trade(t, qty))
+                        logger.info(
+                            f"[{self.strategy_id}] Immediate EXIT {t['direction']} "
+                            f"reason={t.get('exit_reason')} (same bar)"
+                        )
 
         # ── Update internal state ──
         self._prev_trade_keys = current_keys

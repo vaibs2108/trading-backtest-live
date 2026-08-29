@@ -173,12 +173,23 @@ class TradeManager:
         if pnl_override is not None:
             pnl = pnl_override
         else:
+            # T1 partial-book split uses pos.target1 directly against
+            # entry_price -- correct for INDEX mode (both are the same
+            # index-level unit), but for OPTIONS mode entry_price is the
+            # option PREMIUM while target1 is an INDEX-level trigger price,
+            # never comparable. There's no stored premium value from the
+            # moment T1 was actually crossed, so for OPTIONS mode compute
+            # the whole position's PnL off the full qty instead of inventing
+            # a phantom partial-book profit from mixed units (found
+            # 2026-08-25: a real T2 exit reported +Rs.8.5L on a position
+            # whose own option premium hadn't moved between entry and exit).
+            _use_t1_split = pos.t1_hit and pos.trade_mode != "OPTIONS"
             if pos.direction == "LONG":
-                t1p = (pos.target1 - pos.entry_price) * int(pos.qty*0.5) if pos.t1_hit else 0
-                rp  = (exit_price - pos.entry_price) * (pos.qty - int(pos.qty*0.5) if pos.t1_hit else pos.qty)
+                t1p = (pos.target1 - pos.entry_price) * int(pos.qty*0.5) if _use_t1_split else 0
+                rp  = (exit_price - pos.entry_price) * (pos.qty - int(pos.qty*0.5) if _use_t1_split else pos.qty)
             else:
-                t1p = (pos.entry_price - pos.target1) * int(pos.qty*0.5) if pos.t1_hit else 0
-                rp  = (pos.entry_price - exit_price) * (pos.qty - int(pos.qty*0.5) if pos.t1_hit else pos.qty)
+                t1p = (pos.entry_price - pos.target1) * int(pos.qty*0.5) if _use_t1_split else 0
+                rp  = (pos.entry_price - exit_price) * (pos.qty - int(pos.qty*0.5) if _use_t1_split else pos.qty)
             cost = (pos.entry_price + exit_price) * pos.qty * 0.0002
             pnl  = t1p + rp - cost
 
