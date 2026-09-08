@@ -14,12 +14,60 @@ Architecture:
 """
 
 import logging
+import time as _time_mod
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
 
+import broker
+
 logger = logging.getLogger(__name__)
+
+# Fixed anchor matching the period the active strategy was actually
+# train/validate/full-discipline validated against (see STRATEGY_REGISTRY.md
+# and the 2026-08-31 backtest-matrix runs) -- deliberately NOT a sliding
+# "N days back from today" window, so the warm-up context live evaluates on
+# stays identical to what was validated. Cost grows slowly as trading days
+# accumulate (see live_signal_vs_backtest_window_open_decision memory) --
+# not urgent, revisit if a cycle ever creeps toward the 5-min ceiling.
+_FULL_HISTORY_ANCHOR = "2025-07-01"
+
+
+def _fetch_full_history_frames(instrument: str) -> Optional[Dict[str, pd.DataFrame]]:
+    """Fetch full warm-up-buffered history, mirroring /api/backtest's exact
+    methodology (100-day warm-up for 60/15/5, 1100-day for 1D) -- so the
+    active strategy's live evaluation sees the same data shape it was
+    validated on, instead of the 300-bar rolling window every other live
+    strategy still uses. Returns None on any failure so the caller can fall
+    back to the existing 300-bar path without disrupting live evaluation.
+    """
+    try:
+        import pytz
+        now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+        today = (now_ist + timedelta(days=1)).strftime("%Y-%m-%d")
+        from_dt = datetime.strptime(_FULL_HISTORY_ANCHOR, "%Y-%m-%d")
+        warmup_from = (from_dt - timedelta(days=100)).strftime("%Y-%m-%d")
+        daily_from = (from_dt - timedelta(days=1100)).strftime("%Y-%m-%d")
+
+        frames = {}
+        for tf_key, tf_dhan, query_from in [
+            ("1D", "DAY", daily_from),
+            ("60", "60", warmup_from),
+            ("15", "15", warmup_from),
+            ("5", "5", warmup_from),
+        ]:
+            df = broker.get_historical_data(instrument, tf_dhan, query_from, today)
+            if df is None or len(df) < 30:
+                logger.warning(f"[full-history] {tf_key}: only {len(df) if df is not None else 0} rows, aborting")
+                return None
+            frames[tf_key] = df
+            _time_mod.sleep(0.3)
+        return frames
+    except Exception as e:
+        logger.warning(f"[full-history] fetch failed: {e}")
+        return None
 
 
 @dataclass
@@ -213,13 +261,29 @@ class BacktestDiffProcessor:
             if self._initialised and self.last_processed_ts == current_5m_ts:
                 return []
 
-        # Slice frames to trailing window (N=300) for fast live bar evaluation
-        eval_frames = {}
-        for tf, df in frames.items():
-            if df is not None and not df.empty:
-                eval_frames[tf] = df.tail(300).copy() if len(df) > 300 else df
+        # Active strategy (the one whose signals drive Telegram + auto-trade)
+        # gets full warm-up-buffered history instead of the 300-bar window —
+        # validated 2026-08-31 offline: the 300-bar window never missed a
+        # real backtest signal but fired ~1.7x extra phantom trades from
+        # insufficient indicator warm-up. Falls back to the 300-bar path
+        # below on any fetch failure, and for every other live strategy.
+        eval_frames = None
+        is_active = self.strategy_id == getattr(cfg, "strategy", None)
+        if is_active and getattr(cfg, "live_active_strategy_full_history", False):
+            full_frames = _fetch_full_history_frames(getattr(cfg, "instrument", "BANKNIFTY"))
+            if full_frames:
+                eval_frames = full_frames
             else:
-                eval_frames[tf] = df
+                logger.warning(f"[{self.strategy_id}] full-history fetch failed, falling back to 300-bar window this cycle")
+
+        if eval_frames is None:
+            # Slice frames to trailing window (N=300) for fast live bar evaluation
+            eval_frames = {}
+            for tf, df in frames.items():
+                if df is not None and not df.empty:
+                    eval_frames[tf] = df.tail(300).copy() if len(df) > 300 else df
+                else:
+                    eval_frames[tf] = df
 
         # Run kernel backtest
         kernel = self._get_kernel()

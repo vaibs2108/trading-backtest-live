@@ -33,10 +33,36 @@ class Settings(BaseSettings):
     max_daily_profit: float = 15000.0    # Rs. stop trading after this profit
     auto_trade: bool = False             # master switch for live execution
     product_type: str = "NRML"           # NRML | MIS (Carry Forward vs. Intraday)
-    position_hold_mode: str = "INTRADAY"  # INTRADAY | CARRY_FORWARD — backtest engine
-                                           # EOD handling (per-backtest-request override
-                                           # from the Backtest page; distinct from the
-                                           # live-order product_type above)
+    position_hold_mode: str = "CARRY_FORWARD"  # INTRADAY | CARRY_FORWARD — strategy-kernel
+                                           # EOD signal handling. Backtest page always
+                                           # overrides this per-request (defaults to
+                                           # INTRADAY there if unset); this default is
+                                           # what live evaluation uses, and must match
+                                           # whatever mode the active strategy was
+                                           # validated under (CARRY_FORWARD, confirmed
+                                           # against the Backtest page 2026-08-31) so
+                                           # live doesn't force an EOD_EXIT the validated
+                                           # backtest never would have taken. Distinct
+                                           # from the live-order product_type above.
+    live_active_strategy_full_history: bool = True  # 2026-08-31: the active
+                                           # strategy (the one whose signals
+                                           # drive Telegram + auto-trade) is
+                                           # evaluated on full warmed-up
+                                           # history instead of the 300-bar
+                                           # rolling window every other live
+                                           # strategy still uses -- validated
+                                           # offline against 5 real trading
+                                           # days: the 300-bar window never
+                                           # missed a real backtest signal but
+                                           # fired ~1.7x extra phantom trades
+                                           # from insufficient indicator
+                                           # warm-up. Settable live via
+                                           # /api/settings for instant
+                                           # rollback (no restart needed to
+                                           # turn off; live_bar_processor.py
+                                           # also falls back to the 300-bar
+                                           # path automatically on any fetch
+                                           # error).
     confirm_signals: bool = False        # whether to require 2 consecutive polls before entry
     auto_square_off_minutes: int = 10    # minutes before market close to auto square-off
     auto_kill_switch: bool = False       # auto-disable after consecutive failures
