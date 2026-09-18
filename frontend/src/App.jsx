@@ -5,7 +5,7 @@ import {
   Wifi, WifiOff, RefreshCw, Play, Square, AlertCircle,
   ChevronDown, CheckCircle, XCircle, Clock, Zap, BookOpen, Send, Cpu,
   Moon, Sun, LayoutDashboard, Globe, ChevronLeft, ChevronRight, Menu,
-  Calendar, Target, Trash2, Filter, Code2, Sparkles
+  Calendar, Target, Trash2, Filter, Code2, Sparkles, Briefcase
 } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip, ResponsiveContainer, Area, AreaChart } from 'recharts'
 import ResearchStudio from './components/ResearchStudio.jsx'
@@ -147,6 +147,150 @@ function MetricBox({ label, value, color, sub }) {
   )
 }
 
+// ── Piotroski / Altman "why" references ─────────────────────────────────────
+// Both scores' captions in the UI say "some weaker checks" / "grey zone" —
+// these turn the already-computed checks/components dicts into the specific
+// named reasons behind that, instead of leaving the caution unexplained.
+const PIOTROSKI_CHECK_LABELS = {
+  positive_net_income: 'net income',
+  positive_operating_cashflow: 'operating cash flow',
+  roa_improved: 'return on assets (YoY)',
+  cfo_exceeds_net_income: 'cash flow vs. net income',
+  leverage_decreased: 'leverage (debt ratio)',
+  current_ratio_improved: 'current ratio (liquidity)',
+  no_new_shares_issued: 'share capital (dilution)',
+  operating_margin_improved: 'operating margin (YoY)',
+  gross_margin_improved: 'gross margin (YoY)',
+  asset_turnover_improved: 'asset turnover (YoY)',
+}
+
+function piotroskiFailedChecks(checks) {
+  if (!checks) return []
+  return Object.entries(checks).filter(([, pass]) => pass === false).map(([key]) => PIOTROSKI_CHECK_LABELS[key] || key)
+}
+
+// "How to read these numbers" — plain-language guide under the ratio tiles.
+// Rule-of-thumb bands are generic; sector matters a lot (IT/FMCG usually trade
+// at higher P/E than banks/oil/PSU), which the text says so users don't treat
+// them as hard pass/fail lines. The per-company "reading" is deterministic.
+function medianOf(nums) {
+  const a = nums.filter(n => Number.isFinite(n)).sort((x, y) => x - y)
+  if (!a.length) return null
+  const mid = Math.floor(a.length / 2)
+  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2
+}
+
+function ratioGuide(ratios, peers, symbol) {
+  const r = ratios || {}
+  const peerPEs = (peers || []).filter(p => p.Name !== symbol).map(p => parseFloat(String(p.PE).replace(/,/g, ''))).filter(n => n > 0)
+  const peerMedianPE = medianOf(peerPEs)
+  const G = '#22c55e', A = '#f59e0b', R = '#ef4444', N = '#94a3b8'
+
+  const pe = r.pe, pb = r.pb, roe = r.roe, eps = r.eps, opm = r.opm, npm = r.npm
+  const items = []
+
+  {
+    let tone = N, reading = 'Not available.'
+    if (pe != null) {
+      if (pe <= 0) { tone = R; reading = 'No positive profit to price against (loss-making or data missing).' }
+      else {
+        const band = pe < 15 ? 'on the lower side' : pe <= 25 ? 'in the moderate range' : 'on the higher side'
+        tone = pe < 15 ? G : pe <= 25 ? A : R
+        reading = `${pe} is ${band}.`
+        if (peerMedianPE) reading += ` Sector peers' median P/E is ${peerMedianPE.toFixed(1)}, so this stock is priced ${pe < peerMedianPE * 0.9 ? 'cheaper than' : pe > peerMedianPE * 1.1 ? 'richer than' : 'in line with'} its peers.`
+      }
+    }
+    items.push({
+      label: 'P/E (Price ÷ Earnings)', tone, reading,
+      what: 'How many rupees you pay for every ₹1 of the company\'s yearly profit. P/E of 20 means you pay 20 years\' worth of current profit.',
+      range: 'Rough guide: under 15 = cheap-looking, 15–25 = fair for a steady business, above 25 = expensive / high growth expected. Always compare with same-sector companies — IT and FMCG normally trade higher than banks, oil or PSUs.',
+      lowHigh: 'Lower: cheaper per rupee of profit, but can mean slow growth or hidden trouble. Higher: market expects strong growth — you pay a premium and there is less room for disappointment.',
+    })
+  }
+  {
+    let tone = N, reading = 'Not available.'
+    if (pb != null) {
+      tone = pb < 1 ? A : pb <= 3 ? G : A
+      const band = pb < 1 ? 'below 1 — priced under its net worth (a bargain or a warning sign)' : pb <= 3 ? 'in the normal range' : 'on the higher side'
+      reading = `${pb} is ${band}.`
+      if (pb > 3 && roe != null && roe >= 20) reading += ` A high P/B is more justifiable here because ROE is strong (${roe}%).`
+      else if (pb > 3) reading += ' A high P/B needs strong, sustained returns (ROE) to be justified.'
+    }
+    items.push({
+      label: 'P/B (Price ÷ Book Value)', tone, reading,
+      what: 'Share price compared with the company\'s net worth (assets minus debts) per share. P/B of 2 means you pay ₹2 for every ₹1 of net assets on its books.',
+      range: 'Rough guide: below 1 = trades under net worth, 1–3 = normal, above 3 = paying up for earning power. Most meaningful for banks, NBFCs and asset-heavy businesses; less so for asset-light ones (IT, brands).',
+      lowHigh: 'Lower: cheaper vs assets, but check why the market is doubtful. Higher: market values the business well above its assets — fine if returns (ROE) are high, risky if not.',
+    })
+  }
+  {
+    let tone = N, reading = 'Not available.'
+    if (roe != null) {
+      tone = roe >= 15 ? G : roe >= 10 ? A : R
+      reading = `${roe}% is ${roe >= 20 ? 'excellent' : roe >= 15 ? 'good' : roe >= 10 ? 'average' : 'weak'}.`
+    }
+    items.push({
+      label: 'ROE % (Return on Equity)', tone, reading,
+      what: 'How much profit the company earns each year for every ₹100 of shareholders\' money invested in it.',
+      range: 'Rough guide: below 10% = weak, 10–15% = average, 15–20% = good, above 20% = excellent. Check debt too — heavy borrowing can inflate ROE.',
+      lowHigh: 'Higher is better: the business turns shareholders\' capital into profit efficiently. Persistently low means capital is not being used well.',
+    })
+  }
+  {
+    items.push({
+      label: 'EPS (Earnings Per Share)', tone: N, reading: eps != null ? `₹${eps} profit per share over the last 12 months.` : 'Not available.',
+      what: 'The company\'s yearly profit divided by its number of shares — the profit "belonging" to one share.',
+      range: 'No universal good/bad level — a ₹5 EPS is not "worse" than ₹100. What matters is whether EPS is growing year after year, and how it compares with the share price (that\'s the P/E).',
+      lowHigh: 'Rising EPS over time = business growing profits. Falling EPS = earnings shrinking. Do not compare EPS across different companies.',
+    })
+  }
+  {
+    let tone = N, reading = 'Not available.'
+    if (opm != null) {
+      tone = opm >= 20 ? G : opm >= 10 ? A : R
+      reading = `${opm}% — ${opm >= 20 ? 'strong' : opm >= 10 ? 'moderate' : 'thin'} margin from core operations.`
+    }
+    items.push({
+      label: 'OPM % (Operating Profit Margin)', tone, reading,
+      what: 'Out of every ₹100 of sales, how much is left as profit from the core business, before interest, tax and one-off items.',
+      range: 'Depends heavily on sector: trading/retail/oil often 3–10%, manufacturing 10–20%, IT/pharma/FMCG 20–30%+. Compare with peers, and check whether it is stable or improving.',
+      lowHigh: 'Higher: strong pricing power / cost control. Lower: thin cushion — small cost increases can wipe out profit.',
+    })
+  }
+  {
+    let tone = N, reading = 'Not available.'
+    if (npm != null) {
+      tone = npm >= 10 ? G : npm >= 5 ? A : R
+      reading = `${npm}% — ${npm >= 20 ? 'excellent' : npm >= 10 ? 'good' : npm >= 5 ? 'average' : 'thin'} bottom-line margin.`
+    }
+    items.push({
+      label: 'NPM % (Net Profit Margin)', tone, reading,
+      what: 'Out of every ₹100 of sales, how much is finally left as profit after all costs, interest and tax.',
+      range: 'Rough guide: below 5% = thin, 5–10% = average, 10–20% = good, above 20% = excellent. Big gap between OPM and NPM usually means heavy interest or tax burden.',
+      lowHigh: 'Higher: more of each sale reaches shareholders. Lower: profit is easily hurt by higher costs or interest rates.',
+    })
+  }
+  return items
+}
+
+const ALTMAN_COMPONENT_LABELS = {
+  x1_working_capital_ratio: 'working capital',
+  x2_retained_earnings_ratio: 'retained earnings relative to assets',
+  x3_ebit_ratio: 'operating profitability (EBIT)',
+  x4_market_value_to_liabilities: 'equity relative to liabilities (leverage)',
+  x4_book_equity_to_liabilities: 'equity relative to liabilities (leverage)',
+  x5_asset_turnover: 'asset turnover',
+}
+
+function altmanWeakPoints(components) {
+  if (!components) return []
+  return Object.entries(components)
+    .filter(([, v]) => typeof v === 'number' && v < 0.15)
+    .sort(([, a], [, b]) => a - b)
+    .slice(0, 2)
+    .map(([key, v]) => `${v < 0 ? 'negative' : 'low'} ${ALTMAN_COMPONENT_LABELS[key] || key}`)
+}
+
 // ── Sidebar ──────────────────────────────────────────────────────────────────
 function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, connected, collapsed, setCollapsed, isMobile, mobileOpen, setMobileOpen }) {
   const navItems = [
@@ -160,6 +304,7 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
     { id:'performance',     icon:<BarChart2 size={18}/>,       label:'Performance' },
     { id:'research_studio', icon:<Code2 size={18}/>,           label:'Research Studio' },
     { id:'cas',             icon:<AlertCircle size={18}/>,     label:'CAS' },
+    { id:'investment',      icon:<Briefcase size={18}/>,       label:'Investment' },
   ]
 
   const sideW = collapsed ? 64 : 240
@@ -1874,6 +2019,1186 @@ function CasHeatmapTab({ heatmap }) {
       <div style={{ fontSize:11, color:V('text-muted'), textAlign:'center', padding:'4px 0' }}>
         Updates every ~5 min · streak resets on a bias flip or a gap in flagging · Awareness only — no automated trading action is taken.
       </div>
+    </div>
+  )
+}
+
+// ── Investment Analysis Page ────────────────────────────────────────────────
+// Separate from live options trading: its own backend (bse_client.py +
+// tickertape_client.py + investment_api.py), fully self-contained state
+// (search-driven, not a polling dashboard), no shared state with the rest
+// of the app. Company Analysis and IPO Review are functional; Scanner is
+// a placeholder until its own backend exists.
+function InvestmentAnalysisPage() {
+  const [subTab, setSubTab] = useState('company')
+
+  const pillStyle = (active) => ({
+    padding: '6px 16px', borderRadius: 20, fontSize: 13, fontWeight: 600, cursor: 'pointer',
+    background: active ? 'color-mix(in srgb, #6366f1 18%, transparent)' : 'transparent',
+    color: active ? '#6366f1' : V('text-muted'),
+    border: `1px solid ${active ? 'color-mix(in srgb, #6366f1 35%, transparent)' : V('border')}`,
+  })
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+      <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+        <div style={pillStyle(subTab === 'company')} onClick={() => setSubTab('company')}>Company Analysis</div>
+        <div style={pillStyle(subTab === 'scanner')} onClick={() => setSubTab('scanner')}>Stock Scanner</div>
+        <div style={pillStyle(subTab === 'ipo')} onClick={() => setSubTab('ipo')}>IPO Review</div>
+      </div>
+      {subTab === 'company' && <CompanyAnalysisTab />}
+      {subTab === 'scanner' && (
+        <InvestmentComingSoon title="Stock Scanner"
+          note="Ranks the full BSE-listed universe on value, quality, momentum, growth and technical factors, with an AI-reasoned shortlist on top. Backend not built yet." />
+      )}
+      {subTab === 'ipo' && <IpoReviewTab />}
+    </div>
+  )
+}
+
+function InvestmentComingSoon({ title, note }) {
+  return (
+    <Card>
+      <div style={{ fontSize:16, fontWeight:700, color:V('text-primary'), marginBottom:8 }}>{title}</div>
+      <div style={{ fontSize:13, color:V('text-muted') }}>{note}</div>
+    </Card>
+  )
+}
+
+// ── Company Analysis: "should I invest now, wait, or at what price?" ───────
+// Renders investment_valuation's deterministic model (always available) plus
+// the AI debate (bull vs bear with rebuttals, then a judge) when it ran.
+const STANCE_META = {
+  accumulate_now:          { label: 'Attractive — accumulate now',                          color: '#22c55e' },
+  start_small_and_stagger: { label: 'Reasonable — start small, add on dips',                color: '#84cc16' },
+  wait_for_better_price:   { label: 'Fairly priced, thin margin of safety — wait for a dip', color: '#f59e0b' },
+  avoid_for_now:           { label: 'Expensive on these assumptions — stay away for now',   color: '#ef4444' },
+  no_valuation_call:       { label: 'Low-reliability company — no valuation call',           color: '#ef4444' },
+}
+const EDGE_META = { bull: { label: 'Bull', color: '#22c55e' }, bear: { label: 'Bear', color: '#ef4444' }, even: { label: 'Even', color: '#94a3b8' } }
+const DEBATE_TH = { textAlign:'left', padding:'7px 10px', color:V('text-muted'), fontSize:10, textTransform:'uppercase', letterSpacing:'0.05em', borderBottom:`1px solid ${V('border')}`, whiteSpace:'nowrap' }
+const DEBATE_TD = { padding:'7px 10px', borderBottom:`1px solid ${V('border-light')}`, fontSize:12, verticalAlign:'top' }
+
+function Chip({ color, children }) {
+  return (
+    <span style={{ padding:'3px 10px', borderRadius:20, fontSize:11, fontWeight:600, whiteSpace:'nowrap',
+      background:`color-mix(in srgb, ${color} 16%, transparent)`, color, border:`1px solid color-mix(in srgb, ${color} 35%, transparent)` }}>
+      {children}
+    </span>
+  )
+}
+
+function SectionTitle({ children, sub }) {
+  return (
+    <div style={{ marginBottom:8 }}>
+      <div style={{ fontSize:13, fontWeight:700, color:V('text-primary') }}>{children}</div>
+      {sub && <div style={{ fontSize:11, color:V('text-muted'), marginTop:2, lineHeight:1.45 }}>{sub}</div>}
+    </div>
+  )
+}
+
+function Panel({ children, tint, style }) {
+  const bg = tint ? `color-mix(in srgb, ${tint} 7%, transparent)` : V('bg-tertiary')
+  const bd = tint ? `1px solid color-mix(in srgb, ${tint} 25%, transparent)` : `1px solid ${V('border-light')}`
+  return <div style={{ background:bg, border:bd, borderRadius:V('radius-md'), padding:14, ...style }}>{children}</div>
+}
+
+const fmtRs = (v) => v == null ? '—' : `₹${Number(v).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`
+const fmtPct = (v, sign) => v == null ? '—' : `${sign && v > 0 ? '+' : ''}${v}%`
+const retColor = (v) => v == null ? V('text-muted') : v >= 12 ? '#22c55e' : v >= 8 ? '#f59e0b' : '#ef4444'
+
+function ValuationModelPanel({ vm, m }) {
+  if (!vm) return null
+  if (!vm.available) {
+    return <Panel><div style={{ fontSize:12, color:V('text-muted') }}>The price-vs-value model could not be built: {vm.reason}</div></Panel>
+  }
+  const rel = vm.reliability
+  if (vm.levels_withheld) {
+    return (
+      <Panel tint="#ef4444">
+        <div style={{ fontSize:12, fontWeight:700, color:'#ef4444', marginBottom:4 }}>Price levels and return projections are not shown</div>
+        <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5, marginBottom:6 }}>
+          This company's data is too unreliable to support them — a "fair entry price" built on it would look authoritative and not be. Reasons:
+        </div>
+        <ul style={{ margin:0, paddingLeft:18, fontSize:12, color:V('text-primary'), lineHeight:1.55 }}>
+          {(rel?.reasons || []).map((r, i) => <li key={i}>{r}</li>)}
+        </ul>
+      </Panel>
+    )
+  }
+  const sc = vm.scenarios
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
+      {rel && rel.level !== 'high' && (
+        <Panel tint={rel.level === 'low' ? '#ef4444' : '#f59e0b'}>
+          <div style={{ fontSize:12, fontWeight:700, color: rel.level === 'low' ? '#ef4444' : '#f59e0b', marginBottom:4 }}>
+            Model reliability: {rel.level}{vm.stance_capped_for_low_reliability ? ' — stance capped, this model cannot support a buy call for this company' : ''}
+          </div>
+          <ul style={{ margin:0, paddingLeft:18, fontSize:12, color:V('text-primary'), lineHeight:1.5 }}>
+            {rel.reasons.map((r, i) => <li key={i}>{r}</li>)}
+          </ul>
+        </Panel>
+      )}
+
+      <div>
+        <SectionTitle sub={`What you would earn per year over ${vm.horizon_years} years if you bought at today's price (${fmtRs(vm.current_price)}), including the ${vm.dividend_yield_pct ?? 0}% dividend yield. Growth and exit P/E are haircuts of the company's own history — see assumptions below.`}>
+          5-year return scenarios at today's price
+        </SectionTitle>
+        <div style={{ overflowX:'auto' }}>
+          <table style={{ width:'100%', borderCollapse:'collapse' }}>
+            <thead><tr>
+              <th style={DEBATE_TH}></th><th style={DEBATE_TH}>EPS growth / yr</th><th style={DEBATE_TH}>Exit P/E</th>
+              <th style={DEBATE_TH}>EPS in 5 yrs</th><th style={DEBATE_TH}>Implied price in 5 yrs</th><th style={DEBATE_TH}>Return / yr</th>
+            </tr></thead>
+            <tbody>
+              {[['bear', 'Bear', '#ef4444'], ['base', 'Base', '#f59e0b'], ['bull', 'Bull', '#22c55e']].map(([k, name, c]) => (
+                <tr key={k}>
+                  <td style={{ ...DEBATE_TD, fontWeight:700, color:c }}>{name}</td>
+                  <td style={DEBATE_TD}>{sc[k].eps_growth_pct}%</td>
+                  <td style={DEBATE_TD}>{sc[k].exit_pe}×</td>
+                  <td style={DEBATE_TD}>₹{sc[k].eps_in_5y}</td>
+                  <td style={DEBATE_TD}>{fmtRs(sc[k].value_in_5y)}</td>
+                  <td style={{ ...DEBATE_TD, fontWeight:700, color:retColor(sc[k].total_return_pct_pa) }}>{fmtPct(sc[k].total_return_pct_pa, true)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div>
+        <SectionTitle sub="The same maths run backwards: the price at which the BASE case would earn each target return. If today's price is already below a level, that level is already met.">
+          Entry price ladder — what price should I pay?
+        </SectionTitle>
+        <div style={{ overflowX:'auto' }}>
+          <table style={{ width:'100%', borderCollapse:'collapse' }}>
+            <thead><tr>
+              <th style={DEBATE_TH}>Level</th><th style={DEBATE_TH}>Price</th><th style={DEBATE_TH}>vs today</th>
+              <th style={DEBATE_TH}>Bear</th><th style={DEBATE_TH}>Base</th><th style={DEBATE_TH}>Bull</th>
+            </tr></thead>
+            <tbody>
+              {vm.entry_ladder.map((l, i) => {
+                const met = l.price >= vm.current_price
+                return (
+                  <tr key={i}>
+                    <td style={DEBATE_TD}>{l.name}{met && <span style={{ marginLeft:6, fontSize:10, color:'#22c55e', fontWeight:600 }}>✓ today's price already qualifies</span>}</td>
+                    <td style={{ ...DEBATE_TD, fontWeight:700 }}>{fmtRs(l.price)}</td>
+                    <td style={{ ...DEBATE_TD, color: l.vs_current_pct >= 0 ? '#22c55e' : '#ef4444' }}>{fmtPct(l.vs_current_pct, true)}</td>
+                    {['bear', 'base', 'bull'].map(k => (
+                      <td key={k} style={{ ...DEBATE_TD, color:retColor(l.return_if_bought_here_pct_pa[k]) }}>{fmtPct(l.return_if_bought_here_pct_pa[k], true)}/yr</td>
+                    ))}
+                  </tr>
+                )
+              })}
+              {vm.bear_case_safe_price && (
+                <tr>
+                  <td style={DEBATE_TD}>Defensive floor <span style={{ color:V('text-muted') }}>(even the bear case earns ~6%/yr)</span></td>
+                  <td style={{ ...DEBATE_TD, fontWeight:700 }}>{fmtRs(vm.bear_case_safe_price.price)}</td>
+                  <td style={{ ...DEBATE_TD, color: vm.bear_case_safe_price.price >= vm.current_price ? '#22c55e' : '#ef4444' }}>
+                    {fmtPct(Math.round((vm.bear_case_safe_price.price - vm.current_price) / vm.current_price * 1000) / 10, true)}
+                  </td>
+                  <td style={DEBATE_TD} colSpan={3}></td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {rel?.level === 'low' ? (
+        <Panel>
+          <div style={{ fontSize:12, color:V('text-muted'), lineHeight:1.5 }}>
+            Staged-entry prices are not shown: this company's earnings history is too erratic for the model to support a specific entry price. The ladder above is indicative only.
+          </div>
+        </Panel>
+      ) : (
+      <div>
+        <SectionTitle sub="Split the money you plan to invest across these steps rather than betting on one day's price. Later steps only trigger if the price actually falls to that level.">
+          Suggested staged entry
+        </SectionTitle>
+        <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : `repeat(${vm.tranche_plan.length}, 1fr)`, gap:10 }}>
+          {vm.tranche_plan.map((t, i) => (
+            <MetricBox key={i} label={`Step ${i + 1}${t.share_pct ? ` — ${t.share_pct}% of planned money` : ''}`}
+              value={t.share_pct === 0 ? 'Wait' : fmtRs(t.price)} sub={t.when} color={t.share_pct === 0 ? V('text-muted') : undefined} />
+          ))}
+        </div>
+      </div>
+      )}
+
+      <details>
+        <summary style={{ cursor:'pointer', fontSize:12, fontWeight:600, color:'#6366f1' }}>Assumptions behind these numbers</summary>
+        <ul style={{ margin:'8px 0 0', paddingLeft:18, fontSize:11, color:V('text-muted'), lineHeight:1.6 }}>
+          <li>Trailing EPS ₹{vm.eps_ttm}, today's P/E {vm.current_pe}×; industry P/E {vm.industry_pe ?? 'n/a'}×; the stock's own historical median P/E {vm.own_history_median_pe ?? 'n/a'}×; exit-multiple anchor {vm.anchor_pe}×.</li>
+          <li>Growth basis: {vm.growth_basis.historical_eps_growth_pct}% ({vm.growth_basis.source}).</li>
+          {vm.assumptions.map((a, i) => <li key={i}>{a}</li>)}
+          {vm.stance_downgraded_for?.length > 0 && <li>Baseline stance was lowered one step for: {vm.stance_downgraded_for.join(', ')}.</li>}
+          <li>This is a structured way to compare price with value using visible assumptions — not a forecast.</li>
+        </ul>
+      </details>
+    </div>
+  )
+}
+
+function DebateSide({ side, data, m }) {
+  const isBull = side === 'bull'
+  const c = isBull ? '#22c55e' : '#ef4444'
+  const o = data.opening, r = data.rebuttal
+  return (
+    <Panel tint={c} style={{ display:'flex', flexDirection:'column', gap:10 }}>
+      <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:c, fontWeight:700 }}>{isBull ? 'Bull case — for buying now' : 'Bear case — against buying now'}</div>
+      <div style={{ fontSize:13, fontWeight:600, color:V('text-primary'), lineHeight:1.45 }}>{o.thesis}</div>
+      {(o.arguments || []).map((a, i) => (
+        <div key={i} style={{ borderLeft:`3px solid ${c}`, paddingLeft:10 }}>
+          <div style={{ fontSize:12, fontWeight:700, color:V('text-primary') }}>{i + 1}. {a.headline}</div>
+          <div style={{ fontSize:11, color:V('text-muted'), marginTop:3, lineHeight:1.5 }}><b>Evidence:</b> {a.evidence}</div>
+          <div style={{ fontSize:12, color:V('text-primary'), marginTop:3, lineHeight:1.5 }}>{a.why_it_matters}</div>
+        </div>
+      ))}
+      <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>What must be true:</b> {o.what_must_be_true}</div>
+      <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>Own weak spot:</b> {o.own_weak_spot}</div>
+      <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>Would be proven wrong if:</b> {o.invalidation}</div>
+
+      <div style={{ borderTop:`1px dashed ${V('border')}`, paddingTop:10, display:'flex', flexDirection:'column', gap:8 }}>
+        <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:V('text-muted'), fontWeight:600 }}>Rebuttal to the {isBull ? 'bear' : 'bull'}</div>
+        {(r?.rebuttals || []).map((x, i) => (
+          <div key={i} style={{ fontSize:12, lineHeight:1.5 }}>
+            <div style={{ color:V('text-muted'), fontStyle:'italic' }}>“{x.their_point}”</div>
+            <div style={{ color:V('text-primary'), marginTop:3 }}>{x.your_response}</div>
+            <div style={{ color:V('text-muted'), marginTop:3 }}><b>Concedes:</b> {x.concession}</div>
+          </div>
+        ))}
+        {r?.updated_position && <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>After the debate:</b> {r.updated_position}</div>}
+      </div>
+    </Panel>
+  )
+}
+
+// Shown at the very top of a company page the moment it loads, so a company whose
+// data cannot support a valuation is never presented like a well-covered one.
+const DQ_META = {
+  low:            { color: '#ef4444', icon: '⚠' },
+  medium:         { color: '#f59e0b', icon: '⚠' },
+  unavailable:    { color: '#94a3b8', icon: 'ℹ' },
+  not_applicable: { color: '#94a3b8', icon: 'ℹ' },
+}
+
+function DataQualityBanner({ dq }) {
+  if (!dq) return null
+  const meta = DQ_META[dq.level] || DQ_META.unavailable
+  const reasons = (dq.reasons || []).filter(Boolean)
+  return (
+    <div style={{ marginBottom:12, padding:'10px 14px', borderRadius:V('radius-md'),
+      background:`color-mix(in srgb, ${meta.color} 9%, transparent)`, border:`1px solid color-mix(in srgb, ${meta.color} 35%, transparent)` }}>
+      <div style={{ fontSize:13, fontWeight:700, color:meta.color }}>{meta.icon} {dq.headline}</div>
+      {reasons.length > 0 && (
+        <ul style={{ margin:'6px 0 0', paddingLeft:18, fontSize:12, color:V('text-primary'), lineHeight:1.55 }}>
+          {reasons.map((r, i) => <li key={i}>{r}</li>)}
+        </ul>
+      )}
+      {dq.level === 'low' && (
+        <div style={{ marginTop:6, fontSize:11, color:V('text-muted'), lineHeight:1.5 }}>
+          Price targets, entry levels and return projections are not shown for this company. The ratios, results and shareholding below are still factual.
+        </div>
+      )}
+    </div>
+  )
+}
+
+function DataFreshness({ fresh, quoteAsOf, compact }) {
+  const t = quoteAsOf ? new Date(quoteAsOf).toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit' }) : null
+  const parts = []
+  const backup = fresh?.statements_source === 'yahoo'
+  if (fresh?.financials_through) {
+    parts.push(`Financials through ${fresh.financials_through}${fresh.status === 'in_sync' ? ` (BSE and ${backup ? 'Yahoo Finance' : 'Tickertape'} agree)` : ''}`)
+    if (backup) parts.push('backup data source: Yahoo Finance, about 4 fiscal years, not cross-checked against filings')
+  } else parts.push('Multi-year financials not available from our data providers')
+  if (t) parts.push(`price as of ${t}`)
+  return (
+    <div style={{ marginBottom: compact ? 0 : 12 }}>
+      <div style={{ fontSize:11, color:V('text-muted') }}>{parts.join(' · ')}</div>
+      {(fresh?.status === 'tickertape_behind' || fresh?.status === 'bse_behind') && (
+        <div style={{ marginTop:6, padding:'8px 12px', borderRadius:V('radius-md'), fontSize:12, lineHeight:1.5, color:'#f59e0b',
+          background:'color-mix(in srgb, #f59e0b 9%, transparent)', border:'1px solid color-mix(in srgb, #f59e0b 30%, transparent)' }}>
+          ⚠ {fresh.message}
+        </div>
+      )}
+    </div>
+  )
+}
+
+const READ_LABELS = { business_quality: 'Business quality', growth_and_earnings: 'Growth & earnings', valuation: 'Valuation',
+                      sentiment_and_flows: 'Sentiment & investor flows', risks_and_unknowns: 'Risks & unknowns' }
+
+function DeepDebateResult({ d, m }) {
+  if (!d) return null
+  const vm = d.valuation_model
+  if (d.ai_skipped) {
+    return (
+      <Panel>
+        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:6 }}>{d.reason}</div>
+        <div style={{ fontSize:12, color:V('text-muted'), lineHeight:1.5 }}>
+          The AI debate was skipped because no meaningful company analysis is possible here. Everything above is unaffected.
+        </div>
+      </Panel>
+    )
+  }
+  if (!d.available) {
+    return (
+      <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
+        <Panel>
+          <div style={{ fontSize:13, color:V('text-muted') }}>
+            The AI debate isn't available right now{d.reason?.includes('429') || d.reason?.toLowerCase().includes('rate limit') ? ' — the AI provider is rate-limited, try again in a minute' : ''}.
+            The numeric price-vs-value model below doesn't depend on it.
+          </div>
+        </Panel>
+        {vm?.available && (
+          <>
+            <Panel tint={STANCE_META[vm.baseline_stance]?.color}>
+              <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:V('text-muted'), marginBottom:6 }}>Model's baseline stance (no AI)</div>
+              <Chip color={STANCE_META[vm.baseline_stance]?.color || '#94a3b8'}>{STANCE_META[vm.baseline_stance]?.label}</Chip>
+            </Panel>
+            <ValuationModelPanel vm={vm} m={m} />
+          </>
+        )}
+      </div>
+    )
+  }
+
+  const j = d.judge || {}
+  const stanceMeta = STANCE_META[j.final_stance] || { label: j.final_stance, color: '#94a3b8' }
+  const winner = j.who_argued_better === 'bull' ? EDGE_META.bull : j.who_argued_better === 'bear' ? EDGE_META.bear : EDGE_META.even
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
+      <Panel tint={stanceMeta.color}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:8, marginBottom:8 }}>
+          <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:stanceMeta.color, fontWeight:700 }}>{d.low_reliability ? 'Verdict — low-reliability company' : 'Verdict — should I invest?'}</div>
+          <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+            <Chip color={stanceMeta.color}>{stanceMeta.label}</Chip>
+            <Chip color="#94a3b8">{j.confidence} confidence</Chip>
+          </div>
+        </div>
+        <div style={{ fontSize:16, fontWeight:700, color:V('text-primary'), lineHeight:1.4, marginBottom:10 }}>{j.headline}</div>
+        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:8 }}>{j.stance_reasoning}</div>
+        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:8 }}><b>Today, tomorrow or wait?</b> {j.today_vs_wait}</div>
+        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55 }}><b>How to use the price levels:</b> {j.how_to_use_price_levels}</div>
+        {j.stance_adjusted && (
+          <div style={{ fontSize:11, color:V('text-muted'), marginTop:8 }}>
+            The judge moved the numeric baseline (“{STANCE_META[vm?.baseline_stance]?.label}”) by one step based on evidence beyond the model.
+          </div>
+        )}
+        {j.confidence_reason && <div style={{ fontSize:11, color:V('text-muted'), marginTop:6, fontStyle:'italic' }}>{j.confidence_reason}</div>}
+      </Panel>
+
+      <ValuationModelPanel vm={vm} m={m} />
+
+      <div>
+        <SectionTitle sub="Both sides get the same format: four evidence-backed arguments, an admitted weak spot, and a rebuttal after reading the other side.">
+          The debate
+        </SectionTitle>
+        <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr', gap:10 }}>
+          <DebateSide side="bull" data={d.bull} m={m} />
+          <DebateSide side="bear" data={d.bear} m={m} />
+        </div>
+      </div>
+
+      <div>
+        <SectionTitle>Judge's scorecard <Chip color={winner.color}>{j.who_argued_better === 'balanced' ? 'Argued about equally' : `${winner.label} argued better`}</Chip></SectionTitle>
+        <div style={{ overflowX:'auto' }}>
+          <table style={{ width:'100%', borderCollapse:'collapse' }}>
+            <thead><tr><th style={DEBATE_TH}>Issue</th><th style={DEBATE_TH}>Edge</th><th style={DEBATE_TH}>Why</th></tr></thead>
+            <tbody>
+              {(j.scorecard || []).map((s, i) => {
+                const e = EDGE_META[s.edge] || EDGE_META.even
+                return (
+                  <tr key={i}>
+                    <td style={{ ...DEBATE_TD, fontWeight:600, textTransform:'capitalize' }}>{s.issue}</td>
+                    <td style={DEBATE_TD}><Chip color={e.color}>{e.label}</Chip></td>
+                    <td style={{ ...DEBATE_TD, lineHeight:1.5 }}>{s.why}</td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {j.what_would_change_my_mind?.length > 0 && (
+        <Panel>
+          <SectionTitle>What would change this view — check back on these</SectionTitle>
+          <ul style={{ margin:0, paddingLeft:18, fontSize:12, color:V('text-primary'), lineHeight:1.6 }}>
+            {j.what_would_change_my_mind.map((x, i) => <li key={i}>{x}</li>)}
+          </ul>
+        </Panel>
+      )}
+
+      <details>
+        <summary style={{ cursor:'pointer', fontSize:12, fontWeight:600, color:'#6366f1' }}>Analyst reads that fed the debate</summary>
+        <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(2,1fr)', gap:10, marginTop:10 }}>
+          {Object.entries(READ_LABELS).map(([k, label]) => (
+            <Panel key={k}>
+              <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:V('text-muted'), marginBottom:6 }}>{label}</div>
+              <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.55 }}>{d.reads?.[k]}</div>
+            </Panel>
+          ))}
+        </div>
+      </details>
+
+      {d.data_freshness && <DataFreshness fresh={d.data_freshness} compact />}
+      <div style={{ fontSize:11, color:V('text-muted'), textAlign:'center' }}>{d.disclaimer} · AI model: {d.model_name}</div>
+    </div>
+  )
+}
+
+// One company in the name-search dropdown / "did you mean" list. Shows enough
+// detail (legal name, BSE code, ISIN, market cap, rename note) for the user to
+// be sure it is the right company; the analysis only loads for the symbol clicked.
+function SuggestionRow({ s, active, onPick, onHover }) {
+  return (
+    <div onMouseDown={e => { e.preventDefault(); onPick(s) }} onMouseEnter={onHover}
+      style={{ padding:'9px 12px', cursor:'pointer', background: active ? V('bg-tertiary') : 'transparent', borderBottom:`1px solid ${V('border-light')}` }}>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'baseline', gap:10 }}>
+        <span style={{ fontSize:13, fontWeight:600, color:V('text-primary') }}>{s.name}</span>
+        <span style={{ fontSize:11, fontWeight:700, fontFamily:"'JetBrains Mono', monospace", color:'#6366f1', whiteSpace:'nowrap' }}>{s.symbol}</span>
+      </div>
+      <div style={{ fontSize:11, color:V('text-muted'), marginTop:2, lineHeight:1.4 }}>
+        {s.legal_name ? `${s.legal_name} · ` : ''}BSE {s.bse_code} · ISIN {s.isin || '—'}{s.mktcap_cr ? ` · ₹${s.mktcap_cr.toLocaleString('en-IN')} cr market cap` : ''}
+      </div>
+      {s.note && <div style={{ fontSize:11, color:'#f59e0b', marginTop:2 }}>{s.note}</div>}
+    </div>
+  )
+}
+
+function CompanyAnalysisTab() {
+  const [query, setQuery] = useState('')
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState(null)
+  const [debateData, setDebateData] = useState(null)
+  const [debateLoading, setDebateLoading] = useState(false)
+  const [showGuide, setShowGuide] = useState(true)
+  const [suggestions, setSuggestions] = useState([])
+  const [suggestOpen, setSuggestOpen] = useState(false)
+  const [activeIdx, setActiveIdx] = useState(-1)
+  const [didYouMean, setDidYouMean] = useState(null)   // null = not applicable, [] = nothing matched
+  const suggestSeq = useRef(0)
+  const m = window.innerWidth < 768
+
+  // Live name/symbol suggestions as the user types (debounced; stale responses ignored).
+  useEffect(() => {
+    const q = query.trim()
+    const seq = ++suggestSeq.current
+    if (q.length < 2) { setSuggestions([]); return }
+    const t = setTimeout(async () => {
+      try {
+        const r = await fetch(`/api/investment/search?q=${encodeURIComponent(q)}&limit=8`)
+        const j = await r.json()
+        if (seq === suggestSeq.current) { setSuggestions(j.results || []); setActiveIdx(-1) }
+      } catch { if (seq === suggestSeq.current) setSuggestions([]) }
+    }, 250)
+    return () => clearTimeout(t)
+  }, [query])
+
+  const pick = (sug) => { setQuery(sug.symbol); setSuggestOpen(false); setDidYouMean(null); runSearch(sug.symbol) }
+
+  const runSearch = async (sym) => {
+    const s = (sym || '').trim()
+    if (!s) return
+    setLoading(true); setError(null); setDebateData(null); setDidYouMean(null); setSuggestOpen(false)
+    try {
+      const r = await fetch(`/api/investment/equity/${encodeURIComponent(s.toUpperCase())}/full`)
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}))
+        if (r.status === 404) {
+          // Not a BSE symbol: offer the closest companies by name instead of a dead end.
+          try {
+            const sr = await fetch(`/api/investment/search?q=${encodeURIComponent(s)}&limit=6`)
+            setDidYouMean((await sr.json()).results || [])
+          } catch { setDidYouMean([]) }
+        }
+        throw new Error(body.detail || `Request failed (${r.status})`)
+      }
+      setData(await r.json())
+    } catch (e) {
+      setError(e.message || 'Failed to load')
+      setData(null)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const onSearchKey = (e) => {
+    if (e.key === 'ArrowDown' && suggestions.length) { e.preventDefault(); setSuggestOpen(true); setActiveIdx(i => (i + 1) % suggestions.length) }
+    else if (e.key === 'ArrowUp' && suggestions.length) { e.preventDefault(); setActiveIdx(i => (i <= 0 ? suggestions.length - 1 : i - 1)) }
+    else if (e.key === 'Escape') setSuggestOpen(false)
+    else if (e.key === 'Enter') {
+      if (suggestOpen && activeIdx >= 0 && suggestions[activeIdx]) pick(suggestions[activeIdx])
+      else runSearch(query)
+    }
+  }
+
+  const runDebate = async () => {
+    if (!data?.overview?.symbol) return
+    setDebateLoading(true)
+    try {
+      const r = await fetch(`/api/investment/equity/${encodeURIComponent(data.overview.symbol)}/debate`)
+      setDebateData(await r.json())
+    } catch (e) {
+      setDebateData({ available: false, reason: e.message || 'Request failed' })
+    } finally {
+      setDebateLoading(false)
+    }
+  }
+
+  const thStyle = { textAlign:'left', padding:'8px 10px', color:V('text-muted'), fontSize:11, textTransform:'uppercase', letterSpacing:'0.05em', borderBottom:`1px solid ${V('border')}` }
+  const tdStyle = { padding:'8px 10px', borderBottom:`1px solid ${V('border-light')}`, fontSize:13 }
+
+  const ov = data?.overview
+  const fin = data?.financials
+  const sh = data?.shareholding
+  const peers = data?.peers?.peers || []
+  const piotroski = fin?.piotroski_f_score
+  const altman = fin?.altman_z_score
+  const zoneColor = altman?.zone === 'safe' ? '#22c55e' : altman?.zone === 'distress' ? '#ef4444' : '#eab308'
+  const chg = ov ? (ov.quote?.ltp - ov.quote?.prev_close) : null
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+      <Card>
+        <div style={{ display:'flex', gap:10, flexWrap:'wrap' }}>
+          <div style={{ flex:1, minWidth:220, position:'relative' }}>
+            <input
+              type="text" placeholder="Search by company name or BSE symbol (e.g. Reliance, TCS, Larsen & Toubro)..." value={query}
+              onChange={e => { setQuery(e.target.value); setSuggestOpen(true) }}
+              onFocus={() => setSuggestOpen(true)}
+              onBlur={() => setSuggestOpen(false)}
+              onKeyDown={onSearchKey}
+              style={{
+                width:'100%', boxSizing:'border-box', padding:'10px 14px', borderRadius:8, fontSize:14,
+                background:V('bg-tertiary'), border:`1px solid ${V('border')}`, color:V('text-primary'),
+              }}
+            />
+            {suggestOpen && suggestions.length > 0 && (
+              <div style={{ position:'absolute', top:'calc(100% + 4px)', left:0, right:0, zIndex:30, maxHeight:380, overflowY:'auto',
+                background:V('bg-secondary'), border:`1px solid ${V('border')}`, borderRadius:V('radius-md'), boxShadow:V('shadow-md') }}>
+                {suggestions.map((sug, i) => (
+                  <SuggestionRow key={sug.symbol} s={sug} active={i === activeIdx} onPick={pick} onHover={() => setActiveIdx(i)} />
+                ))}
+              </div>
+            )}
+          </div>
+          <StyledButton onClick={() => runSearch(query)} disabled={loading || !query.trim()}>
+            {loading ? 'Loading…' : 'Analyze'}
+          </StyledButton>
+        </div>
+        {error && <div style={{ marginTop:10, color:'#ef4444', fontSize:13 }}>{error}</div>}
+        {didYouMean && (
+          <div style={{ marginTop:10 }}>
+            {didYouMean.length > 0 ? (
+              <>
+                <div style={{ fontSize:12, fontWeight:600, color:V('text-primary'), marginBottom:6 }}>Did you mean one of these? Click the company you want:</div>
+                <div style={{ border:`1px solid ${V('border')}`, borderRadius:V('radius-md'), overflow:'hidden' }}>
+                  {didYouMean.map(sug => <SuggestionRow key={sug.symbol} s={sug} onPick={pick} onHover={() => {}} />)}
+                </div>
+              </>
+            ) : (
+              <div style={{ fontSize:12, color:V('text-muted') }}>No listed company matches that. Try the company name or its BSE symbol.</div>
+            )}
+          </div>
+        )}
+      </Card>
+
+      {!data && !loading && !error && (
+        <div style={{ fontSize:13, color:V('text-muted'), textAlign:'center', padding:'24px 0' }}>
+          Search any BSE-listed company symbol to see ratios, fundamentals, quality scores, shareholding, and peer comparison.
+        </div>
+      )}
+
+      {ov && (
+        <>
+          <Card>
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', flexWrap:'wrap', gap:10, marginBottom:14 }}>
+              <div>
+                <div style={{ fontSize:18, fontWeight:700, color:V('text-primary') }}>
+                  {ov.name} <span style={{ color:V('text-muted'), fontWeight:500, fontSize:13 }}>({ov.symbol})</span>
+                </div>
+                <div style={{ fontSize:12, color:V('text-muted'), marginTop:2 }}>
+                  {ov.classification?.sector} · {ov.classification?.industry} · {ov.classification?.group}
+                </div>
+                <div style={{ fontSize:11, color:V('text-muted'), marginTop:2 }}>ISIN {ov.isin}</div>
+              </div>
+              <div style={{ textAlign:'right' }}>
+                <div style={{ fontSize:22, fontWeight:700, fontFamily:"'JetBrains Mono', monospace", color:V('text-primary') }}>
+                  ₹{ov.quote?.ltp?.toFixed(2)}
+                </div>
+                <div style={{ fontSize:12, color: chg >= 0 ? '#22c55e' : '#ef4444' }}>
+                  {chg >= 0 ? '+' : ''}{chg?.toFixed(2)} ({((chg / ov.quote?.prev_close) * 100)?.toFixed(2)}%)
+                </div>
+              </div>
+            </div>
+            <DataQualityBanner dq={data?.data_quality} />
+            <DataFreshness fresh={fin?.data_freshness} quoteAsOf={ov.quote_as_of} />
+            <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(6,1fr)', gap:10 }}>
+              <MetricBox label="P/E" value={ov.ratios?.pe ?? '—'} sub="Years of profit you're paying for" />
+              <MetricBox label="P/B" value={ov.ratios?.pb ?? '—'} sub="Price vs. net worth per share" />
+              <MetricBox label="ROE %" value={ov.ratios?.roe ?? '—'} sub="Profit per ₹ of shareholder equity" />
+              <MetricBox label="EPS" value={ov.ratios?.eps ?? '—'} sub="Profit earned per share" />
+              <MetricBox label="OPM %" value={ov.ratios?.opm ?? '—'} sub="Operating profit as % of revenue" />
+              <MetricBox label="NPM %" value={ov.ratios?.npm ?? '—'} sub="Net profit as % of revenue" />
+            </div>
+
+            <div style={{ marginTop:14 }}>
+              <button onClick={() => setShowGuide(v => !v)}
+                style={{ background:'none', border:'none', padding:0, cursor:'pointer', fontSize:12, fontWeight:600, color:'#6366f1' }}>
+                {showGuide ? '▾ Hide' : '▸ Show'} how to read these numbers
+              </button>
+              {showGuide && (
+                <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(2,1fr)', gap:10, marginTop:10 }}>
+                  {ratioGuide(ov.ratios, peers, ov.symbol).map(g => (
+                    <div key={g.label} style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderLeft:`3px solid ${g.tone}`, borderRadius:V('radius-md'), padding:12 }}>
+                      <div style={{ fontSize:12, fontWeight:700, color:V('text-primary'), marginBottom:4 }}>{g.label}</div>
+                      <div style={{ fontSize:12, color:g.tone, fontWeight:600, marginBottom:6, lineHeight:1.45 }}>For this company: {g.reading}</div>
+                      <div style={{ fontSize:11, color:V('text-primary'), lineHeight:1.5, marginBottom:4 }}>{g.what}</div>
+                      <div style={{ fontSize:11, color:V('text-muted'), lineHeight:1.5, marginBottom:4 }}><b>Acceptable range:</b> {g.range}</div>
+                      <div style={{ fontSize:11, color:V('text-muted'), lineHeight:1.5 }}><b>Lower vs higher:</b> {g.lowHigh}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </Card>
+
+          <Card>
+            <div style={{ fontSize:15, fontWeight:700, color:V('text-primary'), marginBottom:14 }}>Quality & Risk Scores</div>
+            <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr', gap:14 }}>
+              <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:16 }}>
+                <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.08em', color:V('text-muted'), marginBottom:8 }}>Piotroski F-Score</div>
+                {piotroski?.complete ? (
+                  <>
+                    <div style={{ fontSize:28, fontWeight:700, fontFamily:"'JetBrains Mono', monospace", color:V('text-primary') }}>
+                      {piotroski.score}<span style={{ fontSize:16, color:V('text-muted') }}> / 9</span>
+                    </div>
+                    <div style={{ fontSize:11, color:V('text-muted'), marginTop:4 }}>{piotroski.compared_years?.join(' → ')}</div>
+                    <div style={{ fontSize:12, color:V('text-muted'), marginTop:8, lineHeight:1.5 }}>
+                      {piotroski.score >= 8 ? 'Very strong financial health across profitability, leverage, and efficiency.' :
+                       piotroski.score >= 6 ? 'Reasonably healthy fundamentals, with some weaker checks.' :
+                       piotroski.score >= 3 ? 'Mixed signals across the 9 profitability/leverage/efficiency checks.' :
+                       'Weak on most of the 9 checks — worth a closer look at the financials.'}
+                    </div>
+                    {piotroski.score < 9 && piotroskiFailedChecks(piotroski.checks).length > 0 && (
+                      <div style={{ fontSize:11, color:V('text-muted'), marginTop:6, lineHeight:1.5 }}>
+                        Weaker on: {piotroskiFailedChecks(piotroski.checks).join(', ')}.
+                      </div>
+                    )}
+                  </>
+                ) : <div style={{ fontSize:13, color:V('text-muted') }}>Not enough history{piotroski?.reason ? ` (${piotroski.reason})` : ''}</div>}
+              </div>
+              <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:16 }}>
+                <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.08em', color:V('text-muted'), marginBottom:8 }}>Altman Z-Score</div>
+                {altman?.z_score != null ? (
+                  <>
+                    <div style={{ display:'flex', alignItems:'baseline', gap:10 }}>
+                      <div style={{ fontSize:28, fontWeight:700, fontFamily:"'JetBrains Mono', monospace", color:V('text-primary') }}>{altman.z_score.toFixed(2)}</div>
+                      <span style={{
+                        padding:'3px 10px', borderRadius:20, fontSize:11, fontWeight:600,
+                        background:`color-mix(in srgb, ${zoneColor} 18%, transparent)`, color:zoneColor,
+                        border:`1px solid color-mix(in srgb, ${zoneColor} 35%, transparent)`,
+                      }}>{altman.zone}</span>
+                    </div>
+                    <div style={{ fontSize:11, color:V('text-muted'), marginTop:4 }}>{altman.fiscal_year}</div>
+                    <div style={{ fontSize:12, color:V('text-muted'), marginTop:8, lineHeight:1.5 }}>
+                      {altman.zone === 'safe' ? 'Estimates bankruptcy/distress risk — "safe" means low near-term financial-distress risk by this model.' :
+                       altman.zone === 'grey' ? 'Estimates bankruptcy/distress risk — "grey" means some caution warranted, not a clear pass or fail.' :
+                       'Estimates bankruptcy/distress risk — "distress" is the zone historically associated with companies that later ran into financial trouble.'}
+                    </div>
+                    {/financ|bank|insurance|nbfc/i.test(`${ov.classification?.sector} ${ov.classification?.industry}`) && (
+                      <div style={{ fontSize:11, color:'#f59e0b', marginTop:6, lineHeight:1.5 }}>
+                        Note: this score was designed for manufacturers. Banks and financial companies are leveraged by nature, so it often reads "distress" for healthy lenders — treat it with caution here.
+                      </div>
+                    )}
+                    {altman.zone !== 'safe' && altmanWeakPoints(altman.components).length > 0 && (
+                      <div style={{ fontSize:11, color:V('text-muted'), marginTop:6, lineHeight:1.5 }}>
+                        Driven mainly by: {altmanWeakPoints(altman.components).join(', ')}.
+                      </div>
+                    )}
+                  </>
+                ) : <div style={{ fontSize:13, color:V('text-muted') }}>{altman?.reason || 'Not available'}</div>}
+              </div>
+            </div>
+          </Card>
+
+          {fin?.recent_results_bse && (
+            <Card>
+              <div style={{ fontSize:15, fontWeight:700, color:V('text-primary'), marginBottom:14 }}>
+                Recent Results ({fin.recent_results_bse.currency_unit})
+              </div>
+              <div style={{ overflowX:'auto' }}>
+                <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                  <thead><tr>
+                    <th style={thStyle}>Metric</th>
+                    {fin.recent_results_bse.periods?.map(p => <th key={p} style={thStyle}>{p}</th>)}
+                  </tr></thead>
+                  <tbody>
+                    {fin.recent_results_bse.results_cr?.map((row, i) => (
+                      <tr key={i}>
+                        <td style={{...tdStyle, fontWeight:600}}>{row.title}</td>
+                        {row.values.map((v, j) => <td key={j} style={tdStyle}>{v}</td>)}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
+
+          {sh?.bse_latest?.holding_pct_by_category && (
+            <Card>
+              <div style={{ fontSize:15, fontWeight:700, color:V('text-primary'), marginBottom:4 }}>Shareholding Pattern</div>
+              <div style={{ fontSize:12, color:V('text-muted'), marginBottom:14 }}>{sh.bse_latest.latest_quarter}</div>
+              <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
+                <MetricBox label="Promoter" value={`${(sh.bse_latest.holding_pct_by_category.ShareholdingOfPromoterAndPromoterGroup ?? 0).toFixed(2)}%`} color="#6366f1" />
+                <MetricBox label="Public" value={`${(sh.bse_latest.holding_pct_by_category.PublicShareholding ?? 0).toFixed(2)}%`} />
+              </div>
+            </Card>
+          )}
+
+          {peers.length > 0 && (
+            <Card>
+              <div style={{ fontSize:15, fontWeight:700, color:V('text-primary'), marginBottom:14 }}>Peer Comparison</div>
+              <div style={{ overflowX:'auto' }}>
+                <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                  <thead><tr>
+                    {['Name','LTP','Revenue','PAT','OPM %','NPM %','RONW %','EPS','P/E'].map(h => <th key={h} style={thStyle}>{h}</th>)}
+                  </tr></thead>
+                  <tbody>
+                    {peers.map((p, i) => (
+                      <tr key={i} style={p.Name === ov.symbol ? { background: V('bg-tertiary') } : {}}>
+                        <td style={{...tdStyle, fontWeight: p.Name === ov.symbol ? 700 : 400}}>{p.Name}</td>
+                        <td style={tdStyle}>₹{p.LTP}</td>
+                        <td style={tdStyle}>{p.Revenue}</td>
+                        <td style={tdStyle}>{p.PAT}</td>
+                        <td style={tdStyle}>{p.OPM}</td>
+                        <td style={tdStyle}>{p.NPM}</td>
+                        <td style={tdStyle}>{p.RONW}</td>
+                        <td style={tdStyle}>{p.EPS}</td>
+                        <td style={tdStyle}>{p.PE}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
+
+          <Card>
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:10, marginBottom: debateData ? 14 : 0 }}>
+              <div>
+                <div style={{ fontSize:15, fontWeight:700, color:V('text-primary') }}>Should I invest? — AI Investment Debate</div>
+                <div style={{ fontSize:12, color:V('text-muted'), maxWidth:640, lineHeight:1.5 }}>
+                  Answers three questions: is today's price good, should I wait, and at what price should I buy. A 5-year return model, the stock's own P/E history, shareholding trends and recent announcements feed a bull-vs-bear debate with rebuttals, judged by a senior AI model. On-demand — takes about 30 seconds.
+                </div>
+              </div>
+              <StyledButton onClick={runDebate} disabled={debateLoading}>
+                {debateLoading ? 'Debating… (~30s)' : (debateData ? 'Re-run' : 'Get AI Analysis')}
+              </StyledButton>
+            </div>
+            {debateLoading && (
+              <div style={{ fontSize:12, color:V('text-muted'), marginTop:12 }}>
+                Running four rounds: analyst reads → bull and bear openings → rebuttals → judge's verdict…
+              </div>
+            )}
+
+            <DeepDebateResult d={debateData} m={m} />
+          </Card>
+
+          <div style={{ fontSize:11, color:V('text-muted'), textAlign:'center', padding:'4px 0' }}>
+            Data from BSE and Tickertape.
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function IpoReviewTab() {
+  const [ipos, setIpos] = useState(null)
+  const [listError, setListError] = useState(null)
+  const [selected, setSelected] = useState(null) // ipo_no of the one being analyzed
+  const m = window.innerWidth < 768
+
+  useEffect(() => {
+    fetch('/api/investment/ipo/list')
+      .then(r => r.json())
+      .then(d => setIpos(d.ipos || []))
+      .catch(e => setListError(e.message || 'Failed to load IPO list'))
+  }, [])
+
+  if (selected) {
+    return <IpoAnalysisView ipoNo={selected} onBack={() => setSelected(null)} />
+  }
+
+  const equityOffers = ipos?.filter(i => i.is_equity_offer) || []
+  const otherActions = ipos?.filter(i => !i.is_equity_offer) || []
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
+      <div style={{ fontSize:12, color:V('text-muted') }}>
+        Everything currently open for bidding on BSE. Only IPOs/FPOs get RHP-derived fundamentals, quality scores, and an AI verdict — other corporate actions below use a different disclosure document and don't have that analysis available.
+      </div>
+      {listError && <Card><div style={{ color:'#ef4444', fontSize:13 }}>{listError}</div></Card>}
+      {!ipos && !listError && <div style={{ fontSize:13, color:V('text-muted'), textAlign:'center', padding:'24px 0' }}>Loading IPOs…</div>}
+      {ipos?.length === 0 && <Card><div style={{ fontSize:13, color:V('text-muted') }}>No open issues found.</div></Card>}
+
+      {equityOffers.length > 0 && (
+        <>
+          <div style={{ fontSize:14, fontWeight:700, color:V('text-primary'), marginTop:4 }}>IPOs &amp; FPOs</div>
+          <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(2,1fr)', gap:10 }}>
+            {equityOffers.map(ipo => <IpoListCard key={ipo.ipo_no} ipo={ipo} onClick={() => setSelected(ipo.ipo_no)} />)}
+          </div>
+        </>
+      )}
+
+      {otherActions.length > 0 && (
+        <>
+          <div style={{ fontSize:14, fontWeight:700, color:V('text-primary'), marginTop:10 }}>Other Corporate Actions</div>
+          <div style={{ fontSize:11, color:V('text-muted'), marginBottom:2 }}>
+            Rights Issues, Buybacks, Offers to Buy, and Debt Issues — not fresh equity offerings, so no RHP/fundamentals analysis applies here.
+          </div>
+          <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(2,1fr)', gap:10 }}>
+            {otherActions.map(ipo => <IpoListCard key={ipo.ipo_no} ipo={ipo} onClick={() => setSelected(ipo.ipo_no)} dimmed />)}
+          </div>
+        </>
+      )}
+
+      <div style={{ fontSize:11, color:V('text-muted'), textAlign:'center' }}>
+        GMP/subscription sentiment from investorgain.com — unofficial, community-sourced, informational only.
+      </div>
+    </div>
+  )
+}
+
+function IpoListCard({ ipo, onClick, dimmed }) {
+  const gmpColor = (v) => v == null ? V('text-muted') : v > 0 ? '#22c55e' : v < 0 ? '#ef4444' : V('text-muted')
+  return (
+    <div onClick={onClick}
+      style={{
+        cursor:'pointer', background:V('bg-secondary'), border:`1px solid ${V('border')}`, borderRadius:V('radius-md'),
+        padding:14, display:'flex', flexDirection:'column', gap:8, opacity: dimmed ? 0.85 : 1,
+      }}>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:8 }}>
+        <div style={{ fontSize:14, fontWeight:700, color:V('text-primary') }}>{ipo.name}</div>
+        <span style={{ padding:'2px 8px', borderRadius:12, fontSize:10, fontWeight:600, background:V('bg-tertiary'), color:V('text-muted'), border:`1px solid ${V('border')}`, whiteSpace:'nowrap' }}>
+          {ipo.platform}
+        </span>
+      </div>
+      <div style={{ fontSize:12, color:V('text-muted') }}>
+        <span style={{ fontWeight:600, color: ipo.is_equity_offer ? '#6366f1' : V('text-muted') }}>{ipo.type_full}</span>
+        {' · '}₹{ipo.price_band} · {ipo.start_date?.slice(0,10)} → {ipo.end_date?.slice(0,10)}
+      </div>
+      <div style={{ display:'flex', gap:14, fontSize:12 }}>
+        <div>
+          <span style={{ color:V('text-muted') }}>GMP: </span>
+          <span style={{ color: gmpColor(ipo.sentiment?.gmp?.gmp_value), fontWeight:600 }}>
+            {ipo.sentiment?.gmp?.gmp_value != null ? `₹${ipo.sentiment.gmp.gmp_value} (${ipo.sentiment.gmp.gmp_percent}%)` : '—'}
+          </span>
+        </div>
+        <div>
+          <span style={{ color:V('text-muted') }}>Sub: </span>
+          <span style={{ color:V('text-primary'), fontWeight:600 }}>{ipo.sentiment?.subscription?.total_x != null ? `${ipo.sentiment.subscription.total_x}x` : '—'}</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function IpoAnalysisView({ ipoNo, onBack }) {
+  const [data, setData] = useState(null)
+  const [error, setError] = useState(null)
+  const m = window.innerWidth < 768
+
+  useEffect(() => {
+    setData(null); setError(null)
+    fetch(`/api/investment/ipo/${ipoNo}/analysis`)
+      .then(async r => {
+        if (!r.ok) {
+          const body = await r.json().catch(() => ({}))
+          throw new Error(body.detail || `Request failed (${r.status})`)
+        }
+        return r.json()
+      })
+      .then(setData)
+      .catch(e => setError(e.message || 'Failed to load'))
+  }, [ipoNo])
+
+  const mech = data?.mechanics
+  const sent = data?.sentiment
+  const rhp = data?.rhp
+  const piotroski = data?.piotroski_f_score
+  const altman = data?.altman_zprime_score
+  const trend = data?.yoy_trend
+  const investorInterest = data?.investor_interest
+  const verdict = data?.verdict
+  const zoneColor = altman?.zone === 'safe' ? '#22c55e' : altman?.zone === 'distress' ? '#ef4444' : '#eab308'
+  const callColor = (v) => v === 'apply' || v === 'invest' ? '#22c55e' : v === 'avoid' ? '#ef4444' : '#eab308'
+  const trendColor = (d) => d === 'up' ? '#22c55e' : d === 'down' ? '#ef4444' : V('text-muted')
+  const trendArrow = (d) => d === 'up' ? '↑' : d === 'down' ? '↓' : '→'
+  const priceColor = (p) => p === 'attractive' ? '#22c55e' : p === 'aggressive' ? '#ef4444' : '#eab308'
+  const interestColor = (i) => i === 'high' ? '#22c55e' : i === 'low' ? '#ef4444' : '#eab308'
+
+  return (
+    <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+      <div onClick={onBack} style={{ cursor:'pointer', fontSize:13, color:V('text-muted'), fontWeight:600 }}>← Back to IPO list</div>
+
+      {error && <Card><div style={{ color:'#ef4444', fontSize:13 }}>{error}</div></Card>}
+      {!data && !error && (
+        <div style={{ fontSize:13, color:V('text-muted'), textAlign:'center', padding:'24px 0' }}>
+          Downloading and analyzing the RHP — can take up to a minute for an IPO not seen before…
+        </div>
+      )}
+
+      {mech && (
+        <Card>
+          <div style={{ fontSize:18, fontWeight:700, color:V('text-primary'), marginBottom:10 }}>{mech.scrip_name}</div>
+          <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
+            <MetricBox label="Price Band" value={`₹${mech.price_band}`} />
+            <MetricBox label="Lot Size" value={mech.market_lot ?? '—'} />
+            <MetricBox label="Issue Size" value={mech.issue_size_shares ? Number(mech.issue_size_shares).toLocaleString() : '—'} />
+            <MetricBox label="Period" value={mech.issue_period ?? '—'} />
+          </div>
+        </Card>
+      )}
+
+      {mech && rhp?.errors?.length > 0 && !rhp?.summary_financials && (
+        <Card style={{ border:`1px solid color-mix(in srgb, #eab308 35%, ${V('border')})`, background:'color-mix(in srgb, #eab308 6%, transparent)' }}>
+          <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.5 }}>
+            <strong>No fundamentals analysis available for this issue.</strong> {rhp.errors[0]}.
+          </div>
+        </Card>
+      )}
+
+      {verdict?.available && (
+        <Card style={{ border:`1px solid color-mix(in srgb, ${callColor(verdict.listing_gain_view)} 35%, ${V('border')})` }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', flexWrap:'wrap', gap:10, marginBottom:12 }}>
+            <div style={{ fontSize:15, fontWeight:700, color:V('text-primary') }}>IPO Verdict</div>
+            {verdict.star_rating != null && (
+              <div style={{ fontSize:16, letterSpacing:2 }}>
+                {'★'.repeat(verdict.star_rating)}<span style={{ color:V('border') }}>{'★'.repeat(Math.max(0, 5 - verdict.star_rating))}</span>
+              </div>
+            )}
+          </div>
+          {verdict.business_summary && (
+            <div style={{ fontSize:13, color:V('text-muted'), lineHeight:1.5, marginBottom:14 }}>{verdict.business_summary}</div>
+          )}
+          <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr', gap:10, marginBottom:14 }}>
+            <div style={{
+              padding:14, borderRadius:V('radius-md'),
+              background:`color-mix(in srgb, ${callColor(verdict.listing_gain_view)} 10%, transparent)`,
+              border:`1px solid color-mix(in srgb, ${callColor(verdict.listing_gain_view)} 30%, transparent)`,
+            }}>
+              <div style={{ fontSize:10, textTransform:'uppercase', letterSpacing:'0.06em', color:V('text-muted'), marginBottom:6 }}>Listing Gain Call</div>
+              <div style={{ display:'flex', alignItems:'baseline', gap:8, flexWrap:'wrap' }}>
+                <div style={{ fontSize:18, fontWeight:800, color:callColor(verdict.listing_gain_view), textTransform:'uppercase' }}>{verdict.listing_gain_view}</div>
+                {verdict.listing_gain_view === 'apply' && sent?.gmp?.gmp_percent != null && (
+                  <div style={{ fontSize:13, fontWeight:700, color:callColor(verdict.listing_gain_view) }}>
+                    ~{sent.gmp.gmp_percent}%+ expected
+                  </div>
+                )}
+              </div>
+              {verdict.listing_gain_reason && <div style={{ fontSize:12, color:V('text-primary'), marginTop:6, lineHeight:1.5 }}>{verdict.listing_gain_reason}</div>}
+            </div>
+            <div style={{
+              padding:14, borderRadius:V('radius-md'),
+              background:`color-mix(in srgb, ${callColor(verdict.long_term_view)} 10%, transparent)`,
+              border:`1px solid color-mix(in srgb, ${callColor(verdict.long_term_view)} 30%, transparent)`,
+            }}>
+              <div style={{ fontSize:10, textTransform:'uppercase', letterSpacing:'0.06em', color:V('text-muted'), marginBottom:6 }}>Long-Term Call</div>
+              <div style={{ fontSize:18, fontWeight:800, color:callColor(verdict.long_term_view), textTransform:'uppercase' }}>{verdict.long_term_view}</div>
+              {verdict.long_term_reason && <div style={{ fontSize:12, color:V('text-primary'), marginTop:6, lineHeight:1.5 }}>{verdict.long_term_reason}</div>}
+            </div>
+          </div>
+          <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
+            <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:'10px 12px' }}>
+              <div style={{ fontSize:10, textTransform:'uppercase', color:V('text-muted'), marginBottom:4 }}>Revenue YoY</div>
+              <div style={{ fontSize:14, fontWeight:700, color: trendColor(trend?.revenue_direction) }}>
+                {trend?.revenue_yoy_pct != null ? `${trendArrow(trend.revenue_direction)} ${Math.abs(trend.revenue_yoy_pct)}%` : '—'}
+              </div>
+            </div>
+            <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:'10px 12px' }}>
+              <div style={{ fontSize:10, textTransform:'uppercase', color:V('text-muted'), marginBottom:4 }}>PAT YoY</div>
+              <div style={{ fontSize:14, fontWeight:700, color: trendColor(trend?.net_profit_direction) }}>
+                {trend?.net_profit_yoy_pct != null ? `${trendArrow(trend.net_profit_direction)} ${Math.abs(trend.net_profit_yoy_pct)}%` : '—'}
+              </div>
+            </div>
+            <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:'10px 12px' }}>
+              <div style={{ fontSize:10, textTransform:'uppercase', color:V('text-muted'), marginBottom:4 }}>Issue Price</div>
+              <div style={{ fontSize:14, fontWeight:700, color: priceColor(verdict.issue_price_assessment), textTransform:'capitalize' }}>
+                {verdict.issue_price_assessment || '—'}
+              </div>
+            </div>
+            <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:'10px 12px' }}>
+              <div style={{ fontSize:10, textTransform:'uppercase', color:V('text-muted'), marginBottom:4 }}>Investor Interest</div>
+              <div style={{ fontSize:14, fontWeight:700, color: interestColor(investorInterest), textTransform:'capitalize' }}>
+                {investorInterest || '—'}
+              </div>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {verdict && !verdict.available && rhp?.summary_financials && (
+        <Card>
+          <div style={{ fontSize:13, color:V('text-muted'), background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:14 }}>
+            AI analysis isn't available right now{verdict.reason?.toLowerCase().includes('rate limit') ? ' — the AI provider is rate-limited, try again in a minute' : ''}. The numbers above are unaffected either way.
+          </div>
+        </Card>
+      )}
+
+      {sent && (sent.gmp || sent.subscription) && (
+        <Card>
+          <div style={{ fontSize:15, fontWeight:700, color:V('text-primary'), marginBottom:4 }}>Market Sentiment</div>
+          <div style={{ fontSize:11, color:V('text-muted'), marginBottom:14 }}>{sent.source}</div>
+          <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(3,1fr)', gap:10, marginBottom: sent.subscription ? 14 : 0 }}>
+            <MetricBox label="GMP" value={sent.gmp?.gmp_value != null ? `₹${sent.gmp.gmp_value}` : '—'} color={sent.gmp?.gmp_value > 0 ? '#22c55e' : sent.gmp?.gmp_value < 0 ? '#ef4444' : undefined} />
+            <MetricBox label="GMP %" value={sent.gmp?.gmp_percent != null ? `${sent.gmp.gmp_percent}%` : '—'} />
+            <MetricBox label="Total Sub" value={sent.subscription?.total_x != null ? `${sent.subscription.total_x}x` : '—'} />
+          </div>
+          {sent.subscription && (
+            <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
+              <MetricBox label="QIB" value={sent.subscription.qib_x != null ? `${sent.subscription.qib_x}x` : '—'} />
+              <MetricBox label="NII" value={sent.subscription.nii_x != null ? `${sent.subscription.nii_x}x` : '—'} />
+              <MetricBox label="RII" value={sent.subscription.rii_x != null ? `${sent.subscription.rii_x}x` : '—'} />
+              <MetricBox label="BHNI" value={sent.subscription.bhni_x != null ? `${sent.subscription.bhni_x}x` : '—'} />
+            </div>
+          )}
+        </Card>
+      )}
+
+      {rhp?.summary_financials && (
+        <Card>
+          <div style={{ fontSize:15, fontWeight:700, color:V('text-primary'), marginBottom:14 }}>Quality Scores (from RHP restated financials)</div>
+          <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr', gap:14 }}>
+            <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:16 }}>
+              <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.08em', color:V('text-muted'), marginBottom:8 }}>Piotroski F-Score</div>
+              {piotroski?.complete ? (
+                <>
+                  <div style={{ fontSize:28, fontWeight:700, fontFamily:"'JetBrains Mono', monospace", color:V('text-primary') }}>
+                    {piotroski.score}<span style={{ fontSize:16, color:V('text-muted') }}> / 9</span>
+                  </div>
+                  <div style={{ fontSize:12, color:V('text-muted'), marginTop:8, lineHeight:1.5 }}>
+                    {piotroski.score >= 8 ? 'Very strong financial health across profitability, leverage, and efficiency.' :
+                     piotroski.score >= 6 ? 'Reasonably healthy fundamentals, with some weaker checks.' :
+                     piotroski.score >= 3 ? 'Mixed signals — several of the 9 profitability/leverage/efficiency checks fail. Common for young, fast-scaling companies, not necessarily a red flag on its own.' :
+                     'Weak on most of the 9 checks — worth reading the fundamentals section closely.'}
+                  </div>
+                  {piotroski.score < 9 && piotroskiFailedChecks(piotroski.checks).length > 0 && (
+                    <div style={{ fontSize:11, color:V('text-muted'), marginTop:6, lineHeight:1.5 }}>
+                      Weaker on: {piotroskiFailedChecks(piotroski.checks).join(', ')} — from the RHP's restated financials.
+                    </div>
+                  )}
+                </>
+              ) : <div style={{ fontSize:13, color:V('text-muted') }}>{piotroski?.reason || 'Not available'}</div>}
+            </div>
+            <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:16 }}>
+              <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.08em', color:V('text-muted'), marginBottom:8 }}>Altman Z'-Score (private-company variant)</div>
+              {altman?.z_prime_score != null ? (
+                <>
+                  <div style={{ display:'flex', alignItems:'baseline', gap:10 }}>
+                    <div style={{ fontSize:28, fontWeight:700, fontFamily:"'JetBrains Mono', monospace", color:V('text-primary') }}>{altman.z_prime_score.toFixed(2)}</div>
+                    <span style={{ padding:'3px 10px', borderRadius:20, fontSize:11, fontWeight:600, background:`color-mix(in srgb, ${zoneColor} 18%, transparent)`, color:zoneColor, border:`1px solid color-mix(in srgb, ${zoneColor} 35%, transparent)` }}>{altman.zone}</span>
+                  </div>
+                  <div style={{ fontSize:12, color:V('text-muted'), marginTop:8, lineHeight:1.5 }}>
+                    {altman.zone === 'safe' ? 'Estimates bankruptcy/distress risk — "safe" means low near-term financial-distress risk by this model.' :
+                     altman.zone === 'grey' ? 'Estimates bankruptcy/distress risk — "grey" means some caution warranted, not a clear pass or fail.' :
+                     'Estimates bankruptcy/distress risk — "distress" is the zone historically associated with companies that later ran into financial trouble; worth weighing carefully.'}
+                  </div>
+                  {altman.zone !== 'safe' && altmanWeakPoints(altman.components).length > 0 && (
+                    <div style={{ fontSize:11, color:V('text-muted'), marginTop:6, lineHeight:1.5 }}>
+                      Driven mainly by: {altmanWeakPoints(altman.components).join(', ')} — from the RHP's restated financials.
+                    </div>
+                  )}
+                </>
+              ) : <div style={{ fontSize:13, color:V('text-muted') }}>{altman?.reason || 'Not available'}</div>}
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {rhp?.objects_of_offer?.length > 0 && (
+        <Card>
+          <div style={{ fontSize:15, fontWeight:700, color:V('text-primary'), marginBottom:10 }}>Objects of the Offer</div>
+          <ul style={{ margin:0, paddingLeft:18, display:'flex', flexDirection:'column', gap:6 }}>
+            {rhp.objects_of_offer.map((o, i) => <li key={i} style={{ fontSize:13, color:V('text-primary'), lineHeight:1.5 }}>{o}</li>)}
+          </ul>
+        </Card>
+      )}
+
+      {rhp?.risk_factors?.length > 0 && (
+        <Card>
+          <div style={{ fontSize:15, fontWeight:700, color:V('text-primary'), marginBottom:4 }}>Top Risk Factors (from RHP)</div>
+          <div style={{ fontSize:11, color:V('text-muted'), marginBottom:10 }}>As disclosed by the company, most material first per SEBI ordering</div>
+          <ul style={{ margin:0, paddingLeft:18, display:'flex', flexDirection:'column', gap:8 }}>
+            {rhp.risk_factors.slice(0, 12).map((r) => (
+              <li key={r.number} style={{ fontSize:13, color:V('text-primary'), lineHeight:1.5 }}>{r.heading}</li>
+            ))}
+          </ul>
+        </Card>
+      )}
+
+      {verdict?.available && (
+        <Card>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:10, marginBottom:14 }}>
+            <div style={{ fontSize:15, fontWeight:700, color:V('text-primary') }}>Detailed AI Analysis</div>
+            <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+              <span style={{ padding:'3px 10px', borderRadius:20, fontSize:11, fontWeight:600, background:V('bg-tertiary'), color:V('text-muted'), border:`1px solid ${V('border')}` }}>
+                {verdict.confidence} confidence
+              </span>
+              {verdict.confidence_score != null && (
+                <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                  <div style={{ width:60, height:6, borderRadius:3, background:V('bg-tertiary'), overflow:'hidden' }}>
+                    <div style={{ width:`${verdict.confidence_score}%`, height:'100%', background:'#6366f1' }} />
+                  </div>
+                  <span style={{ fontSize:12, fontWeight:700, fontFamily:"'JetBrains Mono', monospace", color:V('text-primary') }}>
+                    {verdict.confidence_score}%
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+          <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
+            {verdict.key_reasons?.length > 0 && (
+              <ul style={{ margin:0, paddingLeft:18, display:'flex', flexDirection:'column', gap:4 }}>
+                {verdict.key_reasons.map((r, i) => <li key={i} style={{ fontSize:13, color:V('text-primary'), lineHeight:1.5 }}>{r}</li>)}
+              </ul>
+            )}
+
+            <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:14 }}>
+              <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:V('text-muted'), marginBottom:6 }}>Fundamentals</div>
+              <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.5 }}>{verdict.fundamental_read}</div>
+            </div>
+            <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:14 }}>
+              <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:V('text-muted'), marginBottom:6 }}>Sentiment</div>
+              <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.5 }}>{verdict.sentiment_read}</div>
+            </div>
+            {verdict.issue_price_reason && (
+              <div style={{ background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, borderRadius:V('radius-md'), padding:14 }}>
+                <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:V('text-muted'), marginBottom:6 }}>Issue Pricing</div>
+                <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.5 }}>{verdict.issue_price_reason}</div>
+              </div>
+            )}
+            <div style={{ background:'color-mix(in srgb, #6366f1 8%, transparent)', border:'1px solid color-mix(in srgb, #6366f1 25%, transparent)', borderRadius:V('radius-md'), padding:14 }}>
+              <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:'#6366f1', marginBottom:6, fontWeight:600 }}>How the two views were weighed</div>
+              <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.5 }}>{verdict.reasoning}</div>
+            </div>
+
+            <div style={{ fontSize:11, color:V('text-muted'), textAlign:'center' }}>{verdict.disclaimer}</div>
+          </div>
+        </Card>
+      )}
+
+      {rhp?.errors?.length > 0 && rhp?.summary_financials && (
+        <div style={{ fontSize:11, color:V('text-muted'), textAlign:'center' }}>
+          Note: {rhp.errors.join('; ')} — figures shown are whatever was available.
+        </div>
+      )}
     </div>
   )
 }
@@ -7119,6 +8444,7 @@ export default function App() {
     research: ['Research', 'Factor research pipeline — PCA, RMT, lead-lag analysis'],
     settings: ['Settings', 'Configure system settings, strategy parameters, risk thresholds, and API keys'],
     cas: ['CAS', 'CAS-window spike detection (15:05-15:28, stock options) and all-day undercurrent scanning (stocks + indices)'],
+    investment: ['Investment Analysis', 'Company fundamentals, quality scores, and peer comparison — separate from live options trading'],
   }
 
   return (
@@ -7426,6 +8752,12 @@ export default function App() {
           {tab === 'cas' && (
             <ErrorBoundary>
               <CasAlertsPage alertsA={casAlertsA} alertsB={casAlertsB} alertsC={casAlertsC} atRisk={casAtRisk} undercurrent={casUndercurrent} heatmap={casHeatmap} />
+            </ErrorBoundary>
+          )}
+
+          {tab === 'investment' && (
+            <ErrorBoundary>
+              <InvestmentAnalysisPage />
             </ErrorBoundary>
           )}
 

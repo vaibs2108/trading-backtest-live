@@ -139,6 +139,20 @@ logger = logging.getLogger(__name__)
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Dhan ML Trading Engine", version="1.0.0")
 
+# Investment Analysis page (Company Analysis / Stock Scanner / IPO Review) —
+# fully isolated: its own data clients (bse_client.py, tickertape_client.py),
+# no imports from or edits to broker.py/cas_broker.py/config.py/the live
+# trading loop. Guarded so a problem in this new, separate feature can never
+# take down the trading engine's own startup — worst case this page is
+# simply unavailable, nothing else here is affected. Rollback: delete this
+# try block and the three investment_*.py files.
+try:
+    import investment_api
+    app.include_router(investment_api.router)
+    logger.info("Investment Analysis API mounted at /api/investment")
+except Exception as _inv_api_err:
+    logger.error(f"Investment Analysis API failed to mount (feature disabled, trading engine unaffected): {_inv_api_err}")
+
 @app.on_event("shutdown")
 def on_app_shutdown():
     logger.info("Shutdown event triggered — force exiting process cleanly.")
