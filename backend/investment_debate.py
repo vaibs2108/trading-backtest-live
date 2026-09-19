@@ -21,6 +21,7 @@ import os
 import re
 import json
 import time
+import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -65,6 +66,7 @@ PROVIDERS = {
         "max_tokens": 1500,
         "timeout": 120,
         "json_mode": True,
+        "tpm_limit": 30000,   # this OpenAI account's tokens-per-minute cap for gpt-4.1; one full analysis uses about that much
     },
 }
 
@@ -77,6 +79,36 @@ class DebateUnavailable(Exception):
     """Raised when no configured provider has a usable key — callers
     should degrade gracefully (show the quantitative data without the
     debate section), never crash the whole Company Analysis response."""
+
+
+_TPM_LOCK = threading.Lock()
+_TPM_LOG: dict = {}      # provider -> [[timestamp, tokens], ...] for the last 60 seconds
+
+
+def _reserve_tokens(provider: str, cfg: dict, est_tokens: int):
+    """Paces calls to stay under the provider's tokens-per-minute cap, so two analyses run
+    back-to-back are slowed down instead of the second failing with a 429 (observed: a second
+    analysis inside a minute failed even after retries). Reserves an estimate up front; the
+    caller replaces it with the real usage afterwards. Returns the log entry to update."""
+    limit = cfg.get("tpm_limit")
+    if not limit:
+        return None
+    # Calibrated to what OpenAI actually accepts: a full analysis (~31k real tokens over ~25s) passes on an
+    # idle 30k/min account, so a strict budget would slow every single analysis for no reason. This only
+    # spaces out a SECOND analysis started within the same minute; the 429 retry handles any remainder.
+    budget = limit * 1.12
+    while True:
+        with _TPM_LOCK:
+            now = time.time()
+            log = _TPM_LOG.setdefault(provider, [])
+            log[:] = [e for e in log if now - e[0] < 60]
+            used = sum(e[1] for e in log)
+            if used + est_tokens <= budget or not log:
+                entry = [now, est_tokens]
+                log.append(entry)
+                return entry
+            wait = 60 - (now - log[0][0]) + 0.5
+        time.sleep(min(max(wait, 1.0), 30.0))
 
 
 def _call_llm(prompt: str, system: str, provider: str = DEFAULT_PROVIDER, max_tokens: Optional[int] = None) -> str:
@@ -96,17 +128,27 @@ def _call_llm(prompt: str, system: str, provider: str = DEFAULT_PROVIDER, max_to
     if cfg.get("json_mode"):
         body["response_format"] = {"type": "json_object"}
 
+    est = int((len(system) + len(prompt)) / 3.4) + int(0.6 * body["max_tokens"])   # replies use ~60% of the cap
+    slot = _reserve_tokens(provider, cfg, est)
+
     r = None
-    for attempt in range(2):  # one retry on rate-limit / transient upstream errors
+    for attempt in range(7):  # retry rate-limits / transient upstream errors, waiting as long as the provider asks
         r = requests.post(cfg["base_url"], headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                           json=body, timeout=cfg.get("timeout", 45))
-        if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-            time.sleep(3)
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < 6:
+            wait = 3.0
+            m = re.search(r"try again in ([\d.]+)\s*(ms|s)", r.text)
+            if r.status_code == 429 and m:
+                wait = float(m.group(1)) / (1000 if m.group(2) == "ms" else 1) + 1.0
+            time.sleep(min(wait, 25.0))
             continue
         break
     if r.status_code != 200:
         raise DebateUnavailable(f"{provider} returned {r.status_code}: {r.text[:200]}")
     data = r.json()
+    used = (data.get("usage") or {}).get("total_tokens")
+    if slot is not None and used:
+        slot[1] = used           # replace the estimate with what was really consumed
     try:
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
@@ -116,17 +158,34 @@ def _call_llm(prompt: str, system: str, provider: str = DEFAULT_PROVIDER, max_to
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
+_GARBLED_RUPEE_RE = re.compile("\x1b\\[?9(?=\\d)")
+_CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _sanitize(obj):
+    """Model replies occasionally contain control characters (seen: ESC in place of the rupee
+    sign). Repair the known pattern and strip any others, recursively, so a user can never see
+    a corrupted price."""
+    if isinstance(obj, str):
+        return _CONTROL_RE.sub("", _GARBLED_RUPEE_RE.sub(chr(0x20b9), obj))
+    if isinstance(obj, list):
+        return [_sanitize(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    return obj
+
+
 def _parse_json_response(text: str) -> dict:
     """LLMs sometimes wrap JSON in prose or code fences despite instructions
     — pull out the first {...} block rather than failing outright."""
     try:
-        return json.loads(text)
+        return _sanitize(json.loads(text))
     except json.JSONDecodeError:
         pass
     m = _JSON_BLOCK_RE.search(text)
     if m:
         try:
-            return json.loads(m.group(0))
+            return _sanitize(json.loads(m.group(0)))
         except json.JSONDecodeError:
             pass
     raise DebateUnavailable(f"could not parse JSON from model response: {text[:200]}")
@@ -263,7 +322,7 @@ def run_ipo_verdict(mechanics: dict, sentiment: dict, rhp_data: dict, scores: di
         "\"key_reasons\": [\"3-5 short bullet reasons, most important first\"], "
         "\"reasoning\": \"2-4 sentences explaining how the listing-gain and long-term views were weighed\"}."
     )
-    prompt = f"Data:\n{json.dumps(payload, default=str)}\n\nProduce the verdict."
+    prompt = f"Data:\n{_j(payload)}\n\nProduce the verdict."
     try:
         raw = _call_llm(prompt, system, provider)
         parsed = _parse_json_response(raw)
@@ -325,8 +384,15 @@ _LOW_REL_RULES = (
 STANCE_ORDER = ["accumulate_now", "start_small_and_stagger", "wait_for_better_price", "avoid_for_now"]
 
 
+def _j(obj) -> str:
+    """JSON for prompts. ensure_ascii=False on purpose: json.dumps' default writes the rupee
+    sign as the escape \\u20b9, and the model then garbled that escape when quoting text back
+    (observed: 'Rs 729.1' came back as a control character + '9729.1')."""
+    return json.dumps(obj, default=str, ensure_ascii=False)
+
+
 def _dossier_json(dossier: dict) -> str:
-    return json.dumps(dossier, default=str, separators=(",", ":"))
+    return json.dumps(dossier, default=str, separators=(",", ":"), ensure_ascii=False)
 
 
 def _run_reads(dossier: dict, provider: str, low_rel: bool = False) -> dict:
@@ -387,8 +453,8 @@ def _run_rebuttal(side: str, dossier: dict, own_opening: dict, opp_opening: dict
     )
     if low_rel:
         system += _LOW_REL_RULES
-    prompt = (f"Dossier:\n{_dossier_json(dossier)}\n\nYOUR opening:\n{json.dumps(own_opening, default=str)}\n\n"
-              f"THEIR ({other}) opening:\n{json.dumps(opp_opening, default=str)}")
+    prompt = (f"Dossier:\n{_dossier_json(dossier)}\n\nYOUR opening:\n{_j(own_opening)}\n\n"
+              f"THEIR ({other}) opening:\n{_j(opp_opening)}")
     return _parse_json_response(_call_llm(prompt, system, provider, max_tokens=1200))
 
 
@@ -443,8 +509,8 @@ def _run_judge(dossier: dict, reads: dict, bull: dict, bear: dict, provider: str
         '"what_would_change_my_mind": ["3-4 specific observable triggers: price levels from the model, quarterly-result thresholds, shareholding or promoter events"], '
         '"confidence": "low"|"medium"|"high", "confidence_reason": "one sentence (mention model reliability)"}'
     )
-    prompt = (f"Dossier:\n{_dossier_json(dossier)}\n\nAnalyst reads:\n{json.dumps(reads, default=str)}\n\n"
-              f"BULL case:\n{json.dumps(bull, default=str)}\n\nBEAR case:\n{json.dumps(bear, default=str)}")
+    prompt = (f"Dossier:\n{_dossier_json(dossier)}\n\nAnalyst reads:\n{_j(reads)}\n\n"
+              f"BULL case:\n{_j(bull)}\n\nBEAR case:\n{_j(bear)}")
     return _parse_json_response(_call_llm(prompt, system, provider, max_tokens=2200))
 
 

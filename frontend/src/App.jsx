@@ -2329,6 +2329,89 @@ function DataFreshness({ fresh, quoteAsOf, compact }) {
 const READ_LABELS = { business_quality: 'Business quality', growth_and_earnings: 'Growth & earnings', valuation: 'Valuation',
                       sentiment_and_flows: 'Sentiment & investor flows', risks_and_unknowns: 'Risks & unknowns' }
 
+// Shows exactly how a price in the verdict (e.g. "Rs 989") was reached, so it is a
+// traceable calculation rather than an assertion. All numbers come from the
+// deterministic model (investment_valuation.py), never from the AI.
+function PriceReasoning({ vm }) {
+  const d = vm?.price_derivation
+  if (!d) return null
+  const st = d.steps
+  const key = d.key_level_index != null ? d.levels[d.key_level_index] : null
+  const near = d.nearby_prices || []
+  const refIdx = near.findIndex(n => n.is_reference)
+  const lower = refIdx > 0 ? near[refIdx - 1] : null
+  const upper = refIdx >= 0 ? near.slice(refIdx + 1).find(n => !n.is_today) : null
+  const title = key
+    ? `Why ${fmtRs(key.price)}${lower ? `, and not ${fmtRs(lower.price)}` : ''}${upper ? ` or ${fmtRs(upper.price)}` : ''}?`
+    : 'How the price levels were calculated'
+  const sens = d.assumption_sensitivity
+  const step = { fontSize:12, color:V('text-primary'), lineHeight:1.55, marginBottom:6 }
+  return (
+    <details open style={{ marginTop:12, paddingTop:10, borderTop:`1px dashed ${V('border')}` }}>
+      <summary style={{ cursor:'pointer', fontSize:13, fontWeight:700, color:V('text-primary') }}>{title}</summary>
+      <div style={{ marginTop:8 }}>
+        <div style={step}><b>1. Start with what the company earns today:</b> ₹{st.eps_ttm} profit per share over the last 12 months.</div>
+        <div style={step}><b>2. Grow it for {st.horizon_years} years:</b> {st.growth_text} That takes earnings to about <b>₹{st.eps_in_5y}</b> per share.</div>
+        <div style={step}><b>3. Apply the P/E the market is assumed to pay then:</b> {st.exit_pe_text} So ₹{st.eps_in_5y} × {st.exit_pe} ≈ <b>{fmtRs(st.value_in_5y)}</b> expected price in {st.horizon_years} years.</div>
+        <div style={step}><b>4. Work backwards to the price to pay today</b> for each return we want. Dividends ({st.dividend_yield_pct}% a year) cover part of the target, so the share price itself only needs to grow by the rest:</div>
+        <div style={{ overflowX:'auto', marginBottom:8 }}>
+          <table style={{ width:'100%', borderCollapse:'collapse' }}>
+            <thead><tr>
+              <th style={DEBATE_TH}>Level</th><th style={DEBATE_TH}>Target / yr</th><th style={DEBATE_TH}>Price must grow / yr</th><th style={DEBATE_TH}>Calculation</th><th style={DEBATE_TH}>Price today</th>
+            </tr></thead>
+            <tbody>
+              {d.levels.map((l, i) => (
+                <tr key={i} style={i === d.key_level_index ? { background:V('bg-tertiary') } : {}}>
+                  <td style={{ ...DEBATE_TD, fontWeight: i === d.key_level_index ? 700 : 400 }}>{l.name}</td>
+                  <td style={DEBATE_TD}>{l.target_pct}%</td>
+                  <td style={DEBATE_TD}>{l.required_price_growth_pct}%</td>
+                  <td style={DEBATE_TD}>{fmtRs(l.value_in_5y)} ÷ {l.growth_factor}{l.scenario === 'bear' ? ' (bear-case value)' : ''}</td>
+                  <td style={{ ...DEBATE_TD, fontWeight:700 }}>{fmtRs(l.price)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div style={step}><b>5. Why these targets:</b> {d.why_targets}</div>
+
+        {near.length > 0 && (
+          <>
+            <div style={{ ...step, marginTop:10 }}>
+              <b>What if you pay a different price?</b>{key ? ` ${fmtRs(key.price)} is simply the highest price that still meets the ${key.target_pct}% minimum — it is not a forecast that the stock will fall there.` : ''}
+            </div>
+            <div style={{ overflowX:'auto', marginBottom:8 }}>
+              <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                <thead><tr><th style={DEBATE_TH}>If you buy at</th><th style={DEBATE_TH}>Base case earns / yr</th><th style={DEBATE_TH}>Bear case earns / yr</th><th style={DEBATE_TH}></th></tr></thead>
+                <tbody>
+                  {near.map((n, i) => (
+                    <tr key={i} style={n.is_reference ? { background:V('bg-tertiary') } : {}}>
+                      <td style={{ ...DEBATE_TD, fontWeight:700 }}>{fmtRs(n.price)}</td>
+                      <td style={{ ...DEBATE_TD, color:retColor(n.base_return_pct_pa), fontWeight:600 }}>{fmtPct(n.base_return_pct_pa, true)}</td>
+                      <td style={{ ...DEBATE_TD, color:retColor(n.bear_return_pct_pa) }}>{fmtPct(n.bear_return_pct_pa, true)}</td>
+                      <td style={{ ...DEBATE_TD, color:V('text-muted'), fontSize:11 }}>{n.is_today ? 'today' : n.is_reference ? (key ? 'the level in the verdict' : 'defensive floor') : ''}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div style={{ fontSize:11, color:V('text-muted'), lineHeight:1.5, marginBottom:6 }}>
+              A lower price means a bigger cushion and a higher return if the assumptions hold — but the stock may never fall that far. A higher price means a smaller return for the same risk.
+            </div>
+          </>
+        )}
+
+        {sens && (sens.bear || sens.bull) && (
+          <div style={step}>
+            <b>How much does this depend on the assumptions?</b> The price that earns {sens.target_pct}% a year would be{' '}
+            <b>{fmtRs(sens.bear)}</b> if the bear-case assumptions came true, <b>{fmtRs(sens.base)}</b> on the base case, and <b>{fmtRs(sens.bull)}</b> on the bull case.
+            So the number is only as reliable as the growth and P/E assumptions in steps 2 and 3.
+          </div>
+        )}
+      </div>
+    </details>
+  )
+}
+
 function DeepDebateResult({ d, m }) {
   if (!d) return null
   const vm = d.valuation_model
@@ -2381,6 +2464,7 @@ function DeepDebateResult({ d, m }) {
         <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:8 }}>{j.stance_reasoning}</div>
         <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:8 }}><b>Today, tomorrow or wait?</b> {j.today_vs_wait}</div>
         <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55 }}><b>How to use the price levels:</b> {j.how_to_use_price_levels}</div>
+        {!d.low_reliability && <PriceReasoning vm={vm} />}
         {j.stance_adjusted && (
           <div style={{ fontSize:11, color:V('text-muted'), marginTop:8 }}>
             The judge moved the numeric baseline (“{STANCE_META[vm?.baseline_stance]?.label}”) by one step based on evidence beyond the model.
@@ -2794,11 +2878,11 @@ function CompanyAnalysisTab() {
               <div>
                 <div style={{ fontSize:15, fontWeight:700, color:V('text-primary') }}>Should I invest? — AI Investment Debate</div>
                 <div style={{ fontSize:12, color:V('text-muted'), maxWidth:640, lineHeight:1.5 }}>
-                  Answers three questions: is today's price good, should I wait, and at what price should I buy. A 5-year return model, the stock's own P/E history, shareholding trends and recent announcements feed a bull-vs-bear debate with rebuttals, judged by a senior AI model. On-demand — takes about 30 seconds.
+                  Answers three questions: is today's price good, should I wait, and at what price should I buy. A 5-year return model, the stock's own P/E history, shareholding trends and recent announcements feed a bull-vs-bear debate with rebuttals, judged by a senior AI model. On-demand — takes 30 to 60 seconds.
                 </div>
               </div>
               <StyledButton onClick={runDebate} disabled={debateLoading}>
-                {debateLoading ? 'Debating… (~30s)' : (debateData ? 'Re-run' : 'Get AI Analysis')}
+                {debateLoading ? 'Debating… (30-60s)' : (debateData ? 'Re-run' : 'Get AI Analysis')}
               </StyledButton>
             </div>
             {debateLoading && (

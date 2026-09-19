@@ -279,6 +279,99 @@ def _price_for_return(value_5y, target_total, div_yield):
     return value_5y / (1 + required_price_cagr) ** HORIZON_YEARS
 
 
+def _nice_price(x: float) -> float:
+    """Round to a human-friendly price (multiples of 100/50/10/5/1 by magnitude)."""
+    step = 100 if x >= 2000 else 50 if x >= 500 else 10 if x >= 100 else 5 if x >= 20 else 1
+    return float(round(x / step) * step)
+
+
+def _explain_growth(g_hist, g_base, source) -> str:
+    if g_hist < 0:
+        return (f"Historical EPS growth was negative ({g_hist * 100:.1f}%/yr), so the base case assumes only a modest "
+                f"{g_base * 100:.0f}% a year recovery.")
+    raw = 0.75 * g_hist
+    if abs(raw - g_base) < 1e-9:
+        return f"Base-case growth is {g_base * 100:.1f}% a year: 75% of the {g_hist * 100:.1f}% the company achieved historically ({source}), a deliberate haircut."
+    return (f"75% of the {g_hist * 100:.1f}% historical growth ({source}) would be {raw * 100:.1f}%, held to {g_base * 100:.1f}% a year "
+            f"so the projection stays within a plausible range.")
+
+
+def _explain_exit_pe(hist_median, industry_pe, industry_used, anchor_pe, current_pe, exit_base) -> str:
+    parts = []
+    if hist_median:
+        parts.append(f"the stock's own median P/E over recent years ({hist_median:.1f}x)")
+    if industry_pe and industry_used:
+        parts.append(f"the industry P/E ({industry_pe:.1f}x)")
+    if not parts:
+        return f"No P/E history or industry P/E was available, so the multiple is assumed to stay at today's {current_pe:.1f}x."
+    anchor_txt = (f"the average of {parts[0]} and {parts[1]} = {anchor_pe:.1f}x" if len(parts) == 2 else f"{parts[0]}")
+    if anchor_pe <= current_pe:
+        return (f"The P/E the market is assumed to pay in 5 years is {exit_base:.1f}x, anchored on {anchor_txt}. Today's P/E is "
+                f"{current_pe:.1f}x, above that, so the base case assumes it falls back — a fall in the multiple is counted in full.")
+    return (f"The P/E the market is assumed to pay in 5 years is {exit_base:.1f}x. The anchor ({anchor_txt}) is above today's "
+            f"{current_pe:.1f}x, but cheap stocks are often cheap for a reason, so only half of that gap is assumed to close.")
+
+
+def _build_price_derivation(price, eps_ttm, g_base, g_hist, growth_source, scenarios, ladder, bear_safe_price,
+                            div_yield, hist_median, industry_pe, industry_used, anchor_pe, current_pe, exit_base,
+                            v_base, v_bear, v_bull) -> dict:
+    """Shows the user exactly how each price level was reached, so a number like
+    'Rs 989' is a traceable calculation, not an assertion: the base-case 5-year
+    value, worked backwards to the price that earns each target return; why the
+    targets are what they are; what buying at other prices would earn; and how
+    much the number moves if the assumptions are wrong."""
+    base = scenarios["base"]
+    levels = []
+    for lvl in ladder:
+        target = lvl["target_return_pct_pa"] / 100
+        req = target - div_yield
+        levels.append({"name": lvl["name"], "scenario": "base", "target_pct": lvl["target_return_pct_pa"],
+                       "required_price_growth_pct": _r(req * 100, 2), "growth_factor": _r((1 + req) ** HORIZON_YEARS, 3),
+                       "value_in_5y": v_base, "price": lvl["price"]})
+    if bear_safe_price:
+        req = BEAR_FLOOR_RETURN - div_yield
+        levels.append({"name": "Defensive floor (bear case earns 6% a year)", "scenario": "bear", "target_pct": 6,
+                       "required_price_growth_pct": _r(req * 100, 2), "growth_factor": _r((1 + req) ** HORIZON_YEARS, 3),
+                       "value_in_5y": v_bear, "price": _r(bear_safe_price, 0)})
+
+    # the level the verdict most often refers to: the highest ladder price that is still below today's price
+    below = [i for i, l in enumerate(levels) if l["scenario"] == "base" and l["price"] < price * 0.985]
+    key_index = max(below, key=lambda i: levels[i]["price"]) if below else None
+    ref = levels[key_index]["price"] if key_index is not None else (_r(bear_safe_price, 0) if bear_safe_price and bear_safe_price < price else None)
+
+    nearby = []
+    if ref:
+        prices = {ref: "key"}
+        for f in (0.8, 0.9, 1.1):
+            prices.setdefault(_nice_price(ref * f), None)
+        prices.setdefault(_r(price, 0), "today")
+        for p_ in sorted(prices):
+            if p_ and p_ > 0:
+                nearby.append({"price": p_, "is_reference": p_ == ref, "is_today": prices[p_] == "today" or p_ == _r(price, 0),
+                               "base_return_pct_pa": _return_at_price(v_base, p_, div_yield),
+                               "bear_return_pct_pa": _return_at_price(v_bear, p_, div_yield)})
+
+    target = levels[key_index]["target_pct"] / 100 if key_index is not None else TARGET_FAIR_START
+    sens = {"target_pct": _r(target * 100, 0)}
+    for label, v in (("bear", v_bear), ("base", v_base), ("bull", v_bull)):
+        p_ = _price_for_return(v, target, div_yield)
+        sens[label] = _r(p_, 0) if p_ else None
+
+    return {
+        "steps": {
+            "eps_ttm": _r(eps_ttm, 2), "growth_pct": base["eps_growth_pct"], "growth_text": _explain_growth(g_hist, g_base, growth_source),
+            "eps_in_5y": base["eps_in_5y"], "exit_pe": base["exit_pe"],
+            "exit_pe_text": _explain_exit_pe(hist_median, industry_pe, industry_used, anchor_pe, current_pe, exit_base),
+            "value_in_5y": v_base, "dividend_yield_pct": _r(div_yield * 100, 2), "horizon_years": HORIZON_YEARS,
+        },
+        "levels": levels, "key_level_index": key_index,
+        "why_targets": ("The 9%, 12% and 15% targets are decision thresholds we chose, not numbers derived from the company: 9% is the "
+                        "lowest yearly return we treat as worth the risk of owning a single stock, 12% is a comfortable return, and 15% is a "
+                        "strongly attractive one. Change the target and every price level moves with it."),
+        "nearby_prices": nearby, "assumption_sensitivity": sens,
+    }
+
+
 def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct, growth_source,
                           div_yield_pct, quality_flags, reliability=None, industry_pe_weak=False) -> dict:
     if not price or not eps_ttm or eps_ttm <= 0:
@@ -360,9 +453,14 @@ def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct,
     if reliability and reliability.get("level") == "low" and stance < 2:
         stance, capped_for_reliability = 2, True
 
+    industry_used = bool(industry_pe) and (not industry_pe_weak or hist_median is None)
+    price_derivation = _build_price_derivation(price, eps_ttm, g_base, g_hist, growth_source, scenarios, ladder,
+                                               bear_safe, div_yield, hist_median, industry_pe, industry_used, anchor_pe,
+                                               current_pe, exit_base, v_base, v_bear, v_bull)
     return {
         "available": True,
         "reliability": reliability,
+        "price_derivation": price_derivation,
         "stance_capped_for_low_reliability": capped_for_reliability,
         "horizon_years": HORIZON_YEARS,
         "current_price": _r(price, 2), "eps_ttm": _r(eps_ttm, 2), "current_pe": _r(current_pe),
@@ -606,6 +704,6 @@ def compute_all(overview: dict, financials: dict, shareholding: dict, price_summ
         "shareholding_trend": _shareholding_trend((shareholding or {}).get("quarterly_trend")),
         "recent_corporate_announcements": _recent_announcements(announcements),
         "data_freshness": {k: fresh.get(k) for k in ("financials_through", "bse_latest_quarter", "status", "message", "statements_source")},
-        "valuation_model": model,
+        "valuation_model": {k: v for k, v in model.items() if k != "price_derivation"},
     }
     return {"model": model, "dossier": dossier}
