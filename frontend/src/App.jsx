@@ -2140,6 +2140,8 @@ function ValuationModelPanel({ vm, m }) {
         </Panel>
       )}
 
+      <ReverseDcfPanel rd={vm.reverse_dcf} m={m} />
+
       <div>
         <SectionTitle sub={`What you would earn per year over ${vm.horizon_years} years if you bought at today's price (${fmtRs(vm.current_price)}), including the ${vm.dividend_yield_pct ?? 0}% dividend yield. Growth and exit P/E are haircuts of the company's own history — see assumptions below.`}>
           5-year return scenarios at today's price
@@ -2239,6 +2241,138 @@ function ValuationModelPanel({ vm, m }) {
   )
 }
 
+// ── Evidence check: every number the AI wrote is checked against the data it was given ──
+// Click a number to see where it came from; red = could not be traced. The check verifies
+// numbers only — it cannot verify judgement, or whether the data provider was right.
+const EvidenceContext = React.createContext(null)
+
+const EVIDENCE_STYLE = {
+  traced:     { color: '#22c55e', label: 'Traced to the data' },
+  value_only: { color: '#f59e0b', label: 'Matches a data value by number only' },
+  computed:   { color: '#22c55e', label: 'Calculated from the data' },
+  threshold:  { color: '#94a3b8', label: 'A level the AI suggests watching' },
+  unverified: { color: '#ef4444', label: 'Could not be traced' },
+}
+
+function EvidencePopover({ it }) {
+  const st = it.status === 'traced' && it.quality === 'value_only' ? 'value_only' : it.status
+  const meta = EVIDENCE_STYLE[st] || EVIDENCE_STYLE.unverified
+  return (
+    <span onClick={e => e.stopPropagation()} style={{ position:'absolute', zIndex:60, left:0, top:'1.5em', minWidth:230, maxWidth:340, padding:'8px 10px', borderRadius:8,
+      background:V('bg-secondary'), border:`1px solid ${V('border')}`, boxShadow:V('shadow-md'), fontSize:11, lineHeight:1.5, fontWeight:400, fontStyle:'normal', textAlign:'left', color:V('text-primary'), whiteSpace:'normal' }}>
+      <b style={{ color:meta.color }}>{meta.label}</b>
+      {it.status === 'traced' && (it.sources || []).map((src, i) => (
+        <div key={i} style={{ marginTop:3 }}>{src.label} = <b>{src.value}</b><div style={{ color:V('text-muted'), fontSize:10 }}>{src.path}</div></div>
+      ))}
+      {it.status === 'traced' && it.quality === 'value_only' && <div style={{ marginTop:4, color:V('text-muted') }}>The label is not clear from the sentence — check it means the same thing.</div>}
+      {it.status === 'computed' && <div style={{ marginTop:3 }}>{it.formula}</div>}
+      {it.status === 'threshold' && <div style={{ marginTop:3, color:V('text-muted') }}>The AI proposing a level to watch, not a claim about the data.</div>}
+      {it.status === 'unverified' && <div style={{ marginTop:3 }}>This number is not in, and does not follow from, the data the AI was given. Treat it with caution.</div>}
+    </span>
+  )
+}
+
+function Ev({ path, text }) {
+  const ctx = React.useContext(EvidenceContext)
+  const [open, setOpen] = useState(null)
+  const items = ctx?.byPath?.[path]
+  if (!text || !items || !items.length) return <>{text}</>
+  const nodes = []
+  let pos = 0
+  items.forEach((it, i) => {
+    if (it.start < pos || it.end > text.length) return
+    nodes.push(text.slice(pos, it.start))
+    const st = it.status === 'traced' && it.quality === 'value_only' ? 'value_only' : it.status
+    const color = (EVIDENCE_STYLE[st] || EVIDENCE_STYLE.unverified).color
+    const bad = it.status === 'unverified'
+    nodes.push(
+      <span key={i} onClick={e => { e.stopPropagation(); setOpen(open === i ? null : i) }}
+        style={{ position:'relative', cursor:'pointer', borderBottom: bad ? `2px solid ${color}` : `1px dotted ${color}`,
+                 background: bad ? 'color-mix(in srgb, #ef4444 14%, transparent)' : 'transparent' }}>
+        {text.slice(it.start, it.end)}
+        {open === i && <EvidencePopover it={it} />}
+      </span>
+    )
+    pos = it.end
+  })
+  nodes.push(text.slice(pos))
+  return <>{nodes}</>
+}
+
+function EvidenceBadge({ check }) {
+  if (!check) return null
+  const checked = check.total - check.threshold
+  const strong = check.traced + check.computed
+  const un = check.unverified
+  const color = un === 0 ? '#22c55e' : un <= 3 ? '#f59e0b' : '#ef4444'
+  const flagged = (check.items || []).filter(it => it.status === 'unverified' || (it.status === 'traced' && it.quality === 'value_only'))
+  return (
+    <details style={{ margin:'0 0 12px' }}>
+      <summary style={{ cursor:'pointer', fontSize:12, fontWeight:600, color }}>
+        {un === 0 ? '✓' : '⚠'} Evidence check: {strong} of {checked} figures traced to the data the AI was given
+        {check.value_only ? ` · ${check.value_only} match a data value by number only` : ''}{un ? ` · ${un} could not be traced (underlined red below)` : ''}
+      </summary>
+      <div style={{ marginTop:8, padding:'10px 12px', borderRadius:V('radius-md'), background:V('bg-tertiary'), border:`1px solid ${V('border-light')}`, fontSize:12, lineHeight:1.55, color:V('text-primary') }}>
+        <div><b>Click any number</b> in the analysis to see where it came from. {check.scope}</div>
+        {flagged.length > 0 && (
+          <div style={{ marginTop:8 }}>
+            <b>Worth a second look:</b>
+            <ul style={{ margin:'4px 0 0', paddingLeft:18 }}>
+              {flagged.slice(0, 12).map((it, i) => (
+                <li key={i} style={{ color: it.status === 'unverified' ? '#ef4444' : V('text-primary') }}>
+                  <b>{it.figure}</b> — {it.status === 'unverified' ? 'not found in the data' : 'matches a data value by number only'}: <span style={{ color:V('text-muted') }}>“…{it.context}…”</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </details>
+  )
+}
+
+const RDCF_META = {
+  demanding:   { label: 'Demanding',              color: '#ef4444' },
+  in_line:     { label: 'In line with its record', color: '#f59e0b' },
+  undemanding: { label: 'Undemanding',            color: '#22c55e' },
+  unknown:     { label: 'No record to compare',   color: '#94a3b8' },
+}
+
+// Reverse DCF: no forecast at all — solve for the growth today's price already requires.
+function ReverseDcfPanel({ rd, m }) {
+  if (!rd) return null
+  const meta = RDCF_META[rd.level] || RDCF_META.unknown
+  return (
+    <div>
+      <SectionTitle sub="Instead of forecasting, this works backwards from today's price: what earnings growth does the price already require? You decide whether that is plausible.">
+        What today's price already assumes <Chip color={meta.color}>{meta.label}</Chip>
+      </SectionTitle>
+      <Panel tint={meta.color}>
+        <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(3,1fr)', gap:10, marginBottom:10 }}>
+          <MetricBox label="Growth the price needs" value={`${rd.needed_growth_pct}%/yr`} sub={`to earn ${rd.target_pct}% a year over 5 years`} color={meta.color} />
+          <MetricBox label="The company achieved" value={rd.historical_growth_pct != null ? `${rd.historical_growth_pct}%/yr` : '—'} sub={rd.historical_source || 'no usable record'} />
+          <MetricBox label="Our base case assumes" value={`${rd.model_base_growth_pct}%/yr`} sub="a haircut of the record" />
+        </div>
+        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:10 }}>{rd.text}</div>
+        <div style={{ overflowX:'auto' }}>
+          <table style={{ width:'100%', borderCollapse:'collapse' }}>
+            <thead><tr><th style={DEBATE_TH}>Growth needed a year, if…</th><th style={DEBATE_TH}>to earn 9%</th><th style={DEBATE_TH}>to earn 12%</th><th style={DEBATE_TH}>to earn 15%</th></tr></thead>
+            <tbody>
+              {(rd.grid || []).map((g, i) => (
+                <tr key={i}>
+                  <td style={DEBATE_TD}>{g.label}</td>
+                  {['9', '12', '15'].map(t => <td key={t} style={{ ...DEBATE_TD, fontWeight:600 }}>{g.needed_growth_pct[t]}%</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ fontSize:11, color:V('text-muted'), lineHeight:1.5, marginTop:8 }}>{rd.caution}</div>
+      </Panel>
+    </div>
+  )
+}
+
 function DebateSide({ side, data, m }) {
   const isBull = side === 'bull'
   const c = isBull ? '#22c55e' : '#ef4444'
@@ -2246,28 +2380,28 @@ function DebateSide({ side, data, m }) {
   return (
     <Panel tint={c} style={{ display:'flex', flexDirection:'column', gap:10 }}>
       <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:c, fontWeight:700 }}>{isBull ? 'Bull case — for buying now' : 'Bear case — against buying now'}</div>
-      <div style={{ fontSize:13, fontWeight:600, color:V('text-primary'), lineHeight:1.45 }}>{o.thesis}</div>
+      <div style={{ fontSize:13, fontWeight:600, color:V('text-primary'), lineHeight:1.45 }}><Ev path={`${side}.opening.thesis`} text={o.thesis} /></div>
       {(o.arguments || []).map((a, i) => (
         <div key={i} style={{ borderLeft:`3px solid ${c}`, paddingLeft:10 }}>
-          <div style={{ fontSize:12, fontWeight:700, color:V('text-primary') }}>{i + 1}. {a.headline}</div>
-          <div style={{ fontSize:11, color:V('text-muted'), marginTop:3, lineHeight:1.5 }}><b>Evidence:</b> {a.evidence}</div>
-          <div style={{ fontSize:12, color:V('text-primary'), marginTop:3, lineHeight:1.5 }}>{a.why_it_matters}</div>
+          <div style={{ fontSize:12, fontWeight:700, color:V('text-primary') }}>{i + 1}. <Ev path={`${side}.opening.arguments[${i}].headline`} text={a.headline} /></div>
+          <div style={{ fontSize:11, color:V('text-muted'), marginTop:3, lineHeight:1.5 }}><b>Evidence:</b> <Ev path={`${side}.opening.arguments[${i}].evidence`} text={a.evidence} /></div>
+          <div style={{ fontSize:12, color:V('text-primary'), marginTop:3, lineHeight:1.5 }}><Ev path={`${side}.opening.arguments[${i}].why_it_matters`} text={a.why_it_matters} /></div>
         </div>
       ))}
-      <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>What must be true:</b> {o.what_must_be_true}</div>
-      <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>Own weak spot:</b> {o.own_weak_spot}</div>
-      <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>Would be proven wrong if:</b> {o.invalidation}</div>
+      <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>What must be true:</b> <Ev path={`${side}.opening.what_must_be_true`} text={o.what_must_be_true} /></div>
+      <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>Own weak spot:</b> <Ev path={`${side}.opening.own_weak_spot`} text={o.own_weak_spot} /></div>
+      <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>Would be proven wrong if:</b> <Ev path={`${side}.opening.invalidation`} text={o.invalidation} /></div>
 
       <div style={{ borderTop:`1px dashed ${V('border')}`, paddingTop:10, display:'flex', flexDirection:'column', gap:8 }}>
         <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:V('text-muted'), fontWeight:600 }}>Rebuttal to the {isBull ? 'bear' : 'bull'}</div>
         {(r?.rebuttals || []).map((x, i) => (
           <div key={i} style={{ fontSize:12, lineHeight:1.5 }}>
-            <div style={{ color:V('text-muted'), fontStyle:'italic' }}>“{x.their_point}”</div>
-            <div style={{ color:V('text-primary'), marginTop:3 }}>{x.your_response}</div>
-            <div style={{ color:V('text-muted'), marginTop:3 }}><b>Concedes:</b> {x.concession}</div>
+            <div style={{ color:V('text-muted'), fontStyle:'italic' }}>“<Ev path={`${side}.rebuttal.rebuttals[${i}].their_point`} text={x.their_point} />”</div>
+            <div style={{ color:V('text-primary'), marginTop:3 }}><Ev path={`${side}.rebuttal.rebuttals[${i}].your_response`} text={x.your_response} /></div>
+            <div style={{ color:V('text-muted'), marginTop:3 }}><b>Concedes:</b> <Ev path={`${side}.rebuttal.rebuttals[${i}].concession`} text={x.concession} /></div>
           </div>
         ))}
-        {r?.updated_position && <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>After the debate:</b> {r.updated_position}</div>}
+        {r?.updated_position && <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.5 }}><b>After the debate:</b> <Ev path={`${side}.rebuttal.updated_position`} text={r.updated_position} /></div>}
       </div>
     </Panel>
   )
@@ -2447,10 +2581,14 @@ function DeepDebateResult({ d, m }) {
     )
   }
 
+  const evByPath = {}
+  ;(d.evidence_check?.items || []).forEach(it => { (evByPath[it.path] = evByPath[it.path] || []).push(it) })
+  Object.values(evByPath).forEach(list => list.sort((x, y) => x.start - y.start))
   const j = d.judge || {}
   const stanceMeta = STANCE_META[j.final_stance] || { label: j.final_stance, color: '#94a3b8' }
   const winner = j.who_argued_better === 'bull' ? EDGE_META.bull : j.who_argued_better === 'bear' ? EDGE_META.bear : EDGE_META.even
   return (
+    <EvidenceContext.Provider value={{ byPath: evByPath }}>
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
       <Panel tint={stanceMeta.color}>
         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:8, marginBottom:8 }}>
@@ -2460,17 +2598,18 @@ function DeepDebateResult({ d, m }) {
             <Chip color="#94a3b8">{j.confidence} confidence</Chip>
           </div>
         </div>
-        <div style={{ fontSize:16, fontWeight:700, color:V('text-primary'), lineHeight:1.4, marginBottom:10 }}>{j.headline}</div>
-        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:8 }}>{j.stance_reasoning}</div>
-        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:8 }}><b>Today, tomorrow or wait?</b> {j.today_vs_wait}</div>
-        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55 }}><b>How to use the price levels:</b> {j.how_to_use_price_levels}</div>
+        <div style={{ fontSize:16, fontWeight:700, color:V('text-primary'), lineHeight:1.4, marginBottom:10 }}><Ev path="judge.headline" text={j.headline} /></div>
+        <EvidenceBadge check={d.evidence_check} />
+        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:8 }}><Ev path="judge.stance_reasoning" text={j.stance_reasoning} /></div>
+        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:8 }}><b>Today, tomorrow or wait?</b> <Ev path="judge.today_vs_wait" text={j.today_vs_wait} /></div>
+        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55 }}><b>How to use the price levels:</b> <Ev path="judge.how_to_use_price_levels" text={j.how_to_use_price_levels} /></div>
         {!d.low_reliability && <PriceReasoning vm={vm} />}
         {j.stance_adjusted && (
           <div style={{ fontSize:11, color:V('text-muted'), marginTop:8 }}>
             The judge moved the numeric baseline (“{STANCE_META[vm?.baseline_stance]?.label}”) by one step based on evidence beyond the model.
           </div>
         )}
-        {j.confidence_reason && <div style={{ fontSize:11, color:V('text-muted'), marginTop:6, fontStyle:'italic' }}>{j.confidence_reason}</div>}
+        {j.confidence_reason && <div style={{ fontSize:11, color:V('text-muted'), marginTop:6, fontStyle:'italic' }}><Ev path="judge.confidence_reason" text={j.confidence_reason} /></div>}
       </Panel>
 
       <ValuationModelPanel vm={vm} m={m} />
@@ -2497,7 +2636,7 @@ function DeepDebateResult({ d, m }) {
                   <tr key={i}>
                     <td style={{ ...DEBATE_TD, fontWeight:600, textTransform:'capitalize' }}>{s.issue}</td>
                     <td style={DEBATE_TD}><Chip color={e.color}>{e.label}</Chip></td>
-                    <td style={{ ...DEBATE_TD, lineHeight:1.5 }}>{s.why}</td>
+                    <td style={{ ...DEBATE_TD, lineHeight:1.5 }}><Ev path={`judge.scorecard[${i}].why`} text={s.why} /></td>
                   </tr>
                 )
               })}
@@ -2510,7 +2649,7 @@ function DeepDebateResult({ d, m }) {
         <Panel>
           <SectionTitle>What would change this view — check back on these</SectionTitle>
           <ul style={{ margin:0, paddingLeft:18, fontSize:12, color:V('text-primary'), lineHeight:1.6 }}>
-            {j.what_would_change_my_mind.map((x, i) => <li key={i}>{x}</li>)}
+            {j.what_would_change_my_mind.map((x, i) => <li key={i}><Ev path={`judge.what_would_change_my_mind[${i}]`} text={x} /></li>)}
           </ul>
         </Panel>
       )}
@@ -2521,7 +2660,7 @@ function DeepDebateResult({ d, m }) {
           {Object.entries(READ_LABELS).map(([k, label]) => (
             <Panel key={k}>
               <div style={{ fontSize:11, textTransform:'uppercase', letterSpacing:'0.06em', color:V('text-muted'), marginBottom:6 }}>{label}</div>
-              <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.55 }}>{d.reads?.[k]}</div>
+              <div style={{ fontSize:12, color:V('text-primary'), lineHeight:1.55 }}><Ev path={`reads.${k}`} text={d.reads?.[k]} /></div>
             </Panel>
           ))}
         </div>
@@ -2530,6 +2669,7 @@ function DeepDebateResult({ d, m }) {
       {d.data_freshness && <DataFreshness fresh={d.data_freshness} compact />}
       <div style={{ fontSize:11, color:V('text-muted'), textAlign:'center' }}>{d.disclaimer} · AI model: {d.model_name}</div>
     </div>
+    </EvidenceContext.Provider>
   )
 }
 

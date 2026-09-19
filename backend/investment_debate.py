@@ -29,6 +29,7 @@ from typing import Optional
 import requests
 
 import investment_valuation as valuation
+import investment_evidence as evidence
 
 logger = logging.getLogger(__name__)
 
@@ -354,7 +355,9 @@ def run_ipo_verdict(mechanics: dict, sentiment: dict, rhp_data: dict, scores: di
 _GROUNDING = (
     "You are given an evidence dossier (JSON) about one listed Indian company, including "
     "'valuation_model': a deterministic 5-year scenario model (bear/base/bull annual returns "
-    "if bought at today's price), an entry-price ladder, and a baseline stance. Rules: cite "
+    "if bought at today's price), an entry-price ladder, a baseline stance, and 'reverse_dcf' (the earnings "
+    "growth today's price already requires versus the company's own record — use it when judging whether "
+    "the price is demanding). Rules: cite "
     "specific figures from the dossier; NEVER invent a number, event, news item or price level "
     "that is not in it; if something is missing, say it is missing. Prices are in ₹; financial "
     "statement figures are ₹ crore. If valuation_model.reliability.level is 'low' or 'medium', "
@@ -576,7 +579,15 @@ def run_deep_debate(dossier: dict, valuation_model: dict, provider: str = "opena
             judge = _clamp_stance(judge, (valuation_model or {}).get("baseline_stance"))
         result = {"available": True, "provider": provider, "model_name": PROVIDERS[provider]["model"],
                   "reads": reads, "bull": bull, "bear": bear, "judge": judge, **base}
-        return valuation.scrub_withheld_prices(result, withheld) if low_rel else result
+        if low_rel:
+            result = valuation.scrub_withheld_prices(result, withheld)
+        # Check every figure the AI wrote against the evidence it was given (see investment_evidence).
+        # Never allowed to break an otherwise good analysis.
+        try:
+            result["evidence_check"] = evidence.check_output({k: result[k] for k in ("reads", "bull", "bear", "judge")}, dossier)
+        except Exception as e:
+            logger.warning(f"investment_debate: evidence check failed: {e}")
+        return result
     except DebateUnavailable as e:
         logger.warning(f"investment_debate: deep debate unavailable ({provider}): {e}")
         return {"available": False, "reason": str(e), **base}

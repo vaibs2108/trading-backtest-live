@@ -372,6 +372,57 @@ def _build_price_derivation(price, eps_ttm, g_base, g_hist, growth_source, scena
     }
 
 
+def _build_reverse_dcf(price, eps_ttm, current_pe, exit_base, div_yield, g_hist, growth_source, g_base) -> dict:
+    """Reverse DCF / expectations investing (Mauboussin & Rappaport): instead of forecasting,
+    start from today's price and solve for what it ALREADY assumes. The needed EPS growth is
+    the g that makes buying at today's price earn the target return:
+        price = EPS x (1+g)^5 x exit P/E / (1 + target - dividend yield)^5
+    It contains no forecast, so it cannot be 'wrong' the way a projection can — the user
+    judges for themselves whether that growth is plausible against the company's record."""
+    def needed(target, exit_pe):
+        return (price / (eps_ttm * exit_pe)) ** (1 / HORIZON_YEARS) * (1 + target - div_yield) - 1
+
+    cases = [("pe_holds", f"the P/E stays at today's {current_pe:.1f}x", current_pe)]
+    if abs(exit_base - current_pe) > 0.05:
+        cases.append(("pe_base", f"the P/E moves to {exit_base:.1f}x (the base-case assumption)", exit_base))
+    grid = [{"case": key, "label": label, "exit_pe": _r(pe),
+             "needed_growth_pct": {str(int(t * 100)): _r(needed(t, pe) * 100)
+                                    for t in (TARGET_UPPER_LIMIT, TARGET_FAIR_START, TARGET_ACCUMULATE)}}
+            for key, label, pe in cases]
+
+    g_need = needed(TARGET_FAIR_START, exit_base) * 100
+    g_hist_pct = g_hist * 100 if g_hist is not None else None
+    if g_need <= 0:
+        level = "undemanding"
+        text = (f"Buying at today's price would still earn 12% a year even if earnings shrank by {abs(g_need):.1f}% a year "
+                f"(with the P/E at {exit_base:.1f}x). The price is low relative to earnings — worth asking why the market expects so little.")
+    elif g_hist_pct is None:
+        level = "unknown"
+        text = f"To earn 12% a year from today's price, earnings must grow about {g_need:.1f}% a year for 5 years (P/E at {exit_base:.1f}x). The company has no usable growth record to compare against."
+    else:
+        gap = g_need - g_hist_pct
+        if gap > 3:
+            level = "demanding"
+            text = (f"To earn 12% a year from today's price, earnings must grow about {g_need:.1f}% a year for 5 years (P/E at {exit_base:.1f}x) — "
+                    f"more than the {g_hist_pct:.1f}% the company achieved ({growth_source}). The price already assumes better than its record.")
+        elif gap < -3:
+            level = "undemanding"
+            text = (f"To earn 12% a year from today's price, earnings need to grow only about {g_need:.1f}% a year for 5 years (P/E at {exit_base:.1f}x) — "
+                    f"less than the {g_hist_pct:.1f}% the company achieved ({growth_source}). The price does not need its past growth to continue in full.")
+        else:
+            level = "in_line"
+            text = (f"To earn 12% a year from today's price, earnings must grow about {g_need:.1f}% a year for 5 years (P/E at {exit_base:.1f}x) — "
+                    f"about what the company achieved ({g_hist_pct:.1f}%, {growth_source}). The price assumes its record repeats, leaving little room for slowing.")
+    if g_need > 25:
+        text += " That is above the 25% ceiling this model uses even for its bull case."
+    return {
+        "target_pct": 12, "exit_pe_used": _r(exit_base), "needed_growth_pct": _r(g_need),
+        "historical_growth_pct": _r(g_hist_pct) if g_hist_pct is not None else None, "historical_source": growth_source,
+        "model_base_growth_pct": _r(g_base * 100), "level": level, "text": text, "grid": grid,
+        "caution": "Long-run earnings growth persists only weakly (Chan, Karceski & Lakonishok, 2003), so a company's own record is a generous yardstick, not a forecast.",
+    }
+
+
 def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct, growth_source,
                           div_yield_pct, quality_flags, reliability=None, industry_pe_weak=False) -> dict:
     if not price or not eps_ttm or eps_ttm <= 0:
@@ -457,9 +508,11 @@ def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct,
     price_derivation = _build_price_derivation(price, eps_ttm, g_base, g_hist, growth_source, scenarios, ladder,
                                                bear_safe, div_yield, hist_median, industry_pe, industry_used, anchor_pe,
                                                current_pe, exit_base, v_base, v_bear, v_bull)
+    reverse_dcf = _build_reverse_dcf(price, eps_ttm, current_pe, exit_base, div_yield, g_hist, growth_source, g_base)
     return {
         "available": True,
         "reliability": reliability,
+        "reverse_dcf": reverse_dcf,
         "price_derivation": price_derivation,
         "stance_capped_for_low_reliability": capped_for_reliability,
         "horizon_years": HORIZON_YEARS,
