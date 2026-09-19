@@ -12,9 +12,11 @@ is referenced from the rest of the app is a single additive
 existing is modified to add that line, and removing it (plus this file)
 fully removes the feature with zero trace elsewhere.
 """
+import json
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -29,6 +31,7 @@ import investment_freshness as freshness
 import investment_search as inv_search
 import ipo_sentiment_client as ipo_sentiment
 import rhp_extractor
+import investment_backtest as backtest
 
 logger = logging.getLogger(__name__)
 
@@ -408,6 +411,24 @@ def _data_quality(overview: dict, built: Optional[dict]) -> Optional[dict]:
     return None
 
 
+_BACKTEST_PATH = Path(__file__).parent / "data" / "investment" / "backtest_results.json"
+
+
+def _backtest_results() -> Optional[dict]:
+    try:
+        return json.loads(_BACKTEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+@router.get("/model-track-record")
+def get_model_track_record():
+    """Results of the offline back-test of the price-vs-value model (investment_backtest.py).
+    Static until the back-test is re-run; a missing file just means it has not been run yet."""
+    res = _backtest_results()
+    return {"available": True, **res} if res else {"available": False}
+
+
 @router.get("/equity/{symbol}/debate")
 def get_debate(symbol: str):
     """On-demand AI analyst debate — deliberately NOT included in /full,
@@ -428,7 +449,13 @@ def get_debate(symbol: str):
     # gpt-4.1 ("openai_deep") for this on-demand, single-stock path — a multi-round
     # debate needs a much stronger model than the cheap default. Groq stays the
     # module default, reserved for the Scanner's future bulk shortlist runs.
-    return debate.run_deep_debate(built["dossier"], built["model"], provider="openai_deep")
+    dossier = built["dossier"]
+    if dossier and (built["model"].get("reliability") or {}).get("level") != "low":
+        res = _backtest_results()      # lets the AI calibrate its confidence against how this model has really performed
+        digest = backtest.track_record_for_ai(res) if res else None
+        if digest:
+            dossier["model_track_record"] = digest
+    return debate.run_deep_debate(dossier, built["model"], provider="openai_deep")
 
 
 @router.get("/equity/{symbol}/full")

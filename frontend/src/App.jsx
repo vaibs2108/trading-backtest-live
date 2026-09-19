@@ -2140,6 +2140,8 @@ function ValuationModelPanel({ vm, m }) {
         </Panel>
       )}
 
+      <FairValuePanel fv={vm.fair_value} price={vm.current_price} m={m} />
+
       <ReverseDcfPanel rd={vm.reverse_dcf} m={m} />
 
       <div>
@@ -2226,6 +2228,10 @@ function ValuationModelPanel({ vm, m }) {
         </div>
       </div>
       )}
+
+      <WaitingEvidencePanel we={vm.waiting_evidence} m={m} />
+
+      <TrackRecordPanel m={m} />
 
       <details>
         <summary style={{ cursor:'pointer', fontSize:12, fontWeight:600, color:'#6366f1' }}>Assumptions behind these numbers</summary>
@@ -2331,6 +2337,60 @@ function EvidenceBadge({ check }) {
   )
 }
 
+const FV_AGREEMENT = {
+  strong:   { label: 'Methods agree',          color: '#22c55e' },
+  moderate: { label: 'Methods partly agree',   color: '#f59e0b' },
+  weak:     { label: 'Methods disagree widely', color: '#ef4444' },
+  limited:  { label: 'Only two methods',       color: '#94a3b8' },
+}
+const FV_POSITION = { above: { label: 'Price is above fair value', color: '#ef4444' }, inside: { label: 'Price is inside fair value', color: '#f59e0b' }, below: { label: 'Price is below fair value', color: '#22c55e' } }
+
+// What is it worth? Four independent methods drawn on one price axis, with today's price marked.
+function FairValuePanel({ fv, price, m }) {
+  if (!fv || !fv.available) return null
+  const ag = FV_AGREEMENT[fv.agreement] || FV_AGREEMENT.limited
+  const pos = FV_POSITION[fv.price_position] || FV_POSITION.inside
+  const lo = Math.min(price, ...fv.methods.map(x => x.low)) * 0.94
+  const hi = Math.max(price, ...fv.methods.map(x => x.high)) * 1.04
+  const at = v => `${((v - lo) / (hi - lo)) * 100}%`
+  const verdictColor = { above: '#ef4444', inside: '#f59e0b', below: '#22c55e' }
+  return (
+    <div>
+      <SectionTitle sub="One method is one opinion. Here the stock is valued four independent ways; when they land in the same place that means something, and when they scatter the honest answer is a wide range.">
+        What is it worth? <Chip color={ag.color}>{ag.label}</Chip>
+      </SectionTitle>
+      <Panel tint={pos.color}>
+        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:12 }}><b style={{ color:pos.color }}>{pos.label}.</b> {fv.text}</div>
+        <div style={{ position:'relative', margin:'0 4px' }}>
+          <div style={{ position:'absolute', top:0, bottom:0, left:at(fv.zone_low), width:`calc(${at(fv.zone_high)} - ${at(fv.zone_low)})`, background:'color-mix(in srgb, #3b82f6 12%, transparent)', borderLeft:'1px dashed #3b82f6', borderRight:'1px dashed #3b82f6' }} />
+          <div style={{ position:'absolute', top:0, bottom:0, left:at(price), borderLeft:'2px solid #ef4444', zIndex:2 }}>
+            <span style={{ position:'absolute', top:-16, left:-30, fontSize:10, fontWeight:700, color:'#ef4444', whiteSpace:'nowrap' }}>Price {fmtRs(price)}</span>
+          </div>
+          {fv.methods.map(x => (
+            <div key={x.key} style={{ position:'relative', display:'grid', gridTemplateColumns: m ? '1fr' : '150px 1fr', alignItems:'center', gap:m ? 2 : 8, padding:'7px 0' }}>
+              <div style={{ fontSize:12, fontWeight:600, color:V('text-primary') }}>{x.label}</div>
+              <div style={{ position:'relative', height:22 }}>
+                <div style={{ position:'absolute', top:8, height:6, left:at(x.low), width:`calc(${at(x.high)} - ${at(x.low)})`, borderRadius:3, background:verdictColor[x.price_vs_zone], opacity:0.55 }} />
+                <div style={{ position:'absolute', top:3, height:16, left:at(x.mid), borderLeft:`2px solid ${V('text-primary')}` }} />
+                <span style={{ position:'absolute', top:-2, left:at(x.low), fontSize:9, color:V('text-muted'), transform:'translateX(-100%)', paddingRight:3, whiteSpace:'nowrap' }}>{fmtRs(x.low)}</span>
+                <span style={{ position:'absolute', top:-2, left:at(x.high), fontSize:9, color:V('text-muted'), paddingLeft:3, whiteSpace:'nowrap' }}>{fmtRs(x.high)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ fontSize:11, color:V('text-muted'), marginTop:6 }}>Bar = each method's fair range, tick = its middle; green = price below the range (cheap on that method), amber = inside, red = above. Blue band = the consensus zone ({fmtRs(fv.zone_low)} to {fmtRs(fv.zone_high)}).</div>
+        <details style={{ marginTop:8 }}>
+          <summary style={{ cursor:'pointer', fontSize:12, color:V('text-secondary') }}>How each method works</summary>
+          <ul style={{ margin:'6px 0 0', paddingLeft:18, fontSize:12, lineHeight:1.55, color:V('text-primary') }}>
+            {fv.methods.map(x => <li key={x.key}><b>{x.label}:</b> {x.basis}</li>)}
+          </ul>
+        </details>
+        <div style={{ fontSize:11, color:V('text-muted'), lineHeight:1.5, marginTop:8 }}>{fv.caution}</div>
+      </Panel>
+    </div>
+  )
+}
+
 const RDCF_META = {
   demanding:   { label: 'Demanding',              color: '#ef4444' },
   in_line:     { label: 'In line with its record', color: '#f59e0b' },
@@ -2339,6 +2399,108 @@ const RDCF_META = {
 }
 
 // Reverse DCF: no forecast at all — solve for the growth today's price already requires.
+// Evidence for "should I wait?": how often this stock's own history dipped, and whether waiting paid.
+function WaitingEvidencePanel({ we, m }) {
+  if (!we || !we.available) return null
+  const pctCell = v => (v == null ? '—' : `${v}%`)
+  return (
+    <div>
+      <SectionTitle sub="Advice to 'wait for a dip' is only useful if such a dip tends to happen, and only worth it if waiting doesn't cost more than it saves. This measures both on this stock's own price history.">
+        Does waiting for a lower price pay?
+      </SectionTitle>
+      <Panel>
+        {we.verdict_label && <div style={{ fontSize:13, fontWeight:700, marginBottom:6, color: we.verdict === 'favours_waiting' ? '#22c55e' : we.verdict === 'against_waiting' ? '#ef4444' : '#f59e0b' }}>{we.verdict_label}</div>}
+        <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:10 }}>{we.text}</div>
+        <div style={{ overflowX:'auto' }}>
+          <table style={{ width:'100%', borderCollapse:'collapse', minWidth: m ? 620 : 0 }}>
+            <thead>
+              <tr>
+                <th style={DEBATE_TH}>If you wait for…</th>
+                <th style={DEBATE_TH}>Reached within 3 / 6 / 12 months</th>
+                <th style={DEBATE_TH}>Typical wait</th>
+                <th style={DEBATE_TH}>Waiting beat buying now</th>
+                <th style={DEBATE_TH}>2-yr return: now vs waiting</th>
+              </tr>
+            </thead>
+            <tbody>
+              {we.rows.map((r, i) => {
+                const w = r.wait_vs_buy_now_2y
+                return (
+                  <tr key={i}>
+                    <td style={DEBATE_TD}><b>{fmtRs(r.price)}</b> <span style={{ color:V('text-muted') }}>({r.drop_pct}% lower)</span><div style={{ fontSize:10, color:V('text-muted') }}>{r.label}</div></td>
+                    <td style={DEBATE_TD}>{pctCell(r.history_touch_pct['3m'])} / {pctCell(r.history_touch_pct['6m'])} / <b>{pctCell(r.history_touch_pct['12m'])}</b></td>
+                    <td style={DEBATE_TD}>{r.median_weeks_to_reach_when_it_did != null ? `${r.median_weeks_to_reach_when_it_did} weeks` : '—'}</td>
+                    <td style={DEBATE_TD}>{w ? <b style={{ color: w.waiting_beat_buying_now_pct >= 50 ? '#22c55e' : '#ef4444' }}>{w.waiting_beat_buying_now_pct}%</b> : '—'}{w && <div style={{ fontSize:10, color:V('text-muted') }}>order filled {w.order_filled_pct}%</div>}</td>
+                    <td style={DEBATE_TD}>{w ? `${w.avg_price_return_buy_now_pct}% vs ${w.avg_price_return_wait_pct}%` : '—'}</td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ fontSize:11, color:V('text-muted'), lineHeight:1.5, marginTop:8 }}>
+          How it is measured: for every starting week in {we.history_years} years of prices, did the price fall to the level within 3, 6 or 12 months? "Waiting" = leave a buy order at that level for up to a year, buy anyway at the one-year mark if it never filled, and compare the 2-year price return with buying on the starting week. {we.caution}
+        </div>
+      </Panel>
+    </div>
+  )
+}
+
+const STANCE_NAMES = { accumulate_now: 'Accumulate now', start_small_and_stagger: 'Start small, add on dips', wait_for_better_price: 'Wait for a dip', avoid_for_now: 'Avoid for now' }
+const FV_POS_NAMES = { below: 'Priced below the fair-value zone', inside: 'Priced inside it', above: 'Priced above it' }
+
+// How well has this method actually worked? Loaded on demand from the offline back-test.
+function TrackRecordPanel({ m }) {
+  const [tr, setTr] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const load = () => {
+    if (tr || loading) return
+    setLoading(true)
+    fetch('/api/investment/model-track-record').then(r => r.json()).then(setTr).catch(() => setTr({ available: false })).finally(() => setLoading(false))
+  }
+  const h = tr?.available ? tr.horizons?.['3y'] : null
+  const table = (title, rows, names) => (
+    <div style={{ marginTop:10, overflowX:'auto' }}>
+      <div style={{ fontSize:11, fontWeight:700, color:V('text-secondary'), marginBottom:4 }}>{title}</div>
+      <table style={{ width:'100%', borderCollapse:'collapse' }}>
+        <thead><tr><th style={DEBATE_TH}>Group</th><th style={DEBATE_TH}>Cases</th><th style={DEBATE_TH}>Avg return a year</th><th style={DEBATE_TH}>Beat the typical stock</th></tr></thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.bucket}><td style={DEBATE_TD}>{names[r.bucket] || r.bucket}</td><td style={DEBATE_TD}>{r.n}</td><td style={DEBATE_TD}>{r.mean_return_pct}%</td>
+              <td style={DEBATE_TD}><b style={{ color: r.beat_median_stock_pct >= 55 ? '#22c55e' : r.beat_median_stock_pct <= 45 ? '#ef4444' : V('text-primary') }}>{r.beat_median_stock_pct}%</b></td></tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+  return (
+    <details onToggle={e => { if (e.target.open) load() }}>
+      <summary style={{ cursor:'pointer', fontSize:12, fontWeight:600, color:'#6366f1' }}>How well has this method worked in the past? (back-test)</summary>
+      <div style={{ marginTop:8 }}>
+        {loading && <div style={{ fontSize:12, color:V('text-muted') }}>Loading…</div>}
+        {tr && !tr.available && <div style={{ fontSize:12, color:V('text-muted') }}>The back-test has not been run yet.</div>}
+        {h && (
+          <Panel>
+            <div style={{ fontSize:12, color:V('text-muted'), marginBottom:8 }}>
+              The same model was re-run on {tr.universe.stocks} large Indian companies at {tr.as_of_dates[0]} … {tr.as_of_dates[1]}, using only what was knowable on each date, and compared with what the stocks actually returned afterwards ({h.observations} cases at the 3-year horizon).
+            </div>
+            <ul style={{ margin:0, paddingLeft:18, fontSize:13, lineHeight:1.6, color:V('text-primary') }}>
+              {(tr.findings || []).map((f, i) => <li key={i} style={{ marginBottom:6 }}>{f}</li>)}
+            </ul>
+            {table('3-year outcomes by the model’s stance', h.by_stance, STANCE_NAMES)}
+            {table('3-year outcomes by where the price sat against the fair-value zone', h.by_fair_value_position, FV_POS_NAMES)}
+            <div style={{ marginTop:10, fontSize:11, color:V('text-muted'), lineHeight:1.55 }}>
+              <b>Limits of this test:</b>
+              <ul style={{ margin:'4px 0 0', paddingLeft:18 }}>{(tr.limits || []).map((l, i) => <li key={i}>{l}</li>)}</ul>
+              <div style={{ marginTop:4 }}>Not yet validated: whether "the methods agree" predicts anything (the small samples were inconsistent), and the reverse-DCF "demanding / undemanding" label beyond the same cheap-versus-dear signal. Run {tr.generated_at?.slice(0, 10)}.</div>
+            </div>
+          </Panel>
+        )}
+      </div>
+    </details>
+  )
+}
+
 function ReverseDcfPanel({ rd, m }) {
   if (!rd) return null
   const meta = RDCF_META[rd.level] || RDCF_META.unknown

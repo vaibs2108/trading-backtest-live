@@ -357,7 +357,14 @@ _GROUNDING = (
     "'valuation_model': a deterministic 5-year scenario model (bear/base/bull annual returns "
     "if bought at today's price), an entry-price ladder, a baseline stance, and 'reverse_dcf' (the earnings "
     "growth today's price already requires versus the company's own record — use it when judging whether "
-    "the price is demanding). Rules: cite "
+    "the price is demanding), and 'fair_value' (what the stock is worth judged four independent ways, a "
+    "consensus zone, and an 'agreement' grade — say so plainly when the methods disagree, and never present "
+    "the zone's middle as a precise value), and 'waiting_evidence' (how often this stock's own history fell by X% "
+    "within 3/6/12 months and how waiting for a dip compared with buying at once over 2 years — use it to answer "
+    "'should I wait', cite it, and say plainly that the windows overlap and the sample is one stock's history), and "
+    "'model_track_record' (a back-test of this very model — use it to calibrate your confidence: the 9/12/15% levels rank "
+    "stocks, they are not forecasts, so never present them as promised returns, and mention the model's track record "
+    "where it bears on how much weight the price levels deserve). Rules: cite "
     "specific figures from the dossier; NEVER invent a number, event, news item or price level "
     "that is not in it; if something is missing, say it is missing. Prices are in ₹; financial "
     "statement figures are ₹ crore. If valuation_model.reliability.level is 'low' or 'medium', "
@@ -496,7 +503,12 @@ def _run_judge(dossier: dict, reads: dict, bull: dict, bear: dict, provider: str
         "debate points) that the numeric model does not capture. Be direct - the investor needs an answer, "
         "not hedging. Be honest that no one can predict tomorrow's price: timing within days is noise, and "
         "what a disciplined investor controls is the PRICE PAID relative to value and how capital is staged. "
-        "Use ONLY price levels from valuation_model (entry_ladder, bear_case_safe_price, tranche_plan) - "
+        "Use ONLY price levels from valuation_model (entry_ladder, bear_case_safe_price, tranche_plan, fair_value) - "
+        "WAITING: quote valuation_model.waiting_evidence.verdict_label. If the verdict is 'against_waiting' or 'mixed' you must say "
+        "history does not clearly support waiting, that any case for waiting rests on valuation alone, and what missing out would cost "
+        "(avg_rise_missed_when_order_never_filled_pct); never describe the waiting evidence as supporting patience unless the verdict is 'favours_waiting'. "
+        "FAIR VALUE: state fair_value.agreement; if it is 'weak' or 'moderate' say the methods only partly agree and do not write that they agree. "
+        "Mention model_track_record in confidence_reason: how often this model's stance has beaten the typical stock and that its levels are not forecasts. "
         "never invent a level. EXCEPTION: if valuation_model.reliability.level is 'low', the model's inputs "
         "are too unreliable to support entry prices — do NOT name any price as a recommended entry in the "
         "headline, today_vs_wait or how_to_use_price_levels; say plainly that the price levels are indicative "
@@ -510,7 +522,7 @@ def _run_judge(dossier: dict, reads: dict, bull: dict, bear: dict, provider: str
         '"today_vs_wait": "2-4 sentences answering: invest today, tomorrow, or wait - and why", '
         '"how_to_use_price_levels": "2-3 plain-language sentences on how to use the tranche plan and ladder", '
         '"what_would_change_my_mind": ["3-4 specific observable triggers: price levels from the model, quarterly-result thresholds, shareholding or promoter events"], '
-        '"confidence": "low"|"medium"|"high", "confidence_reason": "one sentence (mention model reliability)"}'
+        '"confidence": "low"|"medium"|"high", "confidence_reason": "one sentence: model reliability, the fair-value agreement grade, and that the back-test supports ranking stocks, not precise price levels - never call the price levels well supported"}'
     )
     prompt = (f"Dossier:\n{_dossier_json(dossier)}\n\nAnalyst reads:\n{_j(reads)}\n\n"
               f"BULL case:\n{_j(bull)}\n\nBEAR case:\n{_j(bear)}")

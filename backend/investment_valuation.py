@@ -29,6 +29,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from investment_scores import _real_fiscal_years
+import investment_timing as timing
 
 HORIZON_YEARS = 5
 TARGET_ACCUMULATE = 0.15
@@ -423,8 +424,80 @@ def _build_reverse_dcf(price, eps_ttm, current_pe, exit_base, div_yield, g_hist,
     }
 
 
+FCF_REQUIRED_RETURN = 0.12
+FCF_GROWTH_CAP = 0.06
+INDUSTRY_PE_BAND = 0.15
+
+
+def _build_fair_value(price, eps_ttm, ladder, hist_pe, industry_pe, industry_pe_weak, g_base, fcf_per_share, div_yield) -> dict:
+    """What is this stock worth today? Answered four independent ways, each a
+    zone (low - mid - high). One method is one opinion; when several
+    unrelated methods land in the same place that is worth something, and when
+    they scatter the honest answer is 'nobody knows within a wide range'.
+
+      1. Growth-return model  - the prices at which our own 5-year model earns 15% / 12% / 9% a year.
+      2. Own-history P/E      - trailing EPS x the stock's own 25th / median / 75th percentile P/E.
+      3. Industry P/E         - trailing EPS x the industry P/E, +/-15% (a real industry P/E only).
+      4. Cash-flow value      - 3-year average free cash flow per share, capitalised at a 12% required
+                                return (11-13%), growth capped at 6%. Not used for banks/financials.
+    The zone that summarises them is the median of the methods' lows, mids and highs, so one wild
+    method cannot drag it."""
+    methods = []
+
+    def add(key, label, low, mid, high, basis):
+        if None in (low, mid, high) or not (0 < low <= mid <= high):
+            return
+        methods.append({"key": key, "label": label, "low": _r(low, 0), "mid": _r(mid, 0), "high": _r(high, 0), "basis": basis,
+                        "price_vs_zone": "above" if price > high else "below" if price < low else "inside"})
+
+    by_target = {l["target_return_pct_pa"]: l["price"] for l in (ladder or [])}
+    if all(k in by_target for k in (15.0, 12.0, 9.0)):
+        add("growth_model", "Growth-return model", by_target[15.0], by_target[12.0], by_target[9.0],
+            "prices at which the base case earns 15% / 12% / 9% a year over 5 years")
+    if hist_pe and hist_pe.get("available"):
+        add("own_history_pe", "Own-history P/E", eps_ttm * hist_pe["p25"], eps_ttm * hist_pe["median"], eps_ttm * hist_pe["p75"],
+            f"trailing EPS Rs{eps_ttm:.1f} x its own P/E history (25th {hist_pe['p25']}, median {hist_pe['median']}, 75th {hist_pe['p75']})")
+    if industry_pe and not industry_pe_weak:
+        add("industry_pe", "Industry P/E", eps_ttm * industry_pe * (1 - INDUSTRY_PE_BAND), eps_ttm * industry_pe, eps_ttm * industry_pe * (1 + INDUSTRY_PE_BAND),
+            f"trailing EPS Rs{eps_ttm:.1f} x industry P/E {industry_pe:.1f}, +/-{int(INDUSTRY_PE_BAND * 100)}%")
+    if fcf_per_share and fcf_per_share > 0:
+        g = _clamp(g_base, 0.0, FCF_GROWTH_CAP)
+
+        def cap(r):
+            return fcf_per_share * (1 + g) / (r - g)
+        add("cash_flow", "Cash-flow value", cap(FCF_REQUIRED_RETURN + 0.01), cap(FCF_REQUIRED_RETURN), cap(FCF_REQUIRED_RETURN - 0.01),
+            f"3-year average free cash flow Rs{fcf_per_share:.1f} a share, growing {g * 100:.0f}% a year, valued at a 12% required return (11-13%)")
+
+    if len(methods) < 2:
+        return {"available": False, "reason": "fewer than two independent valuation methods have enough data for this company"}
+
+    mids = [m["mid"] for m in methods]
+    centre = _median(mids)
+    zone_low, zone_high = _median([m["low"] for m in methods]), _median([m["high"] for m in methods])
+    spread = (max(mids) - min(mids)) / centre * 100
+    n = len(methods)
+    agreement = "limited" if n < 3 else "strong" if spread <= 25 else "moderate" if spread <= 50 else "weak"
+    counts = {k: sum(1 for m in methods if m["price_vs_zone"] == k) for k in ("above", "inside", "below")}
+    premium = (price - centre) / centre * 100
+    where = "above" if price > zone_high else "below" if price < zone_low else "inside"
+    verdict = {"above": "above the fair-value zone", "inside": "inside the fair-value zone", "below": "below the fair-value zone"}[where]
+    agree_text = {"strong": "The methods largely agree, so the zone is reasonably firm.",
+                  "moderate": "The methods only partly agree, so treat the zone as a wide range, not a point.",
+                  "weak": "The methods disagree widely - nobody can say precisely what this stock is worth; do not lean on a single number.",
+                  "limited": "Only two methods had enough data, so this is a thin cross-check."}[agreement]
+    text = (f"Today's price of Rs{price:,.0f} is {verdict} (Rs{zone_low:,.0f} to Rs{zone_high:,.0f}, middle Rs{centre:,.0f}; the price is "
+            f"{abs(premium):.0f}% {'above' if premium >= 0 else 'below'} the middle). {counts['above']} of {n} methods put the price above their fair range, "
+            f"{counts['inside']} inside, {counts['below']} below. {agree_text}")
+    return {"available": True, "methods": methods, "zone_low": _r(zone_low, 0), "zone_mid": _r(centre, 0), "zone_high": _r(zone_high, 0),
+            "price_position": where, "price_vs_mid_pct": _r(premium), "spread_of_methods_pct": _r(spread, 0), "agreement": agreement,
+            "methods_above": counts["above"], "methods_inside": counts["inside"], "methods_below": counts["below"], "method_count": n,
+            "text": text,
+            "caution": "Every method here is built from the past (trailing earnings, past multiples, past cash flow). Agreement between them "
+                       "shows the past tells a consistent story; it does not make the future certain."}
+
+
 def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct, growth_source,
-                          div_yield_pct, quality_flags, reliability=None, industry_pe_weak=False) -> dict:
+                          div_yield_pct, quality_flags, reliability=None, industry_pe_weak=False, fcf_per_share=None) -> dict:
     if not price or not eps_ttm or eps_ttm <= 0:
         return {"available": False, "reason_code": "no_positive_earnings",
                 "reason": "This company has no positive trailing earnings (it is loss-making, or earnings data is missing), so a P/E-based price-vs-value analysis is not meaningful."}
@@ -509,10 +582,12 @@ def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct,
                                                bear_safe, div_yield, hist_median, industry_pe, industry_used, anchor_pe,
                                                current_pe, exit_base, v_base, v_bear, v_bull)
     reverse_dcf = _build_reverse_dcf(price, eps_ttm, current_pe, exit_base, div_yield, g_hist, growth_source, g_base)
+    fair_value = _build_fair_value(price, eps_ttm, ladder, hist_pe, industry_pe, industry_pe_weak, g_base, fcf_per_share, div_yield)
     return {
         "available": True,
         "reliability": reliability,
         "reverse_dcf": reverse_dcf,
+        "fair_value": fair_value,
         "price_derivation": price_derivation,
         "stance_capped_for_low_reliability": capped_for_reliability,
         "horizon_years": HORIZON_YEARS,
@@ -559,6 +634,12 @@ def redact_for_low_reliability(model: dict):
         add(t.get("price"))
     for sc in ((model or {}).get("scenarios") or {}).values():
         add(sc.get("value_in_5y"))
+    fv = (model or {}).get("fair_value") or {}
+    for k in ("zone_low", "zone_mid", "zone_high"):
+        add(fv.get(k))
+    for mth in fv.get("methods") or []:
+        for k in ("low", "mid", "high"):
+            add(mth.get(k))
 
     public = {
         "available": True, "levels_withheld": True,
@@ -651,6 +732,17 @@ def _recent_announcements(anns: list, limit: int = 14) -> list:
     return out
 
 
+def _fcf_per_share(profile: dict) -> Optional[float]:
+    """Average free cash flow per share over the last 3 fiscal years. Shares are not in the
+    statements, so they are recovered as net income / EPS for each year (both in the same unit)."""
+    vals = []
+    for h in (profile or {}).get("history_last_6_fy", [])[-3:]:
+        ni, eps, fcf = h.get("net_income"), h.get("eps"), h.get("free_cash_flow")
+        if ni and eps and fcf is not None and eps > 0 and ni > 0:
+            vals.append(fcf / (ni / eps))
+    return sum(vals) / len(vals) if len(vals) >= 2 else None
+
+
 def compute_all(overview: dict, financials: dict, shareholding: dict, price_summary: dict,
                 tt_info: dict, price_hist: list, announcements: list, peers: list) -> dict:
     """Returns {"model": ..., "dossier": ...}. `model` is shown to the user as
@@ -723,8 +815,21 @@ def compute_all(overview: dict, financials: dict, shareholding: dict, price_summ
             f"while BSE already shows {fresh.get('bse_latest_quarter')} — one quarter out of date")
         if reliability["level"] == "high":
             reliability["level"] = "medium"
+    fcf_ps = None if is_financial else _fcf_per_share(profile)
     model = build_valuation_model(price, eps_ttm, industry_pe, hist_pe, g_pct, g_src,
-                                  _f(ratios.get("divYield")), quality_flags, reliability, industry_pe_weak)
+                                  _f(ratios.get("divYield")), quality_flags, reliability, industry_pe_weak, fcf_ps)
+
+    if model.get("available"):
+        levels = [(l["name"], l["price"]) for l in model.get("entry_ladder") or []]
+        if model.get("bear_case_safe_price"):
+            levels.append(("Bear-case safe price", model["bear_case_safe_price"]["price"]))
+        fvz = model.get("fair_value") or {}
+        if fvz.get("available"):
+            levels.append(("Bottom of the fair-value zone", fvz["zone_low"]))
+        try:
+            model["waiting_evidence"] = timing.build_waiting_evidence(price_hist, price, levels)
+        except Exception:
+            model["waiting_evidence"] = {"available": False, "reason": "could not be computed"}
 
     failed_checks = [k for k, v in (piotroski.get("checks") or {}).items() if v is False]
     high, low = _f(ratios.get("52wHigh")), _f(ratios.get("52wLow"))
