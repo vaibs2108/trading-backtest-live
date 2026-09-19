@@ -36,6 +36,11 @@ TARGET_ACCUMULATE = 0.15
 TARGET_FAIR_START = 0.12
 TARGET_UPPER_LIMIT = 0.09
 BEAR_FLOOR_RETURN = 0.06
+# Past EPS growth predicted future returns only weakly in the back-test (investment_backtest*.py) and a 50% pull
+# toward a long-run rate ranked stocks better for non-financial companies on 92% of test dates. Financials are
+# left on the plain rule: for them growth carried real signal and ignoring it made the ranking worse.
+LONG_RUN_GROWTH = 0.10
+GROWTH_FADE_NON_FINANCIAL = 0.5
 
 STANCES = ["accumulate_now", "start_small_and_stagger", "wait_for_better_price", "avoid_for_now"]
 STANCE_LABELS = {
@@ -286,15 +291,22 @@ def _nice_price(x: float) -> float:
     return float(round(x / step) * step)
 
 
-def _explain_growth(g_hist, g_base, source) -> str:
+def _explain_growth(g_hist, g_base, source, g_model=None) -> str:
     if g_hist < 0:
         return (f"Historical EPS growth was negative ({g_hist * 100:.1f}%/yr), so the base case assumes only a modest "
                 f"{g_base * 100:.0f}% a year recovery.")
-    raw = 0.75 * g_hist
+    g_model = g_hist if g_model is None else g_model
+    faded = abs(g_model - g_hist) > 1e-9
+    lead = ""
+    if faded:
+        lead = (f"The company's EPS grew {g_hist * 100:.1f}% a year historically ({source}). Past growth has predicted the future only weakly in back-tests, "
+                f"so it is pulled halfway toward a long-run {LONG_RUN_GROWTH * 100:.0f}%, giving {g_model * 100:.1f}%. ")
+    src = "the blended rate" if faded else f"the {g_hist * 100:.1f}% the company achieved historically ({source})"
+    raw = 0.75 * g_model
     if abs(raw - g_base) < 1e-9:
-        return f"Base-case growth is {g_base * 100:.1f}% a year: 75% of the {g_hist * 100:.1f}% the company achieved historically ({source}), a deliberate haircut."
-    return (f"75% of the {g_hist * 100:.1f}% historical growth ({source}) would be {raw * 100:.1f}%, held to {g_base * 100:.1f}% a year "
-            f"so the projection stays within a plausible range.")
+        return f"{lead}Base-case growth is {g_base * 100:.1f}% a year: 75% of {src}, a deliberate haircut."
+    return (f"{lead}75% of {'the blended rate' if faded else f'the {g_hist * 100:.1f}% historical growth ({source})'} would be {raw * 100:.1f}%, held to "
+            f"{g_base * 100:.1f}% a year so the projection stays within a plausible range.")
 
 
 def _explain_exit_pe(hist_median, industry_pe, industry_used, anchor_pe, current_pe, exit_base) -> str:
@@ -315,7 +327,7 @@ def _explain_exit_pe(hist_median, industry_pe, industry_used, anchor_pe, current
 
 def _build_price_derivation(price, eps_ttm, g_base, g_hist, growth_source, scenarios, ladder, bear_safe_price,
                             div_yield, hist_median, industry_pe, industry_used, anchor_pe, current_pe, exit_base,
-                            v_base, v_bear, v_bull) -> dict:
+                            v_base, v_bear, v_bull, g_model=None) -> dict:
     """Shows the user exactly how each price level was reached, so a number like
     'Rs 989' is a traceable calculation, not an assertion: the base-case 5-year
     value, worked backwards to the price that earns each target return; why the
@@ -360,7 +372,7 @@ def _build_price_derivation(price, eps_ttm, g_base, g_hist, growth_source, scena
 
     return {
         "steps": {
-            "eps_ttm": _r(eps_ttm, 2), "growth_pct": base["eps_growth_pct"], "growth_text": _explain_growth(g_hist, g_base, growth_source),
+            "eps_ttm": _r(eps_ttm, 2), "growth_pct": base["eps_growth_pct"], "growth_text": _explain_growth(g_hist, g_base, growth_source, g_model),
             "eps_in_5y": base["eps_in_5y"], "exit_pe": base["exit_pe"],
             "exit_pe_text": _explain_exit_pe(hist_median, industry_pe, industry_used, anchor_pe, current_pe, exit_base),
             "value_in_5y": v_base, "dividend_yield_pct": _r(div_yield * 100, 2), "horizon_years": HORIZON_YEARS,
@@ -497,7 +509,8 @@ def _build_fair_value(price, eps_ttm, ladder, hist_pe, industry_pe, industry_pe_
 
 
 def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct, growth_source,
-                          div_yield_pct, quality_flags, reliability=None, industry_pe_weak=False, fcf_per_share=None) -> dict:
+                          div_yield_pct, quality_flags, reliability=None, industry_pe_weak=False, fcf_per_share=None,
+                          growth_fade=0.0) -> dict:
     if not price or not eps_ttm or eps_ttm <= 0:
         return {"available": False, "reason_code": "no_positive_earnings",
                 "reason": "This company has no positive trailing earnings (it is loss-making, or earnings data is missing), so a P/E-based price-vs-value analysis is not meaningful."}
@@ -510,13 +523,16 @@ def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct,
     if g_hist is None:
         g_hist, growth_source = 0.10, "generic default (no usable earnings history)"
         notes.append("No usable earnings history, so a generic 10% growth was assumed as the starting point — treat this model as low reliability.")
+    g_model = g_hist                      # the growth the scenarios start from (g_hist stays the company's actual record)
+    if growth_fade and g_hist >= 0 and "generic" not in (growth_source or ""):
+        g_model = (1 - growth_fade) * g_hist + growth_fade * LONG_RUN_GROWTH
     if g_hist < 0:
         g_bear, g_base, g_bull = -0.02, 0.02, 0.06
         notes.append("Historical EPS growth is negative; scenarios assume at best a modest recovery.")
     else:
-        g_bear = _clamp(0.30 * g_hist, 0.0, 0.07)
-        g_base = _clamp(0.75 * g_hist, 0.02, 0.18)
-        g_bull = _clamp(1.00 * g_hist, g_base + 0.02, 0.25)
+        g_bear = _clamp(0.30 * g_model, 0.0, 0.07)
+        g_base = _clamp(0.75 * g_model, 0.02, 0.18)
+        g_bull = _clamp(1.00 * g_model, g_base + 0.02, 0.25)
 
     hist_median = hist_pe.get("median") if hist_pe and hist_pe.get("available") else None
     # a median over a handful of BSE peers is too noisy to average in next to the stock's own
@@ -580,7 +596,7 @@ def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct,
     industry_used = bool(industry_pe) and (not industry_pe_weak or hist_median is None)
     price_derivation = _build_price_derivation(price, eps_ttm, g_base, g_hist, growth_source, scenarios, ladder,
                                                bear_safe, div_yield, hist_median, industry_pe, industry_used, anchor_pe,
-                                               current_pe, exit_base, v_base, v_bear, v_bull)
+                                               current_pe, exit_base, v_base, v_bear, v_bull, g_model)
     reverse_dcf = _build_reverse_dcf(price, eps_ttm, current_pe, exit_base, div_yield, g_hist, growth_source, g_base)
     fair_value = _build_fair_value(price, eps_ttm, ladder, hist_pe, industry_pe, industry_pe_weak, g_base, fcf_per_share, div_yield)
     return {
@@ -594,7 +610,9 @@ def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct,
         "current_price": _r(price, 2), "eps_ttm": _r(eps_ttm, 2), "current_pe": _r(current_pe),
         "industry_pe": _r(industry_pe), "own_history_median_pe": _r(hist_pe.get("median")) if hist_pe and hist_pe.get("available") else None,
         "anchor_pe": _r(anchor_pe), "dividend_yield_pct": _r(div_yield_pct, 2),
-        "growth_basis": {"historical_eps_growth_pct": _r(g_hist * 100), "source": growth_source},
+        "growth_basis": {"historical_eps_growth_pct": _r(g_hist * 100), "source": growth_source,
+                         **({"faded_toward_long_run_pct": int(growth_fade * 100), "long_run_growth_pct": _r(LONG_RUN_GROWTH * 100, 0),
+                             "growth_used_before_haircut_pct": _r(g_model * 100)} if abs(g_model - g_hist) > 1e-9 else {})},
         "scenarios": scenarios,
         "entry_ladder": ladder,
         "bear_case_safe_price": {"price": _r(bear_safe, 0), "meaning": "price at which even the bear scenario still earns ~6% a year"} if bear_safe else None,
@@ -604,7 +622,9 @@ def build_valuation_model(price, eps_ttm, industry_pe, hist_pe, growth_hist_pct,
         "tranche_plan": _tranche_plan(STANCES[stance], price, ladder, bear_safe),
         "assumptions": [
             f"{HORIZON_YEARS}-year horizon; returns are annualised and include the current dividend yield (approximate).",
-            "Growth paths are haircuts of the company's own historical EPS growth (bear ≈30%, base ≈75%, bull ≈100%).",
+            ("Growth paths start from the company's historical EPS growth pulled halfway toward a long-run 10% (past growth predicted the future only weakly in back-tests), then haircut (bear ≈30%, base ≈75%, bull ≈100%)."
+             if abs(g_model - g_hist) > 1e-9 else
+             "Growth paths are haircuts of the company's own historical EPS growth (bear ≈30%, base ≈75%, bull ≈100%)."),
             "Exit P/E anchors on the stock's own multi-year P/E history and its industry P/E; only half of any upside re-rating is credited in the base case, all of any downside re-rating.",
             *notes,
         ],
@@ -817,7 +837,8 @@ def compute_all(overview: dict, financials: dict, shareholding: dict, price_summ
             reliability["level"] = "medium"
     fcf_ps = None if is_financial else _fcf_per_share(profile)
     model = build_valuation_model(price, eps_ttm, industry_pe, hist_pe, g_pct, g_src,
-                                  _f(ratios.get("divYield")), quality_flags, reliability, industry_pe_weak, fcf_ps)
+                                  _f(ratios.get("divYield")), quality_flags, reliability, industry_pe_weak, fcf_ps,
+                                  growth_fade=0.0 if is_financial else GROWTH_FADE_NON_FINANCIAL)
 
     if model.get("available"):
         levels = [(l["name"], l["price"]) for l in model.get("entry_ladder") or []]

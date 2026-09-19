@@ -126,7 +126,7 @@ def asof_statements(st, t: date):
             "income_statement_quarterly": []}
 
 
-def model_asof(stock, t: date):
+def model_asof(stock, t: date, growth_fn=None, fade=None):
     price = price_on(stock, t)
     if not price:
         return None
@@ -154,7 +154,10 @@ def model_asof(stock, t: date):
         return None                      # the live model withholds levels for these, so there is nothing to test
     dps = prof["history_last_6_fy"][-1].get("dps") or 0
     fcfps = None if stock["is_financial"] else V._fcf_per_share(prof)
-    m = V.build_valuation_model(price, eps, None, hist, g_pct, g_src, dps / price * 100, {}, rel, False, fcfps)
+    g_used = growth_fn(g_pct) if growth_fn else g_pct      # experiments only: a different growth rule; None = the live rule
+    if fade is None:                                        # default = exactly what the live model does
+        fade = 0.0 if stock["is_financial"] else V.GROWTH_FADE_NON_FINANCIAL
+    m = V.build_valuation_model(price, eps, None, hist, g_used, g_src, dps / price * 100, {}, rel, False, fcfps, growth_fade=fade)
     if not m.get("available"):
         return None
     fv = m.get("fair_value") or {}
@@ -165,6 +168,7 @@ def model_asof(stock, t: date):
         "fv_agreement": fv.get("agreement"), "fv_methods_above": fv.get("methods_above"), "fv_method_count": fv.get("method_count"),
         "rdcf_level": (m.get("reverse_dcf") or {}).get("level"), "rdcf_needed": (m.get("reverse_dcf") or {}).get("needed_growth_pct"),
         "past_growth_pct": g_pct, "rerating_ratio": m["anchor_pe"] / (price / eps) if m.get("anchor_pe") else None,
+        "is_financial": stock["is_financial"], "fv_mids": {x["key"]: x["mid"] for x in fv.get("methods", [])},
     }
 
 
@@ -316,6 +320,14 @@ def _row(rows, bucket):
     return next((r for r in rows or [] if r["bucket"] == bucket), None)
 
 
+def _variants() -> dict:
+    """The scoring-rule experiments (investment_backtest_variants.py), if they have been run."""
+    try:
+        return json.loads((OUT_PATH.parent / "backtest_variants.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
 def plain_findings(res: dict) -> list:
     """The results in plain English, every figure taken from the numbers themselves so the text can
     never drift from the tables. Headline horizon = 3 years (the longest with a useful sample)."""
@@ -338,10 +350,19 @@ def plain_findings(res: dict) -> list:
         out.append(f"The fair-value zone separates cheap from dear. Stocks priced below it beat the typical stock {below['beat_median_stock_pct']}% of the time over 3 years; stocks above it, {above['beat_median_stock_pct']}%.")
     rt = h["rank_test"]
     m, pe, g = (rt.get("model_expected_return") or {}).get("mean_ic"), (rt.get("baseline_low_pe") or {}).get("mean_ic"), (rt.get("past_eps_growth_alone") or {}).get("mean_ic")
+    var = _variants()
+    old = (((var.get("horizons") or {}).get("3y") or {}).get("all") or {}).get("e_live", {}).get("mean_ic")
     if m is not None and pe is not None:
-        out.append(f"A weakness, stated plainly: simply ranking stocks by lowest P/E predicted returns better than the full model (rank correlation {pe} versus {m} at 3 years"
+        out.append(f"A weakness, stated plainly: in this 2020-2025 test, simply ranking stocks by lowest P/E predicted returns better than the model (rank correlation {pe} versus {m} at 3 years"
                    + (f"; past earnings growth on its own scored {g}, i.e. nothing" if g is not None else "")
-                   + "). Most of the model's signal comes from how cheap a stock is against its own history; its growth projection adds little.")
+                   + ")."
+                   + (f" Before the growth fade the model scored {old}; pulling past growth halfway toward a long-run 10% for non-financial companies is what lifted it." if old is not None else ""))
+    ext = var.get("low_pe_extended") or {}
+    x3 = (ext.get("horizons") or {}).get("3y", {}).get("mean_ic")
+    early = [((ext.get("by_entry_year") or {}).get(y) or {}).get("1y", {}).get("mean_ic") for y in ("2017", "2018", "2019")]
+    if x3 is not None and all(e is not None and e < 0 for e in early):
+        out.append(f"But cheapness alone is not a safe rule. Tested from mid-2017, lowest-P/E scored only {x3} at 3 years, and on 2017-2019 entries it did worse than the priciest stocks "
+                   "(that was a market led by growth and quality companies). It won when the market turned toward value, so treat it as a bet on the market's mood, not a rule.")
     w = {r["dip_pct"]: r for r in res.get("waiting") or []}
     if 10.0 in w:
         r = w[10.0]
@@ -369,7 +390,7 @@ def track_record_for_ai(res: dict) -> dict:
                                           "past_eps_growth_alone": (rt.get("past_eps_growth_alone") or {}).get("mean_ic")},
         "waiting_for_10pct_dip": {k: w[10.0][k] for k in ("reached_within_12m_pct", "waiting_beat_buying_now_pct", "avg_2y_price_return_wait_pct", "avg_2y_price_return_buy_now_pct")} if 10.0 in w else None,
         "how_to_use": "The 9/12/15% levels rank stocks; they are not forecasts (every group, even 'under 9%', usually earned more than 9% a year in this rising market). 'Avoid' stocks still earned positive returns. "
-                      "A plain low-P/E ranking beat this model's ranking, and past growth alone had no predictive value, so do not lean on the growth projection. Sample: one market regime, survivors only.",
+                      "Past growth alone had no predictive value, so the model pulls it halfway toward a long-run 10% for non-financial companies. A plain low-P/E ranking beat the model in 2020-2025 but lost on 2017-2019 entries, so cheapness alone is a bet on the market's mood, not a rule. Sample: large companies that still exist, mostly one market regime.",
     }
 
 

@@ -2237,7 +2237,7 @@ function ValuationModelPanel({ vm, m }) {
         <summary style={{ cursor:'pointer', fontSize:12, fontWeight:600, color:'#6366f1' }}>Assumptions behind these numbers</summary>
         <ul style={{ margin:'8px 0 0', paddingLeft:18, fontSize:11, color:V('text-muted'), lineHeight:1.6 }}>
           <li>Trailing EPS ₹{vm.eps_ttm}, today's P/E {vm.current_pe}×; industry P/E {vm.industry_pe ?? 'n/a'}×; the stock's own historical median P/E {vm.own_history_median_pe ?? 'n/a'}×; exit-multiple anchor {vm.anchor_pe}×.</li>
-          <li>Growth basis: {vm.growth_basis.historical_eps_growth_pct}% ({vm.growth_basis.source}).</li>
+          <li>Growth basis: {vm.growth_basis.historical_eps_growth_pct}% ({vm.growth_basis.source}){vm.growth_basis.faded_toward_long_run_pct ? `, pulled ${vm.growth_basis.faded_toward_long_run_pct}% of the way toward a long-run ${vm.growth_basis.long_run_growth_pct}% → ${vm.growth_basis.growth_used_before_haircut_pct}% before the haircut` : ''}.</li>
           {vm.assumptions.map((a, i) => <li key={i}>{a}</li>)}
           {vm.stance_downgraded_for?.length > 0 && <li>Baseline stance was lowered one step for: {vm.stance_downgraded_for.join(', ')}.</li>}
           <li>This is a structured way to compare price with value using visible assumptions — not a forecast.</li>
@@ -2513,7 +2513,7 @@ function ReverseDcfPanel({ rd, m }) {
         <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(3,1fr)', gap:10, marginBottom:10 }}>
           <MetricBox label="Growth the price needs" value={`${rd.needed_growth_pct}%/yr`} sub={`to earn ${rd.target_pct}% a year over 5 years`} color={meta.color} />
           <MetricBox label="The company achieved" value={rd.historical_growth_pct != null ? `${rd.historical_growth_pct}%/yr` : '—'} sub={rd.historical_source || 'no usable record'} />
-          <MetricBox label="Our base case assumes" value={`${rd.model_base_growth_pct}%/yr`} sub="a haircut of the record" />
+          <MetricBox label="Our base case assumes" value={`${rd.model_base_growth_pct}%/yr`} sub="after our fade and haircut" />
         </div>
         <div style={{ fontSize:13, color:V('text-primary'), lineHeight:1.55, marginBottom:10 }}>{rd.text}</div>
         <div style={{ overflowX:'auto' }}>
