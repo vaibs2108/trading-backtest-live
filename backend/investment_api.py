@@ -14,6 +14,7 @@ fully removes the feature with zero trace elsewhere.
 """
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -544,12 +545,27 @@ def get_ipo_list():
     return {"ipos": out}
 
 
+def _tidy_mechanics(mechanics: dict) -> dict:
+    """BSE's Price_Band field is free text: '1700.00-1785.00|/A discount of Rs 170/- ... is being offered to Eligible
+    Employees...|'. Split it into the actual band (also formatted for display) and the footnote, so the page and the
+    AI both get a clean band instead of a paragraph."""
+    raw = str((mechanics or {}).get("price_band") or "")
+    parts = [p.strip(" /") for p in raw.split("|") if p.strip(" /")]
+    if not parts:
+        return mechanics
+    band = parts[0]
+    nums = re.findall(r"\d[\d,]*\.?\d*", band)
+    display = f"\u20b9{float(nums[0].replace(',', '')):,.0f} \u2013 \u20b9{float(nums[-1].replace(',', '')):,.0f}" if len(nums) >= 2 else (f"\u20b9{band}" if nums else band)
+    note = " ".join(parts[1:]).strip()
+    return {**mechanics, "price_band": band, "price_band_display": display, "price_band_note": note[:1].upper() + note[1:] if note else None}
+
+
 @router.get("/ipo/{ipo_no}")
 def get_ipo_detail(ipo_no: str):
     """Issue mechanics + BSE's raw bid-demand data + best-effort GMP/
     category-wise subscription sentiment."""
     try:
-        mechanics = bse.get_ipo_details(ipo_no)
+        mechanics = _tidy_mechanics(bse.get_ipo_details(ipo_no))
     except Exception as e:
         logger.error(f"investment_api: IPO details fetch failed for {ipo_no}: {e}")
         raise HTTPException(status_code=502, detail=f"upstream data fetch failed: {e}")
@@ -571,7 +587,7 @@ def get_ipo_analysis(ipo_no: str):
     slow on a cold cache (RHP PDFs run 300-600+ pages) — cached after the
     first request since a filed RHP never changes."""
     try:
-        mechanics = bse.get_ipo_details(ipo_no)
+        mechanics = _tidy_mechanics(bse.get_ipo_details(ipo_no))
     except Exception as e:
         logger.error(f"investment_api: IPO details fetch failed for {ipo_no}: {e}")
         raise HTTPException(status_code=502, detail=f"upstream data fetch failed: {e}")

@@ -3329,6 +3329,13 @@ function IpoAnalysisView({ ipoNo, onBack }) {
   const trendArrow = (d) => d === 'up' ? '↑' : d === 'down' ? '↓' : '→'
   const priceColor = (p) => p === 'attractive' ? '#22c55e' : p === 'aggressive' ? '#ef4444' : '#eab308'
   const interestColor = (i) => i === 'high' ? '#22c55e' : i === 'low' ? '#ef4444' : '#eab308'
+  // BSE's price band is free text ("1700.00-1785.00|/A discount of Rs 170/- ... Employee Reservation portion|"):
+  // show the band itself and keep the rest as a footnote. The backend tidies it too; this covers an older backend.
+  const bandParts = String(mech?.price_band ?? '').split('|').map(x => x.trim().replace(/^\/+|\/+$/g, '')).filter(Boolean)
+  const bandNums = (bandParts[0] || '').match(/\d[\d,]*\.?\d*/g) || []
+  const inr = (x) => `₹${Number(x.replace(/,/g, '')).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`
+  const bandDisplay = mech?.price_band_display ?? (bandNums.length >= 2 ? `${inr(bandNums[0])} – ${inr(bandNums[bandNums.length - 1])}` : (bandParts[0] ?? '—'))
+  const bandNote = mech?.price_band_note ?? (bandParts.slice(1).join(' ') || null)
 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
@@ -3345,11 +3352,12 @@ function IpoAnalysisView({ ipoNo, onBack }) {
         <Card>
           <div style={{ fontSize:18, fontWeight:700, color:V('text-primary'), marginBottom:10 }}>{mech.scrip_name}</div>
           <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
-            <MetricBox label="Price Band" value={`₹${mech.price_band}`} />
+            <MetricBox label="Price Band" value={bandDisplay} />
             <MetricBox label="Lot Size" value={mech.market_lot ?? '—'} />
             <MetricBox label="Issue Size" value={mech.issue_size_shares ? Number(mech.issue_size_shares).toLocaleString() : '—'} />
             <MetricBox label="Period" value={mech.issue_period ?? '—'} />
           </div>
+          {bandNote && <div style={{ marginTop:8, fontSize:11, color:V('text-muted'), lineHeight:1.5 }}>Note on the price band: {bandNote}</div>}
         </Card>
       )}
 
