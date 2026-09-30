@@ -71,10 +71,11 @@ class CandleBuilder:
                 "close": price,
                 "volume": 0,
             }
-        else:
+        elif slot == self._current_slot:
             # Same slot — update OHLCV
             if self._current is None:
-                # slot was seeded/time-closed without an active candle — start one
+                # slot was seeded/time-closed without an active candle yet — start one
+                # (the legitimate case: the first live tick continuing the last-seeded slot)
                 self._current = {
                     "timestamp": slot,
                     "open": price, "high": price, "low": price, "close": price,
@@ -84,6 +85,20 @@ class CandleBuilder:
                 self._current["high"] = max(self._current["high"], price)
                 self._current["low"] = min(self._current["low"], price)
                 self._current["close"] = price
+        else:
+            # slot < self._current_slot: a late/out-of-order tick for a slot that
+            # was ALREADY finalized — most often close_on_time()'s boundary check
+            # (polled every ~50ms, independent of ticks) racing ahead of a tick
+            # still in flight for the slot it just closed. self._current is None
+            # here (close_on_time cleared it), so there is no in-progress candle
+            # to update; building a fresh one would silently duplicate the
+            # already-appended candle for this same timestamp — confirmed live
+            # 2026-09-29: this produced two entries for the same 5m candle,
+            # corrupting bar-count-based indicators (lookback windows) downstream.
+            # Drop it; periodic REST reconciliation (see LiveFeedManager
+            # .reconcile_recent) covers any resulting minor incompleteness.
+            logger.debug(f"LiveFeed: dropped late tick for already-closed slot {slot} (current={self._current_slot})")
+            return None
 
         # Volume is cumulative from exchange; we track it per candle
         # by storing last known volume and computing delta
@@ -411,6 +426,74 @@ class LiveFeedManager:
                 last_ts_1m = last_ts_1m.replace(tzinfo=_IST)
             self.candle_1m._current_slot = self.candle_1m._get_slot(last_ts_1m)
             logger.info(f"LiveFeed seeded with {len(df_1m)} 1m candles")
+
+    def reconcile_recent(self, df_5m: pd.DataFrame = None, df_1m: pd.DataFrame = None,
+                          max_age_minutes: int = 90, tolerance_pct: float = 0.0005) -> tuple:
+        """Patch recently-completed candles against fresh REST historical data.
+
+        After seed_candles() runs once at startup/reconnect, every candle from
+        then on is built purely from local WebSocket ticks (see CandleBuilder
+        .on_tick) with nothing cross-checking it against Dhan's own settled
+        OHLC. Confirmed live on 2026-09-29: the very first candles of a session
+        can differ from the REST-reported candle by 100+ points on a sharp
+        opening move — exactly which ticks got captured first, not a data
+        outage. This never self-heals on its own; only later candles (built
+        from a fuller, calmer tick stream) happen to end up close to the
+        truth. Call this periodically (see main.py's _feed_reconcile_loop) with
+        a fresh REST pull to close that gap for candles old enough to be
+        settled — the in-progress candle is intentionally never touched, since
+        REST data for a still-forming bar isn't final either.
+
+        Returns (corrected_5m_count, corrected_1m_count).
+        """
+        cutoff = datetime.now(_IST).replace(tzinfo=None) - timedelta(minutes=max_age_minutes)
+
+        def _patch(builder: CandleBuilder, df: pd.DataFrame) -> int:
+            if df is None or df.empty:
+                return 0
+            rest = {}
+            for _, row in df.iterrows():
+                ts = row["timestamp"]
+                if isinstance(ts, str):
+                    ts = pd.to_datetime(ts)
+                if getattr(ts, "tzinfo", None) is not None:
+                    ts = ts.tz_localize(None)
+                ts = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+                if ts < cutoff:
+                    continue
+                rest[ts] = (float(row["open"]), float(row["high"]), float(row["low"]),
+                            float(row["close"]), int(row.get("volume", 0) or 0))
+
+            if not rest:
+                return 0
+
+            corrected = 0
+            new_candles = deque(maxlen=builder.max_candles)
+            for c in builder.candles:
+                ts = c["timestamp"]
+                r = rest.get(ts)
+                if r is not None:
+                    o, h, l, cl, v = r
+                    # relative tolerance on every field, not just close — exact `!=` on floats
+                    # false-positives on harmless rounding noise (confirmed live 2026-09-29:
+                    # logged "corrections" that replaced a candle with itself)
+                    def _differs(a, b):
+                        return abs(a - b) / b > tolerance_pct if b else a != b
+                    drift = abs(c["close"] - cl) / cl if cl else 0.0
+                    if _differs(c["open"], o) or _differs(c["high"], h) or _differs(c["low"], l) or _differs(c["close"], cl):
+                        logger.info(
+                            f"LiveFeed reconcile: {builder.tf_minutes}m candle {ts} corrected "
+                            f"C={c['close']:.2f}->{cl:.2f} (drift {drift * 100:.2f}%)")
+                        c = {"timestamp": ts, "open": o, "high": h, "low": l, "close": cl, "volume": v}
+                        corrected += 1
+                new_candles.append(c)
+            if corrected:
+                builder.candles = new_candles  # atomic reference swap — safe against the tick thread
+            return corrected
+
+        n5 = _patch(self.candle_5m, df_5m)
+        n1 = _patch(self.candle_1m, df_1m)
+        return n5, n1
 
     def get_status(self) -> dict:
         """Return feed status for the dashboard/API."""

@@ -1983,6 +1983,38 @@ async def _heartbeat_loop():
         await asyncio.sleep(10)
 
 
+async def _feed_reconcile_loop():
+    """Periodically patches the live feed's candles against fresh REST data.
+
+    seed_candles() only runs once, at startup/reconnect; every candle after
+    that is built purely from local WebSocket ticks with no cross-check
+    against Dhan's own settled OHLC (see live_feed.py's reconcile_recent
+    docstring — confirmed live on 2026-09-29 to drift 100+ points on a sharp
+    opening move, since it depends on exactly which ticks got captured
+    first). This closes that gap for candles old enough to have settled;
+    the in-progress candle is never touched here."""
+    await asyncio.sleep(90)  # let the feed connect and take a few real ticks first
+    while True:
+        try:
+            _feed = get_live_feed()
+            if _feed.is_running and broker.is_connected():
+                cfg = get_settings()
+                _hist_5m = await asyncio.to_thread(
+                    broker.get_historical_data, cfg.instrument, "5",
+                    (datetime.now(_IST) - timedelta(days=1)).strftime("%Y-%m-%d"),
+                    (datetime.now(_IST) + timedelta(days=1)).strftime("%Y-%m-%d"))
+                _hist_1m = await asyncio.to_thread(
+                    broker.get_historical_data, cfg.instrument, "1",
+                    (datetime.now(_IST) - timedelta(days=1)).strftime("%Y-%m-%d"),
+                    (datetime.now(_IST) + timedelta(days=1)).strftime("%Y-%m-%d"))
+                n5, n1 = _feed.reconcile_recent(_hist_5m, _hist_1m)
+                if n5 or n1:
+                    add_activity_log(f"Live feed reconciled against REST: {n5}x5m, {n1}x1m candle(s) corrected.")
+        except Exception as e:
+            logger.debug(f"Feed reconcile loop error: {e}")
+        await asyncio.sleep(300)  # every 5 minutes — matches the 5m bar cadence
+
+
 # ── Background polling (auto-signal every 5 min bar) ─────────────────────────
 
 @app.on_event("startup")
@@ -2089,6 +2121,7 @@ async def startup_event():
 
     asyncio.create_task(_signal_polling_loop())
     asyncio.create_task(_heartbeat_loop())
+    asyncio.create_task(_feed_reconcile_loop())
 
     # Mark app as running for watchdog crash detection
     try:
@@ -2847,17 +2880,28 @@ async def _signal_polling_loop():
                                     _trace(_tid, "CHART", f"skipped, age={_entry_sig_age:.1f}m (historical replay, not pushed to chart)")
                                 # Send Telegram in background (non-blocking) for active strategy --
                                 # skip stale/historical-replay signals so a data-gap catch-up burst
-                                # doesn't alert as if each old signal just happened live.
+                                # doesn't alert as if each old signal just happened live. Also skip
+                                # when the single position-tracking slot is already occupied (e.g. a
+                                # manual/DHAN_SYNC position) -- this entry will never be attempted (see
+                                # gate below), so alerting "Entry: LONG" here would announce a trade
+                                # that never actually happened, not even a paper one (found live,
+                                # 2026-09-30: slot occupied by a manual position all morning, Telegram
+                                # kept firing anyway since it had no ownership/slot check, unlike the
+                                # matching EXIT alert path which already suppresses on ownership).
+                                _entry_slot_free = not tm.position or tm.position.instrument != cfg.instrument
                                 if _strat_id == cfg.strategy:
-                                    if _entry_is_fresh:
+                                    if _entry_is_fresh and _entry_slot_free:
                                         _trace(_tid, "TELEGRAM", "sending")
                                         asyncio.get_event_loop().run_in_executor(None, send_strat_telegram_alert, _strat_id, sig_dict)
-                                    else:
+                                    elif not _entry_is_fresh:
                                         _trace(_tid, "TELEGRAM", f"skipped, age={_entry_sig_age:.1f}m")
                                         logger.info(f"[{_strat_id}] Telegram entry alert skipped — signal {_entry_sig_age:.1f} mins old")
+                                    else:
+                                        _trace(_tid, "TELEGRAM", f"skipped, position slot occupied by {tm.position.symbol}")
+                                        logger.info(f"[{_strat_id}] Telegram entry alert skipped — position slot occupied by {tm.position.symbol}, this entry will not be attempted")
 
                                 # Instant order execution for active strategy (1-2s latency matching backtest)
-                                if _strat_id == cfg.strategy and (not tm.position or tm.position.instrument != cfg.instrument):
+                                if _strat_id == cfg.strategy and _entry_slot_free:
                                     ok, reason = True, "OK"
                                     if cfg.auto_trade:
                                         # Signal freshness check: skip historical replay signals (>10 mins old)
@@ -3152,21 +3196,27 @@ async def _signal_polling_loop():
                     elif tm.position and tm.position.instrument == sig.get("instrument") and tm.position.direction != sig_direction:
                         pos = tm.position
 
-                        # --- FIX: Do NOT close DHAN_SYNC positions internally when auto_trade is OFF ---
-                        # If auto_trade is OFF we can't send a broker exit order, so closing locally
-                        # is pointless — Dhan sync will re-import the position next poll cycle,
-                        # creating an infinite close/import loop that floods the logs.
+                        # --- Ownership guard ---
+                        # Same check as the processor path (added after the 2026-07-27 incident
+                        # where a strategy's exit closed an unrelated Dhan carry position — see
+                        # _owns_position above). A DHAN_SYNC position, or one belonging to a
+                        # different strategy, must never be closed by this signal — live or
+                        # local — regardless of auto_trade. Previously this only blocked the
+                        # broker call when auto_trade was OFF (to stop a re-import log-spam
+                        # loop); that left a real gap once auto_trade was turned ON, where this
+                        # path would place a REAL exit order against a position it doesn't own.
                         _is_dhan_sync = getattr(pos, "order_id", "").startswith("DHAN_SYNC_")
-                        if not cfg.auto_trade and _is_dhan_sync:
+                        _owns_position = not _is_dhan_sync and (not getattr(pos, "strategy", None) or pos.strategy == cfg.strategy)
+                        if not _owns_position:
                             # Throttle: this condition stays true every poll for as long as
                             # the opposite signal persists and the position stays open --
                             # without a throttle this re-logs (and re-traces) every ~15s
                             # indefinitely. Confirmed in production (2026-08-24): the same
                             # event logged continuously for 4+ minutes straight. Reuses the
                             # same once-per-15-min throttle as the MANUAL_EXIT_NEEDED
-                            # reminder -- identical underlying situation (a DHAN_SYNC
-                            # position needing manual intervention), just detected via a
-                            # different code path.
+                            # reminder -- identical underlying situation (a position needing
+                            # manual intervention or belonging to someone else), just detected
+                            # via a different code path.
                             _now_alert = datetime.now(_IST)
                             _last_alert = _manual_exit_alert_last_sent.get(pos.order_id)
                             if _last_alert is None or (_now_alert - _last_alert).total_seconds() >= 900:
@@ -3174,14 +3224,15 @@ async def _signal_polling_loop():
                                 _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", sig_ts)
                                 _trace(_tid, "DETECTED", f"path=legacy_opposite_signal strategy={cfg.strategy} "
                                                           f"closing={pos.direction} new_signal={sig_direction} sig_time={sig_ts}")
+                                _owner_desc = "DHAN_SYNC" if _is_dhan_sync else f"strategy '{pos.strategy}'"
                                 logger.warning(
-                                    f"Opposite signal ({sig_direction}) vs DHAN_SYNC {pos.direction} {pos.symbol} "
-                                    f"— auto_trade OFF, skipping internal close to avoid re-import loop. "
-                                    f"Manage this position manually on Dhan."
+                                    f"Opposite signal ({sig_direction}) vs {_owner_desc} {pos.direction} {pos.symbol} "
+                                    f"— not owned by active strategy '{cfg.strategy}' (auto_trade={cfg.auto_trade}), "
+                                    f"skipping internal close. Manage this position manually on Dhan."
                                 )
                             _pending_telegram_signal = sig
                             _last_telegram_signal_key = ("", "")
-                            continue  # skip — can't act on broker, don't close locally
+                            continue  # skip — not this strategy's position to act on, broker or local
 
                         _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", sig_ts)
                         _trace(_tid, "DETECTED", f"path=legacy_opposite_signal strategy={cfg.strategy} "
@@ -3564,8 +3615,25 @@ async def _signal_polling_loop():
                             _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", pos.entry_time)
                             _trace(_tid, "DETECTED", f"path=position_monitor strategy={cfg.strategy} "
                                                       f"reason={exit_reason} pos={pos.symbol} entry_time={pos.entry_time}")
-                            # Only place real broker exit order in live auto-trade mode
-                            if cfg.auto_trade and not pos.order_id.startswith("PAPER_") and exit_reason != "BROKER_SL_HIT":
+                            # Ownership guard — same check as the processor and legacy_opposite_signal
+                            # paths (2026-07-27 incident). Local SL/target/time detection above
+                            # intentionally runs for every position, DHAN_SYNC included, so the app's
+                            # own bookkeeping and the user alert stay accurate — but a real broker
+                            # order must only ever be placed for a position this strategy actually
+                            # opened. Previously this only checked auto_trade + not-PAPER_, so a
+                            # DHAN_SYNC (or another strategy's) position would get a real exit order
+                            # placed against it once auto_trade was ON, based on a stop/target level
+                            # this strategy computed for its own trade, not the user's.
+                            _pm_is_dhan_sync = getattr(pos, "order_id", "").startswith("DHAN_SYNC_")
+                            _pm_owns_position = not _pm_is_dhan_sync and (not getattr(pos, "strategy", None) or pos.strategy == cfg.strategy)
+                            if cfg.auto_trade and not _pm_owns_position and not pos.order_id.startswith("PAPER_"):
+                                logger.warning(
+                                    f"{exit_reason} on {pos.symbol} ({'DHAN_SYNC' if _pm_is_dhan_sync else f'strategy {pos.strategy!r}'}) "
+                                    f"— not owned by active strategy '{cfg.strategy}', auto_trade is ON but skipping "
+                                    f"broker close. Manage this position manually on Dhan."
+                                )
+                            # Only place real broker exit order in live auto-trade mode, for a position we own
+                            if cfg.auto_trade and _pm_owns_position and not pos.order_id.startswith("PAPER_") and exit_reason != "BROKER_SL_HIT":
                                 _trace(_tid, "ORDER_ATTEMPT", f"path=position_monitor auto_trade={cfg.auto_trade} closing {pos.symbol}")
                                 if getattr(pos, "sl_order_id", None):
                                     try:
