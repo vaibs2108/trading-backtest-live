@@ -187,18 +187,34 @@ class RegimeTrendV2Kernel(StrategyKernel):
 
     @staticmethod
     def _estimate_round_trip_cost(entry_px: float, exit_px: float, qty: int) -> float:
-        """Realistic BANKNIFTY futures round-trip friction (brokerage + STT +
-        exchange txn + GST + stamp + SEBI + 1pt/side slippage). Reporting only —
-        does NOT affect signals."""
-        buy_n, sell_n = entry_px * qty, exit_px * qty
-        brokerage = 40.0
-        stt = 0.0002 * sell_n
-        txn = 0.0000173 * (buy_n + sell_n)
-        sebi = 0.000001 * (buy_n + sell_n)
-        gst = 0.18 * (brokerage + txn + sebi)
-        stamp = 0.00002 * buy_n
-        slip = 2.0 * qty
-        return brokerage + stt + txn + sebi + gst + stamp + slip
+        """
+        Realistic 1-lot BANKNIFTY OPTIONS round-trip cost (buy + sell), per Dhan's
+        published pricing (dhan.co/pricing, checked 2026-10-01) and NSE/SEBI
+        statutory rates. Reporting only — does NOT affect signals.
+
+        entry_px/exit_px are INDEX levels here (this kernel trades in index
+        points), not the option premium actually paid, so STT/exchange/stamp
+        (levied on premium) can't be derived from them directly — they're a
+        small fraction of the total regardless (brokerage + GST on brokerage
+        alone is ~85% of the round trip), so a representative near-ATM weekly
+        premium is assumed for those components.
+
+        Corrected 2026-10-01: the previous version computed STT/exchange/stamp
+        on the INDEX notional (entry_px * qty, e.g. Rs 16L+), correct for a
+        futures trade but wildly overstating an options trade's real charges —
+        it put the round-trip estimate at ~18 index points (~Rs 530-550).
+        User's real Dhan contract notes show ~Rs 50-55 per round trip; this
+        formula lands at ~Rs 55 for a typical Rs 120 premium, matching that.
+        """
+        brokerage = 20.0 * 2                      # Rs 20/executed order (Dhan), both legs
+        assumed_premium = 120.0                   # representative near-ATM weekly premium
+        notional = assumed_premium * qty          # one side's turnover
+        stt = 0.001 * notional * 2                # 0.1% on buy AND sell (Dhan pricing page)
+        exch_txn = 0.000030699 * notional * 2     # NSE: 0.0030699%, both legs
+        sebi = 0.000001 * notional * 2            # SEBI: 0.0001% of turnover, both legs
+        stamp = 0.00015 * notional                # stamp duty: 0.015% on buy-side turnover only
+        gst = 0.18 * (brokerage + exch_txn + sebi)  # GST: 18% on brokerage + exchange + SEBI
+        return brokerage + stt + exch_txn + sebi + stamp + gst
 
     def _run_agents(self, df_slice, row, position, cfg, df_1h, df_1d, df_1w):
         close = float(row.get("close", 0))

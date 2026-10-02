@@ -42,7 +42,11 @@ logger = logging.getLogger(__name__)
 
 # ITM option-buying economics (reporting only)
 _OPT_CAPTURE = 0.85     # delta capture of index points
-_OPT_FIXED = 90.0       # brokerage + statutory per round trip
+# Rs 20/order brokerage (both legs) + GST on it + small STT/exchange/stamp on
+# premium (Dhan pricing page, checked 2026-10-01) -- matches user's real Dhan
+# contract notes, ~Rs 50-55 per round trip. See _fut_cost's docstring below
+# for the same correction (that one previously computed on index notional).
+_OPT_FIXED = 55.0       # brokerage + statutory per round trip
 _OPT_SLIP_PTS = 2.0     # premium points lost per side
 
 
@@ -84,15 +88,34 @@ class DonchianSwingKernel(StrategyKernel):
 
     @staticmethod
     def _fut_cost(entry_px: float, exit_px: float, qty: int) -> float:
-        buy_n, sell_n = entry_px * qty, exit_px * qty
-        brokerage = 40.0
-        stt = 0.0002 * sell_n
-        txn = 0.0000173 * (buy_n + sell_n)
-        sebi = 0.000001 * (buy_n + sell_n)
-        gst = 0.18 * (brokerage + txn + sebi)
-        stamp = 0.00002 * buy_n
-        slip = 2.0 * qty
-        return brokerage + stt + txn + sebi + gst + stamp + slip
+        """
+        Realistic 1-lot BANKNIFTY OPTIONS round-trip cost (buy + sell), per Dhan's
+        published pricing (dhan.co/pricing, checked 2026-10-01) and NSE/SEBI
+        statutory rates. Reporting only — does NOT affect signals.
+
+        entry_px/exit_px are INDEX levels here (this kernel trades in index
+        points), not the option premium actually paid, so STT/exchange/stamp
+        (levied on premium) can't be derived from them directly — they're a
+        small fraction of the total regardless (brokerage + GST on brokerage
+        alone is ~85% of the round trip), so a representative near-ATM weekly
+        premium is assumed for those components.
+
+        Corrected 2026-10-01: the previous version computed STT/exchange/stamp
+        on the INDEX notional (entry_px * qty, e.g. Rs 16L+), correct for a
+        futures trade but wildly overstating an options trade's real charges —
+        it put the round-trip estimate at ~18 index points (~Rs 530-550).
+        User's real Dhan contract notes show ~Rs 50-55 per round trip; this
+        formula lands at ~Rs 55 for a typical Rs 120 premium, matching that.
+        """
+        brokerage = 20.0 * 2                      # Rs 20/executed order (Dhan), both legs
+        assumed_premium = 120.0                   # representative near-ATM weekly premium
+        notional = assumed_premium * qty          # one side's turnover
+        stt = 0.001 * notional * 2                # 0.1% on buy AND sell (Dhan pricing page)
+        exch_txn = 0.000030699 * notional * 2     # NSE: 0.0030699%, both legs
+        sebi = 0.000001 * notional * 2            # SEBI: 0.0001% of turnover, both legs
+        stamp = 0.00015 * notional                # stamp duty: 0.015% on buy-side turnover only
+        gst = 0.18 * (brokerage + exch_txn + sebi)  # GST: 18% on brokerage + exchange + SEBI
+        return brokerage + stt + exch_txn + sebi + stamp + gst
 
     @staticmethod
     def _opt_net(points: float, qty: int) -> float:

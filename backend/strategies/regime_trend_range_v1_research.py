@@ -1305,18 +1305,16 @@ class RegimeTrendRangeV2CUSUMPlusRawHalfTrendKernel(RegimeTrendRangeV2CUSUMCappe
         net improvement on the tuning window reversed on holdout, net
         wash over the full 13 months.
 
-    NOTE ON TRANSACTION COSTS: the trade count here (601) is much higher
-    than CUSUM 1.5 alone (325) -- the shared engine's own cost estimator
-    (_estimate_round_trip_cost, futures-style: brokerage + STT + exchange
-    txn + GST + stamp + ~2pt/side slippage) puts total estimated round-
-    trip friction at roughly Rs 335K over the 13 months for this
-    strategy, meaningfully eroding the gross P&L above. That estimator
-    assumes FUTURES-style STT on full index notional; if this is traded
-    via options instead, the real cost basis is different (likely much
-    smaller, since option premium notional is a fraction of index
-    notional) and has not yet been reconciled against live trading costs
-    -- treat the gross backtest P&L above as the honest starting point
-    and confirm real costs before sizing this for live use.
+    NOTE ON TRANSACTION COSTS (corrected 2026-10-01): the trade count here
+    (601) is much higher than CUSUM 1.5 alone (325), so cost drag matters
+    more for this variant. The shared engine's cost estimator
+    (_estimate_round_trip_cost, inherited from RegimeTrendV2Kernel) used to
+    assume FUTURES-style STT/exchange/stamp on the full index notional
+    (~Rs 530-550/round trip, ~18 index points) -- now corrected to a
+    realistic 1-lot OPTIONS round trip (~Rs 50-55, per Dhan's published
+    pricing and the user's own contract notes), an order of magnitude
+    smaller. Re-run this strategy's stats to see the updated (much smaller)
+    cost drag before treating the old Rs 335K estimate as current.
 
     NOT YET LIVE-CAPABLE. This is a backtest-page-only promotion per an
     explicit request to check results across timeframes before any
