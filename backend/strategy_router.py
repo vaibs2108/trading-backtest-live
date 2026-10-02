@@ -45,7 +45,6 @@ def add_indicators(df):
 
 
 STRATEGY_OPTIONS = {
-    "regime_reversal": "Regime + Reversal Combined",
     "regime_trend_range": "Regime Trend/Range Optimized (6 agents)",
     "regime_trend_v2": "Regime Trend V2 — Selective (optimized)",
     "regime_trend_v2b": "Regime Trend V2-B — Balanced (runner-up)",

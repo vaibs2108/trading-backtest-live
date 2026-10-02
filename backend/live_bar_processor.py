@@ -9,7 +9,7 @@ Architecture:
     signals are **identical** to the backtest / chart overlay.
 
     Each strategy gets a thin subclass that only specifies:
-        - strategy_id   (e.g. "regime_reversal")
+        - strategy_id   (e.g. "regime_trend_range")
         - _get_module() (returns the strategy module with run_backtest())
 """
 
@@ -166,6 +166,27 @@ def _to_ist_iso(ts) -> str:
 # days old.
 STALE_ENTRY_MAX_AGE_MIN = 60.0
 
+# Per-strategy override of the non-active trailing-window size (default 300
+# bars below). Added 2026-10-01 for the RAM/Range-Filter engine family
+# (custom_ram_rf_box.py and its Option A/B subclasses): RAM and Range Filter
+# are recursive indicators whose state is built from index 0 of whatever
+# array they're given, so a too-short window can diverge from what a full-
+# history run would produce. Measured cost of 1000 vs 300 bars for this
+# specific engine: ~32ms vs ~1.8ms per poll -- negligible against the 1-2s
+# live-feed-driven poll cadence, and strategies already evaluate concurrently
+# (asyncio.gather), so this adds no perceptible signal latency. The shared
+# `frames` dict already carries far more than 1000 bars of 5m data every
+# cycle (see main.py's _fetch_all_frames, ~30 calendar days), so widening
+# this is a pure in-memory slice, not an extra fetch. Scoped to just this
+# family rather than changed globally -- the 5 already-live production
+# strategies stay at their validated 300-bar window, untouched.
+_WIDE_WINDOW_BARS = {
+    "custom_option_a_tg_ram_rf": 1000,
+    "custom_option_b_ram_rf": 1000,
+    "custom_ram_rf_box": 1000,
+}
+DEFAULT_WINDOW_BARS = 300
+
 
 def _bar_age_minutes(bar_time) -> Optional[float]:
     """Age of a bar's own timestamp in minutes, or None if unparseable."""
@@ -188,7 +209,7 @@ class BacktestDiffProcessor:
     """Runs run_backtest(frames) and diffs consecutive results.
 
     Subclasses must set:
-        strategy_id  – e.g. "regime_reversal"
+        strategy_id  – e.g. "regime_trend_range"
     and implement:
         _get_module() – return the strategy module with run_backtest()
     """
@@ -277,11 +298,13 @@ class BacktestDiffProcessor:
                 logger.warning(f"[{self.strategy_id}] full-history fetch failed, falling back to 300-bar window this cycle")
 
         if eval_frames is None:
-            # Slice frames to trailing window (N=300) for fast live bar evaluation
+            # Slice frames to a trailing window for fast live bar evaluation --
+            # N=300 by default, wider for strategies in _WIDE_WINDOW_BARS.
+            window = _WIDE_WINDOW_BARS.get(self.strategy_id, DEFAULT_WINDOW_BARS)
             eval_frames = {}
             for tf, df in frames.items():
                 if df is not None and not df.empty:
-                    eval_frames[tf] = df.tail(300).copy() if len(df) > 300 else df
+                    eval_frames[tf] = df.tail(window).copy() if len(df) > window else df
                 else:
                     eval_frames[tf] = df
 
@@ -523,11 +546,6 @@ class RegimeLiveProcessor(BacktestDiffProcessor):
     strategy_id = "regime_trend_range"
 
 
-class RegimeReversalLiveProcessor(BacktestDiffProcessor):
-    """Regime + Reversal combined strategy."""
-    strategy_id = "regime_reversal"
-
-
 class MultiAgentLiveProcessor(BacktestDiffProcessor):
     """Multi-Agent V3 Kernel strategy."""
     strategy_id = "multi_agent"
@@ -560,10 +578,15 @@ class RegimeV1FinalLiveProcessor(BacktestDiffProcessor):
     strategy_id = "custom_regime_v1_trend_range_final"
 
 
-class HalfTrendHullLiveProcessor(BacktestDiffProcessor):
-    """HalfTrend + Hull (Standalone, Research). Promoted to live after
-    the scratch/research_v1/ session."""
-    strategy_id = "custom_halftrend_hull_standalone"
+class OptionBRamRFLiveProcessor(BacktestDiffProcessor):
+    """Option B: Ram > Range Filter (hold-only + no-progress) -- replaces
+    HalfTrend + Hull Standalone in the live loop, 2026-10-01 (see
+    scratch/research_14L/FINDINGS.md rounds 12-21 and the live-wiring audit
+    the same day: SL/target fix, 1000-bar window via _WIDE_WINDOW_BARS
+    above, target2 informational-only via main.py's _INFO_ONLY_TARGET2).
+    No trailing SL (not in main.py's _TRAIL_PARAMS) -- its own RAM/RF/
+    no-progress signals are the only exit path, by design."""
+    strategy_id = "custom_option_b_ram_rf"
 
 
 class Cusum15LiveProcessor(BacktestDiffProcessor):
@@ -615,9 +638,6 @@ def _get_processor(cls) -> BacktestDiffProcessor:
 def get_regime_processor() -> RegimeLiveProcessor:
     return _get_processor(RegimeLiveProcessor)
 
-def get_regime_reversal_processor() -> RegimeReversalLiveProcessor:
-    return _get_processor(RegimeReversalLiveProcessor)
-
 def get_multi_agent_processor() -> MultiAgentLiveProcessor:
     return _get_processor(MultiAgentLiveProcessor)
 
@@ -636,8 +656,8 @@ def get_donchian_intraday_processor() -> DonchianIntradayLiveProcessor:
 def get_regime_v1_final_processor() -> RegimeV1FinalLiveProcessor:
     return _get_processor(RegimeV1FinalLiveProcessor)
 
-def get_halftrend_hull_processor() -> HalfTrendHullLiveProcessor:
-    return _get_processor(HalfTrendHullLiveProcessor)
+def get_option_b_processor() -> OptionBRamRFLiveProcessor:
+    return _get_processor(OptionBRamRFLiveProcessor)
 
 def get_cusum15_processor() -> Cusum15LiveProcessor:
     return _get_processor(Cusum15LiveProcessor)

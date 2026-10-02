@@ -209,15 +209,41 @@ class Settings(BaseSettings):
 
 
 import threading
+import contextvars
+from contextlib import contextmanager
 
 # Singleton
 _settings: Optional[Settings] = None
 _settings_file = BASE_DIR / "settings.json"
 _settings_lock = threading.Lock()
 
+# Per-request settings override (e.g. a backtest for a different strategy/instrument).
+# A ContextVar is only visible to the task that set it and to threads started from it
+# via asyncio.to_thread (which copies the context), so the live loop keeps seeing the
+# real global settings while a backtest runs.
+_settings_override: contextvars.ContextVar[Optional[Settings]] = contextvars.ContextVar(
+    "_settings_override", default=None
+)
+
+
+@contextmanager
+def settings_override(base: Optional[Settings] = None, **changes):
+    """Make get_settings() return a copy of `base` (default: the current settings) with
+    `changes` applied, for the current context only. The global settings object is never
+    modified."""
+    source = base if base is not None else get_settings()
+    token = _settings_override.set(source.model_copy(update=changes))
+    try:
+        yield
+    finally:
+        _settings_override.reset(token)
+
 
 def get_settings() -> Settings:
     global _settings
+    override = _settings_override.get()
+    if override is not None:
+        return override
     with _settings_lock:
         if _settings is None:
             _settings = _load_settings()

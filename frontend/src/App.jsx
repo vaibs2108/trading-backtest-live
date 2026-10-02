@@ -25,22 +25,33 @@ const API = {
 // deep trade-level audit -- BankNifty-only validation, see
 // STRATEGY_REGISTRY.md at the repo root. The other 3 are the research
 // strategies promoted earlier. regime_trend_range / multi_agent remain
-// selectable on the Backtest page, just no longer live; regime_reversal was
-// removed from the app entirely on 2026-08-23 (worst drawdown of any
-// strategy tested -- see STRATEGY_REGISTRY.md). Single source of truth for
-// every dropdown/label surface that shows live strategy options.
+// selectable on the Backtest page, just no longer live. Single source of
+// truth for every dropdown/label surface that shows live strategy options.
 const LIVE_STRATEGY_OPTIONS = [
   { v: 'custom_alpha_combo_cusum125', l: 'Alpha Combo (CUSUM 1.25)' },
   { v: 'custom_time_gated_alpha_combo', l: 'Time-Gated Alpha Combo' },
   { v: 'custom_regime_v1_trend_range_final', l: 'Regime T/R V1 Final' },
-  { v: 'custom_halftrend_hull_standalone', l: 'HalfTrend + Hull' },
+  { v: 'custom_option_b_ram_rf', l: 'Option B: Ram > Range Filter' },
   { v: 'custom_cusum15_nodonchian_cd8', l: 'CUSUM 1.5 (No Donchian)' },
 ]
 const LIVE_STRATEGY_LABELS = Object.fromEntries(LIVE_STRATEGY_OPTIONS.map(o => [o.v, o.l]))
-// All 5 are regime-classifier-based (Alpha Combo and Time-Gated Alpha Combo
-// share the same RegimeTrendRangeV2 lineage as the other 3), so the regime badge
-// (TRENDING_UP/DOWN/SIDEWAYS, confidence, playbook) should render for all of them.
-const LIVE_REGIME_STRATEGY_IDS = LIVE_STRATEGY_OPTIONS.map(o => o.v)
+// Full list of live strategy ids, for grids/panels that should show EVERY
+// live strategy (Strategy Agreement, Secondary Strategy Signal, etc.) --
+// always derived from LIVE_STRATEGY_OPTIONS so a future strategy swap there
+// (add/remove/replace) automatically shows up everywhere without having to
+// remember a second list. Do NOT filter this one for "doesn't have X data"
+// reasons -- that caused a real bug 2026-10-01 (Option B silently vanished
+// from every grid that iterated this list, not just its regime badge, when
+// it was filtered out here instead of from NO_REGIME_STRATEGY_IDS below).
+const LIVE_STRATEGY_IDS = LIVE_STRATEGY_OPTIONS.map(o => o.v)
+// Subset with NO regime classifier (TRENDING_UP/DOWN/SIDEWAYS, confidence,
+// playbook) -- used ONLY to suppress that one badge for strategies that
+// can't produce it, never to hide them from a strategy list/grid. Option B
+// (custom_option_b_ram_rf, replaced HalfTrend+Hull here 2026-10-01) is a
+// plain Ram/Range-Filter combo with no regime classifier at all. Add future
+// non-regime-based strategies here, not by removing them from
+// LIVE_STRATEGY_IDS above.
+const NO_REGIME_STRATEGY_IDS = new Set(['custom_option_b_ram_rf'])
 
 // ── Theme Hook ──────────────────────────────────────────────────────────────
 function useTheme() {
@@ -522,7 +533,7 @@ function LiveChart({ instrument, timeframe, signals, strategy, refreshChart, the
           const isLongExit = s.signal === 'LONG_EXIT'
           const isEntry = isLong || isShort
           const isExit = isShortExit || isLongExit
-          const p = s.strategy === 'custom_alpha_combo_cusum125' ? 'A' : s.strategy === 'custom_time_gated_alpha_combo' ? 'T' : s.strategy === 'custom_regime_v1_trend_range_final' ? 'V' : s.strategy === 'custom_halftrend_hull_standalone' ? 'H' : s.strategy === 'custom_cusum15_nodonchian_cd8' ? 'C' : (s.strategy === 'broker_sync' ? 'B' : 'M')
+          const p = s.strategy === 'custom_alpha_combo_cusum125' ? 'A' : s.strategy === 'custom_time_gated_alpha_combo' ? 'T' : s.strategy === 'custom_regime_v1_trend_range_final' ? 'V' : s.strategy === 'custom_option_b_ram_rf' ? 'R' : s.strategy === 'custom_halftrend_hull_standalone' ? 'H' : s.strategy === 'custom_cusum15_nodonchian_cd8' ? 'C' : (s.strategy === 'broker_sync' ? 'B' : 'M')
           const up = isLong || isShortExit
           const t = Math.floor(new Date(s.time).getTime()/1000) + 19800
           return {
@@ -613,7 +624,7 @@ function SignalPanel({ signal, onManualTrade, position, connected, ltp, lastEntr
   const isEntry = sig === 'LONG' || sig === 'SHORT'
   const isExit  = sig === 'LONG_EXIT' || sig === 'SHORT_EXIT'
   const isHold  = sig === 'HOLD'
-  const isRegime = LIVE_REGIME_STRATEGY_IDS.includes(signal.strategy)
+  const isRegime = LIVE_STRATEGY_IDS.includes(signal.strategy) && !NO_REGIME_STRATEGY_IDS.has(signal.strategy)
   const showActiveEntry = isHold && lastEntry && (lastEntry.signal === 'LONG' || lastEntry.signal === 'SHORT')
   const displaySig = showActiveEntry ? lastEntry.signal : sig
   const sigColor = displaySig==='LONG'||displaySig==='LONG_EXIT' ? V('green') : displaySig==='SHORT'||displaySig==='SHORT_EXIT' ? V('red') : V('yellow')
@@ -713,7 +724,7 @@ function CompactSignalPanel({ signal, strategyLabel, ltp, lastEntry }) {
   const m = window.innerWidth < 768
   if (!signal || !signal.signal) return null
   const sig = signal.signal
-  const isRegime = LIVE_REGIME_STRATEGY_IDS.includes(signal.strategy)
+  const isRegime = LIVE_STRATEGY_IDS.includes(signal.strategy) && !NO_REGIME_STRATEGY_IDS.has(signal.strategy)
   const isEntry = sig === 'LONG' || sig === 'SHORT'
   const isHold  = sig === 'HOLD'
   const showActiveEntry = isHold && lastEntry && (lastEntry.signal === 'LONG' || lastEntry.signal === 'SHORT')
@@ -1111,13 +1122,12 @@ function SettingsPanel({ onSaved }) {
 // ── Backtest Panel ──────────────────────────────────────────────────────────
 function BacktestPanel({ connected, selectedStrategy, onSelectStrategy }) {
   const m = window.innerWidth < 768
-  const [form, setForm] = useState({ instrument:'BANKNIFTY', from_date:'', to_date:'', initial_capital:500000, lot_multiplier:1, strategy: selectedStrategy || 'regime_reversal', hold_mode:'INTRADAY' })
+  const [form, setForm] = useState({ instrument:'BANKNIFTY', from_date:'', to_date:'', initial_capital:500000, lot_multiplier:1, strategy: selectedStrategy || 'regime_trend_range', hold_mode:'INTRADAY' })
   const [result, setResult] = useState(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState('')
   const [availableStrategies, setAvailableStrategies] = useState([
     { v:'regime_trend_range', l:'Regime Trend/Range Optimized' },
-    { v:'regime_reversal', l:'Regime + Reversal Combined' },
     { v:'regime_trend_v2', l:'Regime Trend V2 — Selective (optimized)' },
     { v:'regime_trend_v2b', l:'Regime Trend V2-B — Balanced' },
     { v:'multi_agent', l:'Multi-Agent V3 Kernel' },
@@ -1436,10 +1446,9 @@ function SignalJournalPanel({ entries, onRefresh }) {
       const s = (e.strategy || '').toLowerCase()
       const f = appliedFilters.strategy.toLowerCase()
       if (s) {
-        if (f === 'regime_reversal' && !s.includes('reversal') && !s.includes('regime')) return false
         if (f === 'regime_trend_range' && !s.includes('regime') && !s.includes('trend') && !s.includes('range')) return false
         if (f === 'multi_agent' && !s.includes('multi')) return false
-        if (f !== 'regime_reversal' && f !== 'regime_trend_range' && f !== 'multi_agent' && s !== f && !s.includes(f)) return false
+        if (f !== 'regime_trend_range' && f !== 'multi_agent' && s !== f && !s.includes(f)) return false
       }
     }
 
@@ -1478,7 +1487,7 @@ function SignalJournalPanel({ entries, onRefresh }) {
     const headers = ['Date', 'Strategy', 'Instrument', 'Direction', 'Entry Price', 'SL', 'Target 1', 'Target 2', 'Regime', 'Score', 'Exit Time', 'Exit Price', 'P&L pts', 'P&L INR', 'Exit Reason', 'Status']
     const rows = filteredEntries.map(e => [
       e.entry_time,
-      LIVE_STRATEGY_LABELS[e.strategy] || (e.strategy === 'regime_reversal' ? 'Regime + Reversal' : e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy),
+      LIVE_STRATEGY_LABELS[e.strategy] || (e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy),
       e.instrument,
       e.direction,
       e.entry_price,
@@ -1540,7 +1549,8 @@ function SignalJournalPanel({ entries, onRefresh }) {
                 <option value="custom_alpha_combo_cusum125">Alpha Combo (CUSUM 1.25)</option>
                 <option value="custom_time_gated_alpha_combo">Time-Gated Alpha Combo</option>
                 <option value="custom_regime_v1_trend_range_final">Regime T/R V1 Final</option>
-                <option value="custom_halftrend_hull_standalone">HalfTrend + Hull</option>
+                <option value="custom_option_b_ram_rf">Option B: Ram &gt; Range Filter</option>
+                <option value="custom_halftrend_hull_standalone">HalfTrend + Hull (retired)</option>
                 <option value="custom_cusum15_nodonchian_cd8">CUSUM 1.5 (No Donchian)</option>
                 <option value="regime_trend_range">Regime T/R Optimized</option>
                 <option value="regime_trend_v2">Regime Trend V2 — Selective</option>
@@ -1642,7 +1652,7 @@ function SignalJournalPanel({ entries, onRefresh }) {
                 <tr key={i} style={{ borderBottom:`1px solid ${V('border-light')}`, background: i%2===0 ? 'transparent' : V('bg-tertiary') }}>
                   <td style={{ padding:'6px 8px', color:V('text-muted'), whiteSpace:'nowrap', fontSize:10 }}>{toISTDateTime(e.entry_time)}</td>
                   <td style={{ padding:'6px 8px', color:V('text-primary'), fontWeight:500 }}>
-                    {LIVE_STRATEGY_LABELS[e.strategy] || (e.strategy === 'regime_reversal' ? 'Regime + Reversal' : e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy)}
+                    {LIVE_STRATEGY_LABELS[e.strategy] || (e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy)}
                   </td>
                   <td style={{ padding:'6px 8px', color:V('text-primary'), fontWeight:500 }}>{e.instrument}</td>
                   <td style={{ padding:'6px 8px', color:e.direction==='LONG'?V('green'):V('red'), fontWeight:700 }}>{e.direction}</td>
@@ -5934,7 +5944,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
   // todayPnl directly.
   const displayPnl = todayPnl
 
-  const strategyLabels = { ...LIVE_STRATEGY_LABELS, regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
+  const strategyLabels = { ...LIVE_STRATEGY_LABELS, multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
   const [sparkData, setSparkData] = React.useState({ closes: [], pct_change: 0.0 })
   const [logs, setLogs] = React.useState([])
   const [isClosing, setIsClosing] = React.useState(false)
@@ -6080,7 +6090,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
     </Card>
   )
 
-  const maSignal = allSignals?.custom_halftrend_hull_standalone || (strategy === 'custom_halftrend_hull_standalone' ? signal : null)
+  const maSignal = allSignals?.custom_option_b_ram_rf || (strategy === 'custom_option_b_ram_rf' ? signal : null)
   const rtrSignal = allSignals?.custom_regime_v1_trend_range_final || (strategy === 'custom_regime_v1_trend_range_final' ? signal : null)
   const alphaComboSignal = allSignals?.custom_alpha_combo_cusum125 || (strategy === 'custom_alpha_combo_cusum125' ? signal : null)
   const timeGatedSignal = allSignals?.custom_time_gated_alpha_combo || (strategy === 'custom_time_gated_alpha_combo' ? signal : null)
@@ -6289,7 +6299,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
       <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(auto-fit, minmax(220px, 1fr))', gap:10, marginBottom:10 }}>
         {renderSignalCard(alphaComboSignal, 'Alpha Combo Signal')}
         {renderSignalCard(timeGatedSignal, 'Time-Gated Alpha Combo Signal')}
-        {renderSignalCard(maSignal, 'HalfTrend + Hull Signal')}
+        {renderSignalCard(maSignal, 'Option B (Ram > RF) Signal')}
         {renderSignalCard(rtrSignal, 'Regime T/R V1 Final Signal')}
       </div>
 
@@ -6376,7 +6386,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
 // ── Auto Trade Monitor Page ─────────────────────────────────────────────────
 function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals, capitalState, tradeState, strategy, signal }) {
   const m = window.innerWidth < 768
-  const strategyLabels = { ...LIVE_STRATEGY_LABELS, regime_reversal: 'Regime + Reversal', multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
+  const strategyLabels = { ...LIVE_STRATEGY_LABELS, multi_agent: 'Multi-Agent Optimized', regime_trend_range: 'Regime T/R Optimized', regime_trend_v2: 'Regime Trend V2', regime_trend_v2b: 'Regime Trend V2-B', donchian_5m_swing: 'Donchian 5m Swing', donchian_5m_intraday: 'Donchian 5m Intraday' }
 
   // ── Inactive state ──
   if (!autoTrade) {
@@ -6397,7 +6407,12 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
   }
 
   // ── Compute confidence score ──
-  const maSignal = allSignals?.custom_halftrend_hull_standalone
+  // NOTE: maSignal now comes from Option B (custom_option_b_ram_rf, replaced
+  // HalfTrend+Hull here 2026-10-01), which has no regime classifier -- its
+  // weighted_score/regime/regime_confidence are always 0/unset, so this
+  // score's "Weighted score" and "Regime clarity" components will read 0 for
+  // it. Agreement scoring (direction only) still works normally.
+  const maSignal = allSignals?.custom_option_b_ram_rf
   const rtrSignal = allSignals?.custom_regime_v1_trend_range_final
   const activeSignal = signal || maSignal || rtrSignal
 
@@ -6521,7 +6536,7 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
         <Card style={{ padding:20 }}>
           <div style={{ color:V('text-muted'), fontSize:11, textTransform:'uppercase', fontWeight:600, marginBottom:12 }}>Strategy Agreement</div>
           <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
-            {LIVE_REGIME_STRATEGY_IDS.map(sid => {
+            {LIVE_STRATEGY_IDS.map(sid => {
               const s = allSignals?.[sid]
               const dir = s?.signal
               const dirColor = dir === 'LONG' || dir === 'LONG_EXIT' ? V('green') : dir === 'SHORT' || dir === 'SHORT_EXIT' ? V('red') : V('yellow')
@@ -9017,7 +9032,7 @@ export default function App() {
 
                   {/* Col 2: Secondary Strategy Signal */}
                   {(() => {
-                    const otherSignals = Object.entries(allSignals || {}).filter(([k]) => LIVE_REGIME_STRATEGY_IDS.includes(k) && k !== strategy)
+                    const otherSignals = Object.entries(allSignals || {}).filter(([k]) => LIVE_STRATEGY_IDS.includes(k) && k !== strategy)
                     if (otherSignals.length > 0) {
                       return otherSignals.map(([k, sig]) => (
                         <ErrorBoundary key={k}>

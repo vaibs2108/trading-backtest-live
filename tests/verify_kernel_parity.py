@@ -2,8 +2,8 @@
 tests/verify_kernel_parity.py — Automated 100% Backtest Parity Verification.
 
 Compares trade-by-trade results between:
-  1. Old strategy modules (regime_strategy.py, regime_reversal_strategy.py)
-  2. New StrategyKernel instances (RegimeTrendKernel, RegimeReversalKernel)
+  1. Old strategy module (regime_strategy.py)
+  2. New StrategyKernel instance (RegimeTrendKernel)
 
 Asserts:
   - Exact trade count
@@ -132,55 +132,9 @@ def test_regime_trend_parity():
         return False
 
 
-def test_regime_reversal_parity():
-    logger.info("=== Testing RegimeReversalKernel Parity ===")
-    from strategies import regime_reversal_strategy
-
-    frames = generate_synthetic_frames(num_days=25)
-
-    # 1. Run old backtest
-    res_old = regime_reversal_strategy.run_backtest(frames)
-    trades_old = res_old.get("trades", [])
-    stats_old = res_old.get("stats", {})
-
-    # 2. Run new kernel backtest
-    kernel = get_kernel("regime_reversal")
-    res_new = kernel.run_backtest(frames)
-    trades_new = res_new.get("trades", [])
-    stats_new = res_new.get("stats", {})
-
-    logger.info(f"Old Trades Count: {len(trades_old)}, Total PnL: {stats_old.get('total_pnl')}")
-    logger.info(f"New Trades Count: {len(trades_new)}, Total PnL: {stats_new.get('total_pnl')}")
-
-    if len(trades_old) != len(trades_new):
-        logger.error(f"MISMATCH in trade count: Old={len(trades_old)} vs New={len(trades_new)}")
-        return False
-
-    mismatches = 0
-    for i, (t1, t2) in enumerate(zip(trades_old, trades_new)):
-        ep1, ep2 = t1.get("exit_price"), t2.get("exit_price")
-        exit_match = (pd.isna(ep1) and pd.isna(ep2)) or (ep1 == ep2)
-
-        if (t1["entry_time"] != t2["entry_time"] or
-            t1["direction"] != t2["direction"] or
-            t1["entry_price"] != t2["entry_price"] or
-            not exit_match or
-            t1["pnl"] != t2["pnl"]):
-            logger.error(f"Mismatch at Trade #{i+1}:\n  Old: {t1}\n  New: {t2}")
-            mismatches += 1
-
-    if mismatches == 0:
-        logger.info("✅ PARITY SUCCESS: RegimeReversalKernel matches 100% with original regime_reversal_strategy!")
-        return True
-    else:
-        logger.error(f"❌ PARITY FAILED: {mismatches} trade mismatches found!")
-        return False
-
-
 if __name__ == "__main__":
     t1 = test_regime_trend_parity()
-    t2 = test_regime_reversal_parity()
-    if t1 and t2:
+    if t1:
         logger.info("🎉 ALL PARITY TESTS PASSED! 100% BACKTEST MATCH GUARANTEED!")
         sys.exit(0)
     else:

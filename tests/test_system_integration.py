@@ -21,7 +21,6 @@ sys.path.insert(0, str(backend_dir))
 
 from strategy_kernel import get_kernel, get_all_kernels, get_kernel_list, SignalEvent
 from strategies.regime_strategy import run_backtest as old_regime_bt
-from strategies.regime_reversal_strategy import run_backtest as old_reversal_bt
 import strategy_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -78,12 +77,12 @@ def test_1_kernel_registry():
     kernel_list = get_kernel_list()
     
     assert len(kernels) == 4, f"Expected 4 kernels, got {len(kernels)}"
-    expected_ids = {"regime_trend_range", "regime_reversal", "trend_reversal", "multi_agent"}
+    expected_ids = {"regime_trend_range", "trend_reversal", "multi_agent"}
     assert set(kernels.keys()) == expected_ids, f"Mismatch in kernel IDs: {set(kernels.keys())}"
 
     # Check live capability flag
     live_ids = {k.strategy_id for k in kernels.values() if k.live_capable}
-    assert live_ids == {"regime_trend_range", "regime_reversal"}, f"Unexpected live kernels: {live_ids}"
+    assert live_ids == {"regime_trend_range"}, f"Unexpected live kernels: {live_ids}"
 
     logger.info(f"✅ Test 1 Passed: 4 strategy kernels registered cleanly (Live: {live_ids})")
     return True
@@ -106,16 +105,7 @@ def test_2_multi_regime_parity():
         assert len(t_old) == len(t_new), f"Regime {r} Trend trade count mismatch: {len(t_old)} vs {len(t_new)}"
         assert res_old_trend["stats"]["total_pnl"] == res_new_trend["stats"]["total_pnl"], f"Regime {r} Trend PnL mismatch"
 
-        # 2. Regime Reversal Parity
-        res_old_rev = old_reversal_bt(frames)
-        res_new_rev = get_kernel("regime_reversal").run_backtest(frames)
-        
-        r_old = res_old_rev.get("trades", [])
-        r_new = res_new_rev.get("trades", [])
-        assert len(r_old) == len(r_new), f"Regime {r} Reversal trade count mismatch: {len(r_old)} vs {len(r_new)}"
-        assert res_old_rev["stats"]["total_pnl"] == res_new_rev["stats"]["total_pnl"], f"Regime {r} Reversal PnL mismatch"
-
-        logger.info(f"  ✓ {r}: Trend ({len(t_old)} trades, ₹{res_old_trend['stats']['total_pnl']:.2f}) & Reversal ({len(r_old)} trades, ₹{res_old_rev['stats']['total_pnl']:.2f}) 100% matched.")
+        logger.info(f"  ✓ {r}: Trend ({len(t_old)} trades, ₹{res_old_trend['stats']['total_pnl']:.2f}) 100% matched.")
 
     logger.info("✅ Test 2 Passed: 100% Backtest Parity verified across all market regimes.")
     return True
@@ -158,7 +148,7 @@ def test_4_all_strategy_backtests():
     logger.info("--- Test 4: Backtest Execution Across All 4 Kernels ---")
     frames = generate_regime_frames("TRENDING_UP", num_days=10)
 
-    for strat_id in ["regime_trend_range", "regime_reversal", "trend_reversal", "multi_agent"]:
+    for strat_id in ["regime_trend_range", "trend_reversal", "multi_agent"]:
         kernel = get_kernel(strat_id)
         assert kernel is not None, f"Kernel not found: {strat_id}"
         

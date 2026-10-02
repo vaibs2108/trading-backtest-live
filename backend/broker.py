@@ -59,15 +59,19 @@ def dhan_api_call(*args, **kwargs):
         func = kwargs.pop("func")
         func_args = ()
 
+    # The lock only reserves this call's time slot within its category; the wait and
+    # the network call itself happen outside it. It used to be held across the call,
+    # so one slow request (e.g. a backtest's multi-month historical fetch) blocked every
+    # other Dhan call in the app -- LTP, positions, orders -- until it returned.
     min_spacing = _category_min_spacing.get(category, 0.50)
     with _dhan_api_lock:
         now = _time.time()
-        last_time = _last_call_by_category.get(category, 0.0)
-        elapsed = now - last_time
-        if elapsed < min_spacing:
-            _time.sleep(min_spacing - elapsed)
-        _last_call_by_category[category] = _time.time()
-        return func(*func_args, **kwargs)
+        slot = max(now, _last_call_by_category.get(category, 0.0) + min_spacing)
+        _last_call_by_category[category] = slot
+    wait = slot - _time.time()
+    if wait > 0:
+        _time.sleep(wait)
+    return func(*func_args, **kwargs)
 
 # ── Global client and facade instances ───────────────────────────────────────
 _dhan_client = None
@@ -542,6 +546,96 @@ def fetch_index_historical_data(
     return get_historical_data(instrument, timeframe, from_date, to_date, use_index=True)
 
 
+def _load_local_parquet_cache(
+    instrument: str,
+    timeframe: str,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None
+) -> Optional[pd.DataFrame]:
+    """Fallback loader when Dhan REST Historical API fails or returns HTTP 451 (DH-902).
+    
+    Reads from pre-cleaned parquet archives in scratch/research_14L/long_cache/,
+    scratch/research_banknifty/live_cache/, Research/data/clean/, or Research/data/raw/.
+    Ensures chart rendering and live indicator calculations never crash or return empty.
+    """
+    try:
+        from pathlib import Path
+        tf_norm = str(timeframe).upper().replace("MIN", "").replace("M", "").strip()
+        if tf_norm in ("DAY", "D", "1D"):
+            tf_keys = ["1D", "daily", "DAY"]
+        elif tf_norm in ("60", "1H", "H", "60MIN"):
+            tf_keys = ["60", "1hour", "60min"]
+        elif tf_norm in ("15", "15MIN"):
+            tf_keys = ["15", "15min"]
+        elif tf_norm in ("5", "5MIN"):
+            tf_keys = ["5", "5min"]
+        elif tf_norm in ("1", "1MIN"):
+            tf_keys = ["1", "1min"]
+        else:
+            tf_keys = [tf_norm]
+
+        base_dir = Path(__file__).resolve().parent.parent  # repo root
+        inst_up = instrument.upper()
+        inst_lo = instrument.lower()
+
+        candidates = []
+        for k in tf_keys:
+            candidates.extend([
+                base_dir / "scratch" / "research_14L" / "long_cache" / f"{inst_up}_{k}.parquet",
+                base_dir / "scratch" / "research_banknifty" / "live_cache" / f"{inst_up}_{k}.parquet",
+                base_dir / "scratch" / "research_sensex" / "data" / f"sensex_{k}_recent.parquet",
+                base_dir / "scratch" / "research_sensex" / "data" / f"sensex_{k}.parquet",
+                base_dir / "Research" / "data" / "clean" / f"{inst_lo}_{k}.parquet",
+                base_dir / "Research" / "data" / "raw" / f"{inst_lo}_{k}.parquet",
+                base_dir / "Research" / "data" / "clean" / f"{inst_lo}_{k}min.parquet",
+                base_dir / "Research" / "data" / "raw" / f"{inst_lo}_{k}min.parquet",
+            ])
+
+        target_file = None
+        for c in candidates:
+            if c.exists():
+                target_file = c
+                break
+
+        if not target_file:
+            return None
+
+        df = pd.read_parquet(target_file)
+        if "timestamp" not in df.columns and "datetime" in df.columns:
+            df["timestamp"] = df["datetime"]
+        elif "date" in df.columns and "timestamp" not in df.columns:
+            df["timestamp"] = df["date"]
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        if getattr(df["timestamp"].dt, "tz", None) is not None:
+            df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "volume" not in df.columns:
+            df["volume"] = 0
+        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
+
+        res = df
+        if from_date or to_date:
+            cond = pd.Series(True, index=df.index)
+            if from_date:
+                cond = cond & (df["timestamp"] >= pd.to_datetime(from_date))
+            if to_date:
+                cond = cond & (df["timestamp"] <= pd.to_datetime(to_date) + pd.Timedelta(days=1))
+            sub = df[cond]
+            if len(sub) >= 30:
+                res = sub
+            else:
+                res = df.tail(min(len(df), 2000))
+
+        return res[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+    except Exception as e:
+        logger.error(f"Error reading local parquet cache for {instrument} {timeframe}: {e}")
+        return None
+
+
 def get_historical_data(
     instrument: str,
     timeframe: str,
@@ -553,6 +647,7 @@ def get_historical_data(
     Fetch historical OHLCV data from Dhan directly using dhanhq client.
     Supports daily data (historical_daily_data) and intraday timeframes 
     (intraday_minute_data with 90-day chunk limits).
+    Falls back gracefully to local parquet cache if broker API is unavailable or returns 451.
     """
     global _hist_cache, _hist_cache_time
     cache_key = (instrument, timeframe, from_date, to_date, use_index)
@@ -566,6 +661,11 @@ def get_historical_data(
             return _hist_cache[cache_key].copy()
 
     if not _connected or _dhan_client is None:
+        cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_date, to_date)
+        if cached_fallback is not None and not cached_fallback.empty:
+            _hist_cache[cache_key] = cached_fallback
+            _hist_cache_time[cache_key] = now
+            return cached_fallback.copy()
         return None
 
     try:
@@ -596,7 +696,8 @@ def get_historical_data(
                     expiry_code = int(row['SEM_EXPIRY_CODE'])
                 else:
                     logger.error(f"Could not resolve FUTCOM for MCX symbol {symbol}")
-                    return None
+                    cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_date, to_date)
+                    return cached_fallback.copy() if cached_fallback is not None else None
             else:
                 match = df_master[
                     ((df_master['SEM_TRADING_SYMBOL'] == symbol) | (df_master['SEM_CUSTOM_SYMBOL'] == symbol)) &
@@ -604,7 +705,8 @@ def get_historical_data(
                 ]
                 if match.empty:
                     logger.error(f"Could not resolve symbol {symbol} for historical data")
-                    return None
+                    cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_date, to_date)
+                    return cached_fallback.copy() if cached_fallback is not None else None
                 row = match.iloc[-1]
                 sec_id = str(row['SEM_SMST_SECURITY_ID'])
                 exch_seg = "NSE_FNO" if exch == "NFO" else ("BSE_FNO" if exch == "BFO" else ("MCX_COMM" if exch == "MCX" else "NSE_EQ"))
@@ -613,7 +715,8 @@ def get_historical_data(
 
         if not sec_id:
             logger.error(f"Could not resolve security ID for {instrument}")
-            return None
+            cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_date, to_date)
+            return cached_fallback.copy() if cached_fallback is not None else None
 
         # Build dates
         if not from_date or not to_date:
@@ -673,7 +776,12 @@ def get_historical_data(
                     else:
                         res_str = str(res).lower()
                         is_rate_limit = any(x in res_str for x in ["dh-904", "rate_limit", "rate limit", "too many requests", "904"])
-                        if is_rate_limit:
+                        is_unauthorized = any(x in res_str for x in ["dh-902", "invalid_access", "451", "not subscribed"])
+                        if is_unauthorized:
+                            logger.warning(f"Dhan historical Data API unavailable (DH-902/451). Switching to local cache.")
+                            curr_from = to_dt + timedelta(days=1)
+                            break
+                        elif is_rate_limit:
                             wait_secs = 0.5 * (attempt + 1)
                             logger.warning(f"Rate limited, retry {attempt+1}/3 in {wait_secs}s")
                             _time.sleep(wait_secs)
@@ -687,7 +795,14 @@ def get_historical_data(
                 _time.sleep(0.3)
 
         if not all_dfs:
-            logger.error(f"Failed to retrieve historical data for {instrument}")
+            logger.warning(f"No historical data from broker API for {instrument} ({timeframe}), checking local parquet cache...")
+            cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_d, to_d)
+            if cached_fallback is not None and not cached_fallback.empty:
+                logger.info(f"Loaded {len(cached_fallback)} rows from local parquet cache for {instrument} ({timeframe})")
+                _hist_cache[cache_key] = cached_fallback
+                _hist_cache_time[cache_key] = now
+                return cached_fallback.copy()
+            logger.error(f"Failed to retrieve historical data for {instrument} (both broker API and local cache empty)")
             return None
 
         df = pd.concat(all_dfs, ignore_index=True)
@@ -713,6 +828,9 @@ def get_historical_data(
         return result_df.copy()
     except Exception as e:
         logger.error(f"Error in get_historical_data: {e}")
+        cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_date, to_date)
+        if cached_fallback is not None and not cached_fallback.empty:
+            return cached_fallback.copy()
         return None
 
 

@@ -212,13 +212,30 @@ class LiveFeedManager:
         logger.info(f"LiveFeed started for {self._instrument} (security_id={self._security_id})")
 
     def stop(self):
-        """Stop the WebSocket feed."""
+        """Stop the WebSocket feed.
+
+        dhanhq's MarketFeed.close_connection() ends in
+        asyncio.run_coroutine_threadsafe(...).result() with no timeout. stop() sets
+        _running=False first, so the feed thread's loop exits within ~2s and that future
+        can then never complete: the caller hangs forever. On the event-loop thread this
+        froze the whole server until the watchdog's 120s heartbeat kill ("Failed to fetch"
+        on the Backtest page, 2026-10-02). So close in a daemon thread and give up after
+        a bounded wait instead of blocking the caller.
+        """
         self._running = False
-        if self._feed is not None:
-            try:
-                self._feed.close_connection()
-            except Exception as e:
-                logger.debug(f"Error closing feed: {e}")
+        feed = self._feed
+        if feed is not None:
+            def _close():
+                try:
+                    feed.close_connection()
+                except Exception as e:
+                    logger.debug(f"Error closing feed: {e}")
+
+            closer = threading.Thread(target=_close, daemon=True, name="LiveFeedClose")
+            closer.start()
+            closer.join(timeout=5.0)
+            if closer.is_alive():
+                logger.warning("LiveFeed close_connection() did not return within 5s -- abandoning it")
         self._feed = None
         logger.info("LiveFeed stopped")
 

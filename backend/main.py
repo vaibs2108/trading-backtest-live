@@ -87,7 +87,7 @@ import strategy
 from live_feed import get_live_feed
 import strategy_router
 import signal_journal_manager
-from config import get_settings, save_settings, INSTRUMENT_META, TIMEFRAME_LABELS, MARKET_HOURS
+from config import get_settings, save_settings, settings_override, INSTRUMENT_META, TIMEFRAME_LABELS, MARKET_HOURS
 from trade_manager import get_trade_manager, ActivePosition
 from capital_tracker import get_capital_tracker
 import slippage_tracker
@@ -207,6 +207,29 @@ _live_frames: dict = {}          # cached multi-TF data
 _live_frames_instrument: str = ""   # which instrument _live_frames belongs to
 _last_signal: dict = {}          # last computed signal
 _all_strat_sigs_cache: dict = {}  # cached signals from ALL strategies (set by polling loop)
+
+
+def _display_last_signal() -> dict:
+    """_last_signal for display to the frontend (/api/status, WS 'init').
+
+    _last_signal only gets written inside _signal_polling_loop's market-hours
+    section (BUG FIXED 2026-10-01) -- right after a restart, or any time
+    outside 09:15-15:30 IST, it's still the bare {} module default. The
+    frontend's primary SignalPanel does `if (!signal || !signal.signal)
+    return null`, so an empty dict made the active strategy's own panel go
+    fully blank -- looked like a missing-strategy bug, was actually just
+    "the engine hasn't completed a cycle yet". Internal logic that checks
+    _last_signal's truthiness to mean "has the engine ever run" (lines near
+    994, 3149, 4902) is untouched -- this only affects what's shown to the UI.
+    """
+    if _last_signal and _last_signal.get("signal"):
+        return _last_signal
+    _cfg = get_settings()
+    _cur_ltp = broker.get_ltp(_cfg.instrument)
+    return {
+        "signal": "HOLD", "strategy": _cfg.strategy, "instrument": _cfg.instrument,
+        "close": _cur_ltp or 0.0, "time": datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S")
+    }
 _signal_history: list = []       # all signals this session
 _SIGNAL_HISTORY_PATH = Path(__file__).parent / "data" / "signal_history.json"
 
@@ -630,7 +653,7 @@ async def get_status():
         "lot_size":     lot,
         "ltp":          ltp,
         "trade_state":  trade_state,
-        "last_signal":  _last_signal,
+        "last_signal":  _display_last_signal(),
         "active_trade_signal": _active_trade_signal,
         "active_entries": _get_active_entries(cfg, tm),
         "capital_state": get_capital_tracker().get_state(),
@@ -858,10 +881,27 @@ async def get_signals_all():
     # Return the cache populated by _signal_polling_loop
     results = dict(_all_strat_sigs_cache)  # shallow copy
 
-    # If the cache is empty (engine hasn't run yet), return minimal HOLD stubs
+    # If the cache is empty (engine hasn't run a cycle yet since this process
+    # started -- e.g. right after a restart, or outside market hours when
+    # there's no new bar to trigger an evaluation), return minimal HOLD
+    # stubs. BUG FIXED 2026-10-01: this used to stub out
+    # strategy_router.STRATEGY_OPTIONS, a legacy list of 6 backtest-only
+    # strategies (regime_trend_v2/v2b, donchian_*, ...) that
+    # hasn't matched what's actually live since 2026-08-23 -- the frontend's
+    # LIVE_STRATEGY_OPTIONS tiles would find none of their expected keys and
+    # just look broken/empty. Stub the REAL 5 production strategies instead
+    # (keep this in sync with _proc_list below).
     if not results:
-        for strat_id in strategy_router.STRATEGY_OPTIONS:
-            results[strat_id] = {"signal": "HOLD", "strategy": strat_id, "instrument": cfg.instrument}
+        _cur_ltp = broker.get_ltp(cfg.instrument)
+        for strat_id in (
+            "custom_alpha_combo_cusum125", "custom_time_gated_alpha_combo",
+            "custom_regime_v1_trend_range_final", "custom_option_b_ram_rf",
+            "custom_cusum15_nodonchian_cd8",
+        ):
+            results[strat_id] = {
+                "signal": "HOLD", "strategy": strat_id, "instrument": cfg.instrument,
+                "close": _cur_ltp or 0.0, "time": datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S")
+            }
 
     active_entries = _get_active_entries(cfg, tm)
     return {"active_strategy": cfg.strategy, "signals": results, "active_entries": active_entries}
@@ -1025,22 +1065,23 @@ async def run_backtest(req: BacktestRequest):
         raise HTTPException(status_code=500, detail="Failed to fetch backtest data")
     # Use dynamic lot size from Dhan API / INSTRUMENT_META
     lot_size = broker.get_lot_size(req.instrument)
-    # Temporarily override strategy and instrument for this backtest
+    # The backtest runs in a separate worker process (backtest_worker.py) on a COPY of
+    # the settings with its own strategy/instrument/hold mode. It used to write those
+    # onto the GLOBAL live settings and run in this process, sharing strategy objects
+    # and CPU with the live loop -- the live feed got rebound to the backtest's
+    # instrument (freezing the server), and the live loop treated the backtest's
+    # strategy as the active one for the whole run.
     cfg = get_settings()
     bt_strategy = req.strategy or cfg.strategy
-    original_strategy = cfg.strategy
-    original_instrument = cfg.instrument
-    original_hold_mode = cfg.position_hold_mode
-    if bt_strategy != original_strategy:
-        cfg.strategy = bt_strategy
-    if req.instrument != original_instrument:
-        cfg.instrument = req.instrument
     bt_hold_mode = req.hold_mode if req.hold_mode in ("INTRADAY", "CARRY_FORWARD") else "INTRADAY"
-    cfg.position_hold_mode = bt_hold_mode
+    bt_settings = cfg.model_copy(update={
+        "strategy": bt_strategy, "instrument": req.instrument, "position_hold_mode": bt_hold_mode,
+    })
 
     try:
-        result = await asyncio.to_thread(
-            strategy_router.run_backtest,
+        import backtest_worker
+        result = await backtest_worker.run_backtest(
+            bt_settings,
             frames,
             req.initial_capital,
             lot_size,
@@ -1051,10 +1092,6 @@ async def run_backtest(req: BacktestRequest):
     except Exception as e:
         logger.error(f"Backtest execution error for {req.instrument} ({bt_strategy}): {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Backtest error: {str(e)}")
-    finally:
-        cfg.strategy = original_strategy
-        cfg.instrument = original_instrument
-        cfg.position_hold_mode = original_hold_mode
 
     if not isinstance(result, dict):
         result = {"error": "Invalid backtest result"}
@@ -1215,7 +1252,6 @@ async def get_backtest_strategies():
 
     builtins = [
         {"id": "regime_trend_range", "label": "Regime Trend/Range Optimized"},
-        {"id": "regime_reversal", "label": "Regime + Reversal Combined"},
         {"id": "regime_trend_v2", "label": "Regime Trend V2 — Selective (optimized)"},
         {"id": "regime_trend_v2b", "label": "Regime Trend V2-B — Balanced"},
         {"id": "multi_agent", "label": "Multi-Agent V3 Kernel"},
@@ -1321,7 +1357,7 @@ def _build_chart_signals_from_result(result: dict, strat: str, inst: str, days: 
             "target1": t.get("target1", 0), "target2": t.get("target2", 0),
             "strategy": strat,
         })
-        if exit_time:
+        if exit_time and exit_time not in ("", "-", "None", "nan") and t.get("exit_reason") != "OPEN":
             signals.append({
                 "signal": f"{direction}_EXIT", "time": exit_time,
                 "entry": t.get("exit_price", 0), "close": t.get("exit_price", 0),
@@ -1394,19 +1430,12 @@ async def get_chart_signals(strategy: Optional[str] = None, instrument: Optional
                     def _run_bt():
                         try:
                             import strategy_router
-                            # Run for the REQUESTED strategy and instrument — override cfg
-                            # for the duration of this call so router executes correctly.
-                            _orig_strat = cfg.strategy
-                            _orig_inst = cfg.instrument
-                            if strat != _orig_strat:
-                                cfg.strategy = strat
-                            if inst != _orig_inst:
-                                cfg.instrument = inst
-                            try:
+                            # Run for the REQUESTED strategy and instrument. The override is
+                            # local to this worker thread -- it used to be written onto the
+                            # GLOBAL settings, so for the whole run the live loop treated the
+                            # chart's strategy as the active one (Telegram, entries, ownership).
+                            with settings_override(strategy=strat, instrument=inst):
                                 return strategy_router.run_backtest(frames)
-                            finally:
-                                cfg.strategy = _orig_strat
-                                cfg.instrument = _orig_inst
                         except Exception as e:
                             logger.error(f"chart_signals backtest error ({strat} for {inst}): {e}")
                             return None
@@ -1449,7 +1478,9 @@ async def get_chart_signals(strategy: Optional[str] = None, instrument: Optional
 async def get_signal_journal_endpoint():
     """Fetch strategy signal journal entries (theoretical P&L, all instruments)."""
     entries = signal_journal_manager.get_journal(None)
-    return {"entries": entries}
+    # Some closed entries have NaN exit price / P&L (no exit price was recorded);
+    # NaN isn't valid JSON and made this endpoint fail with HTTP 500.
+    return _sanitise_floats({"entries": entries})
 
 
 @app.get("/api/cas_alerts")
@@ -1956,7 +1987,7 @@ async def websocket_endpoint(ws: WebSocket):
         # Send current state immediately on connect
         await ws.send_json({"type": "init", "data": {
             "connected": broker.is_connected(),
-            "signal": _last_signal,
+            "signal": _display_last_signal(),
             "state": get_trade_manager().get_state(),
         }})
         while True:
@@ -2153,6 +2184,12 @@ async def shutdown_event():
     try:
         import cas_scanner
         cas_scanner.stop()
+    except Exception:
+        pass
+    # Stop Backtest-page worker processes
+    try:
+        import backtest_worker
+        backtest_worker.shutdown()
     except Exception:
         pass
     try:
@@ -2464,7 +2501,9 @@ async def _ensure_live_feed(cfg, now_ist):
     add_activity_log(f"Live feed restart ({reason}): {cfg.instrument}")
     _old_thread = getattr(_feed, "_thread", None)
     try:
-        _feed.stop()
+        # Off the event loop: stop() waits (bounded) on dhanhq's close_connection(); running
+        # it directly here froze the whole server (see LiveFeedManager.stop()).
+        await asyncio.wait_for(asyncio.to_thread(_feed.stop), timeout=15)
     except Exception:
         pass
     if _old_thread is not None and _old_thread.is_alive():
@@ -2510,7 +2549,6 @@ async def _ensure_live_feed(cfg, now_ist):
 # (backend/strategies/regime_trend_range_v1_research.py).
 _TRAIL_PARAMS = {
     "custom_regime_v1_trend_range_final": {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
-    "custom_halftrend_hull_standalone":   {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
     "custom_cusum15_nodonchian_cd8":      {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
     # Alpha Combo inherits TRAIL_MULT=3.5/BE_TRIGGER=2.0 unchanged from the same
     # CUSUM15PlusRawHalfTrendKernel lineage as the CD8 row above (only
@@ -2519,16 +2557,22 @@ _TRAIL_PARAMS = {
     # Time-Gated Alpha Combo is Alpha Combo plus an entry-time filter only --
     # trail/BE params are untouched, same values apply.
     "custom_time_gated_alpha_combo":      {"trail_mult": 3.5, "trail_activation": 0.3, "be_trigger": 2.0, "be_buffer": 0.4},
+    # custom_option_b_ram_rf (replaced custom_halftrend_hull_standalone here
+    # 2026-10-01) is deliberately NOT in this dict -- backtesting showed the
+    # app's standard ATR trail wrecks this engine's own RAM/RF/no-progress
+    # exit logic (-24,923 pts over 5 years). Its exits must come only from
+    # its own signals; see live_bar_processor.py's OptionBRamRFLiveProcessor.
 }
 
 # Cooldown-after-loss bar counts, keyed by strategy_id. CUSUM's 8-bar
 # cooldown is load-bearing for its validated drawdown control (it's what
 # brought maxDD down from -11.44% to -7.92% in backtest) and must be
 # respected here exactly, not silently default to 0 like an unrecognized
-# strategy would.
+# strategy would. custom_option_b_ram_rf is deliberately absent (defaults to
+# 0) -- its own engine's re-entry behavior was validated as-is, with no
+# cooldown layered on top; see FINDINGS.md rounds 12-21.
 _COOLDOWN_BARS = {
     "custom_regime_v1_trend_range_final": 4,
-    "custom_halftrend_hull_standalone": 4,
     "custom_cusum15_nodonchian_cd8": 8,
     # Alpha Combo inherits COOLDOWN_BARS=8 unchanged from CUSUM15PlusRawHalfTrendKernel,
     # same as the CD8 row above.
@@ -2536,6 +2580,27 @@ _COOLDOWN_BARS = {
     # Time-Gated Alpha Combo inherits the same COOLDOWN_BARS=8 (only adds an
     # entry-time filter, doesn't touch cooldown).
     "custom_time_gated_alpha_combo": 8,
+}
+
+# Strategies whose target2 is informational-only (shown on the tile/journal/
+# Telegram so the user can choose to close manually) and must NOT auto-fire
+# a real T2_HIT exit. Added 2026-10-01 for the RAM/Range-Filter engine family
+# (custom_ram_rf_box.py): backtesting showed a real auto-exiting 1-2% target2
+# cuts 20-48% of this engine's total P&L, because its edge depends on letting
+# RF-held trends run -- a fixed early target fights the strategy's own
+# design.
+#
+# CORRECTION (same day, caught by a second independent pass): target1 is
+# NOT purely informational for any strategy -- reaching it calls
+# tm.mark_t1_hit(), which moves the live SL to the entry price (breakeven;
+# see trade_manager.py). That's a real, consequential side effect, not a
+# flag. For this engine family specifically, touching target1 at any level
+# tested cost points rather than helping, so their own TARGET1_PCT class
+# attribute is set to 0 (off) instead -- see custom_ram_rf_box.py.
+_INFO_ONLY_TARGET2 = {
+    "custom_option_a_tg_ram_rf",
+    "custom_option_b_ram_rf",
+    "custom_ram_rf_box",
 }
 
 
@@ -2770,7 +2835,7 @@ async def _signal_polling_loop():
                 global _all_strat_sigs_cache
 
                 from live_bar_processor import (
-                    get_regime_v1_final_processor, get_halftrend_hull_processor, get_cusum15_processor,
+                    get_regime_v1_final_processor, get_option_b_processor, get_cusum15_processor,
                     get_alpha_combo_processor, get_time_gated_alpha_combo_processor,
                 )
 
@@ -2779,26 +2844,28 @@ async def _signal_polling_loop():
 
                 _all_strat_sigs = {}
 
-                # Five PRODUCTION strategies run live: the original 3 research
+                # Five PRODUCTION strategies run live: the original research
                 # strategies validated in scratch/research_v1/ (Regime T/R
-                # V1 Final, HalfTrend+Hull Standalone, CUSUM 1.5/No-Donchian/
-                # CD8), Alpha Combo (CUSUM 1.25 Tuned) -- the strategy that
-                # beat CUSUM 1.5 and every dual-engine pyramid variant under
-                # train/validate/full discipline, promoted 2026-08-22 and the
-                # default (see settings.json / config.py Settings.strategy)
-                # -- and Time-Gated Alpha Combo, promoted 2026-08-23 after the
-                # same discipline plus a deep trade-level audit (BankNifty-only
-                # validation, see STRATEGY_REGISTRY.md). regime_trend_range/
+                # V1 Final, CUSUM 1.5/No-Donchian/CD8), Alpha Combo (CUSUM 1.25
+                # Tuned) -- the strategy that beat CUSUM 1.5 and every dual-
+                # engine pyramid variant under train/validate/full discipline,
+                # promoted 2026-08-22 and the default (see settings.json /
+                # config.py Settings.strategy) -- Time-Gated Alpha Combo,
+                # promoted 2026-08-23 after the same discipline plus a deep
+                # trade-level audit (BankNifty-only validation, see
+                # STRATEGY_REGISTRY.md) -- and Option B: Ram > Range Filter
+                # (scratch/research_14L/), promoted 2026-10-01, REPLACING
+                # HalfTrend+Hull Standalone in this slot (see FINDINGS.md
+                # rounds 12-21 for the full comparison and the SL/target/
+                # window live-wiring fix done the same day). regime_trend_range/
                 # multi_agent remain registered for the Backtest page but are
-                # no longer evaluated in the live loop; regime_reversal was
-                # removed from the registry entirely on 2026-08-23 (worst
-                # drawdown of any tested strategy, see STRATEGY_REGISTRY.md).
+                # no longer evaluated in the live loop.
                 # V2 / V2-B / Donchian also stay backtest-only, as before.
                 _proc_list = [
                     ("custom_alpha_combo_cusum125", get_alpha_combo_processor()),
                     ("custom_time_gated_alpha_combo", get_time_gated_alpha_combo_processor()),
                     ("custom_regime_v1_trend_range_final", get_regime_v1_final_processor()),
-                    ("custom_halftrend_hull_standalone", get_halftrend_hull_processor()),
+                    ("custom_option_b_ram_rf", get_option_b_processor()),
                     ("custom_cusum15_nodonchian_cd8", get_cusum15_processor()),
                 ]
                 # Active strategy FIRST — its chart marker, telegram alert and
@@ -3540,8 +3607,11 @@ async def _signal_polling_loop():
                             #     exit_reason = "DAILY_LOSS_LIMIT_BREACH"
                             #     exit_price = ltp
                             #     logger.warning(f"Intra-trade guard: {breach_msg}. Forcing exit.")
-                            # 1. Target 2 hit (index level)
-                            if pos.target2 > 0 and (
+                            # 1. Target 2 hit (index level) -- informational-only for
+                            # strategies in _INFO_ONLY_TARGET2 (gated on the position's
+                            # OWN strategy, not cfg.strategy, since this loop runs for
+                            # every tracked position regardless of which is active).
+                            if pos.target2 > 0 and getattr(pos, "strategy", None) not in _INFO_ONLY_TARGET2 and (
                                (pos.direction == "LONG" and ltp >= pos.target2) or
                                (pos.direction == "SHORT" and ltp <= pos.target2)
                             ):
