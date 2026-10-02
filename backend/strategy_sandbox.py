@@ -1143,6 +1143,12 @@ class CustomStrategyManager:
         filename = f"{clean_id}.py"
         filepath = os.path.join(CUSTOM_STRATEGIES_DIR, filename)
 
+        # A live strategy's file is never overwritten -- saving under its name always
+        # creates a new copy instead (see config.LIVE_STRATEGY_IDS).
+        from config import LIVE_STRATEGY_IDS
+        if clean_id in LIVE_STRATEGY_IDS:
+            overwrite = False
+
         if os.path.exists(filepath) and not overwrite:
             clean_id = f"{clean_id}_{int(time.time())}"
             filename = f"{clean_id}.py"
@@ -1217,6 +1223,10 @@ class CustomStrategyManager:
 
     @staticmethod
     def delete_strategy(strategy_id: str) -> bool:
+        from config import LIVE_STRATEGY_IDS
+        if strategy_id.removesuffix(".py") in LIVE_STRATEGY_IDS:
+            logger.warning(f"Refused to delete live strategy {strategy_id}")
+            return False  # live strategies are locked (see config.LIVE_STRATEGY_IDS)
         filename = f"{strategy_id}.py" if not strategy_id.endswith(".py") else strategy_id
         filepath = os.path.join(CUSTOM_STRATEGIES_DIR, filename)
         if os.path.exists(filepath):

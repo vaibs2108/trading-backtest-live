@@ -250,6 +250,17 @@ def get_settings() -> Settings:
         return _settings
 
 
+# The strategies the live trading loop runs (keep in sync with main.py's _proc_list).
+# They are locked: the Backtest page / Research Studio can't delete or replace them,
+# and reloading custom strategies never swaps out their loaded code while live.
+LIVE_STRATEGY_IDS = (
+    "custom_alpha_combo_cusum125",
+    "custom_time_gated_alpha_combo",
+    "custom_regime_v1_trend_range_final",
+    "custom_option_b_ram_rf",
+    "custom_cusum15_nodonchian_cd8",
+)
+
 # Credential fields that must ONLY come from .env (never saved to settings.json)
 CRED_FIELDS = {"dhan_client_code", "dhan_access_token", "telegram_bot_token", "telegram_chat_id",
                "dhan_cas_client_code", "dhan_cas_access_token"}

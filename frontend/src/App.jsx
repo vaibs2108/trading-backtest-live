@@ -1130,7 +1130,7 @@ function SettingsPanel({ onSaved }) {
 }
 
 // ── Backtest Panel ──────────────────────────────────────────────────────────
-function BacktestPanel({ connected, selectedStrategy, onSelectStrategy }) {
+function BacktestPanel({ connected, selectedStrategy, onStrategyChange, onSelectStrategy }) {
   const m = window.innerWidth < 768
   const [form, setForm] = useState({ instrument:'BANKNIFTY', from_date:'', to_date:'', initial_capital:500000, lot_multiplier:1, strategy: selectedStrategy || 'regime_trend_range', hold_mode:'INTRADAY' })
   const [result, setResult] = useState(null)
@@ -1174,7 +1174,7 @@ function BacktestPanel({ connected, selectedStrategy, onSelectStrategy }) {
         setForm(p => ({ ...p, strategy: 'regime_trend_range' }))
         fetchStrats()
       } else {
-        alert(r.error || 'Failed to delete strategy')
+        alert(r.detail || r.error || 'Failed to delete strategy')
       }
     } catch (e) {
       alert('Delete request failed: ' + e.message)
@@ -1221,6 +1221,8 @@ function BacktestPanel({ connected, selectedStrategy, onSelectStrategy }) {
   }
 
   const isCustomStrategy = (form.strategy || '').startsWith('custom_')
+  // Strategies running in live trading are locked: no delete from here (backend refuses too)
+  const isLiveStrategy = LIVE_STRATEGY_IDS.includes(form.strategy)
 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
@@ -1232,15 +1234,19 @@ function BacktestPanel({ connected, selectedStrategy, onSelectStrategy }) {
               <StyledButton onClick={() => onSelectStrategy && onSelectStrategy(form.strategy)} variant="secondary" style={{ padding:'4px 10px', fontSize:11 }}>
                 ✏️ Edit in Research Studio
               </StyledButton>
-              <StyledButton onClick={() => deleteCustomStrat(form.strategy)} variant="danger" style={{ padding:'4px 10px', fontSize:11 }}>
-                🗑️ Delete Strategy
-              </StyledButton>
+              {isLiveStrategy ? (
+                <span style={{ color:V('text-muted'), fontSize:11, alignSelf:'center' }}>🔒 Live strategy — locked</span>
+              ) : (
+                <StyledButton onClick={() => deleteCustomStrat(form.strategy)} variant="danger" style={{ padding:'4px 10px', fontSize:11 }}>
+                  🗑️ Delete Strategy
+                </StyledButton>
+              )}
             </div>
           )}
         </div>
         <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
           {[
-            ['Strategy', <select value={form.strategy} onChange={e=>setForm(p=>({...p,strategy:e.target.value}))} style={inputStyle}>
+            ['Strategy', <select value={form.strategy} onChange={e=>{ const v = e.target.value; setForm(p=>({...p,strategy:v})); onStrategyChange && onStrategyChange(v) }} style={inputStyle}>
               {availableStrategies.map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
             </select>],
             ['Instrument', <select value={form.instrument} onChange={e=>setForm(p=>({...p,instrument:e.target.value}))} style={inputStyle}>
@@ -8402,6 +8408,9 @@ export default function App() {
   const [instrument,  setInstrument]  = useState('BANKNIFTY')
   const [strategy,    setStrategy]    = useState(LIVE_STRATEGY_OPTIONS[0].v)
   const [researchLoadReq, setResearchLoadReq] = useState(null)
+  // Backtest page's own strategy selection -- never the Live page's `strategy`
+  // (Research Studio's "Backtest" button used to overwrite the live page's state).
+  const [btStrategy, setBtStrategy] = useState(null)
   const [chartTf,     setChartTf]     = useState('5')
   const [sigHistory,  setSigHistory]  = useState([])
   const [chartSignals, setChartSignals] = useState([])
@@ -9163,10 +9172,10 @@ export default function App() {
           )}
 
           {tab === 'research_studio' && (
-            <ResearchStudio API={API} onNavigateToBacktest={(sId) => { setStrategy(sId); setTab('backtest'); }} loadRequest={researchLoadReq} />
+            <ResearchStudio API={API} onNavigateToBacktest={(sId) => { setBtStrategy(sId); setTab('backtest'); }} loadRequest={researchLoadReq} />
           )}
 
-          {tab === 'backtest' && <BacktestPanel connected={connected} selectedStrategy={strategy} onSelectStrategy={(sId) => { setResearchLoadReq({ id: sId, ts: Date.now() }); setTab('research_studio'); }} />}
+          {tab === 'backtest' && <BacktestPanel connected={connected} selectedStrategy={btStrategy} onStrategyChange={setBtStrategy} onSelectStrategy={(sId) => { setResearchLoadReq({ id: sId, ts: Date.now() }); setTab('research_studio'); }} />}
 
           {tab === 'sig_journal' && (
             <ErrorBoundary>

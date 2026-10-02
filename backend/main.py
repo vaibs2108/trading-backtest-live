@@ -922,11 +922,8 @@ async def get_signals_all():
     if not results:
         _cur_ltp = broker.get_ltp(cfg.instrument)
         _stub_time = _placeholder_signal_time(cfg.instrument)
-        for strat_id in (
-            "custom_alpha_combo_cusum125", "custom_time_gated_alpha_combo",
-            "custom_regime_v1_trend_range_final", "custom_option_b_ram_rf",
-            "custom_cusum15_nodonchian_cd8",
-        ):
+        from config import LIVE_STRATEGY_IDS
+        for strat_id in LIVE_STRATEGY_IDS:
             results[strat_id] = {
                 "signal": "HOLD", "strategy": strat_id, "instrument": cfg.instrument,
                 "close": _cur_ltp or 0.0, "time": _stub_time
@@ -1314,6 +1311,9 @@ async def get_custom_strategy(strategy_id: str):
 async def delete_custom_strategy(strategy_id: str):
     from strategy_sandbox import CustomStrategyManager
     from strategy_kernel import init_kernels
+    from config import LIVE_STRATEGY_IDS
+    if strategy_id in LIVE_STRATEGY_IDS:
+        raise HTTPException(status_code=403, detail=f"'{strategy_id}' is running in live trading and can't be deleted")
     ok = CustomStrategyManager.delete_strategy(strategy_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Strategy file not found or could not be deleted")
@@ -5621,7 +5621,9 @@ def _fetch_frames_range(instrument: str, from_date: str, to_date: str) -> dict:
     for tf_key, tf_dhan in [("1D","DAY"),("60","60"),("15","15"),("5","5")]:
         query_from = daily_from_date if tf_key == "1D" else from_date
         logger.info(f"[Backtest] Fetching {tf_key} data: {query_from} -> {to_date_inclusive}")
-        df = broker.get_historical_data(instrument, tf_dhan, query_from, to_date_inclusive)
+        # use_cache=False: a backtest's multi-month download isn't kept in the live
+        # process's memory cache (it never expired and grew with every backtest).
+        df = broker.get_historical_data(instrument, tf_dhan, query_from, to_date_inclusive, use_cache=False)
         if df is not None and len(df) >= 30:
             frames[tf_key] = df
             logger.info(f"[Backtest] {tf_key}: {len(df)} rows, {df['timestamp'].min()} -> {df['timestamp'].max()}")

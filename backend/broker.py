@@ -644,9 +644,12 @@ def get_historical_data(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
     use_index: bool = True,
+    use_cache: bool = True,
 ) -> Optional[pd.DataFrame]:
     """
     Fetch historical OHLCV data from Dhan directly using dhanhq client.
+    use_cache=False (Backtest page) neither reads nor stores the in-memory cache, so
+    backtest downloads don't pile up in the live process's memory.
     Supports daily data (historical_daily_data) and intraday timeframes 
     (intraday_minute_data with 90-day chunk limits).
     Falls back gracefully to local parquet cache if broker API is unavailable or returns 451.
@@ -655,7 +658,7 @@ def get_historical_data(
     cache_key = (instrument, timeframe, from_date, to_date, use_index)
     import pytz
     now = datetime.now(pytz.timezone("Asia/Kolkata"))
-    if cache_key in _hist_cache and cache_key in _hist_cache_time:
+    if use_cache and cache_key in _hist_cache and cache_key in _hist_cache_time:
         # Intraday frames must stay fresh (a 120s-stale 5m frame delays live
         # signals by 1-2 candles); slow frames keep the long TTL.
         _ttl = 20 if str(timeframe).upper() in ("1", "5") else 120
@@ -665,8 +668,9 @@ def get_historical_data(
     if not _connected or _dhan_client is None:
         cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_date, to_date)
         if cached_fallback is not None and not cached_fallback.empty:
-            _hist_cache[cache_key] = cached_fallback
-            _hist_cache_time[cache_key] = now
+            if use_cache:
+                _hist_cache[cache_key] = cached_fallback
+                _hist_cache_time[cache_key] = now
             return cached_fallback.copy()
         return None
 
@@ -801,8 +805,9 @@ def get_historical_data(
             cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_d, to_d)
             if cached_fallback is not None and not cached_fallback.empty:
                 logger.info(f"Loaded {len(cached_fallback)} rows from local parquet cache for {instrument} ({timeframe})")
-                _hist_cache[cache_key] = cached_fallback
-                _hist_cache_time[cache_key] = now
+                if use_cache:
+                    _hist_cache[cache_key] = cached_fallback
+                    _hist_cache_time[cache_key] = now
                 return cached_fallback.copy()
             logger.error(f"Failed to retrieve historical data for {instrument} (both broker API and local cache empty)")
             return None
@@ -825,8 +830,9 @@ def get_historical_data(
         df.dropna(subset=["open", "high", "low", "close"], inplace=True)
         result_df = df[["timestamp", "open", "high", "low", "close", "volume"]]
 
-        _hist_cache[cache_key] = result_df
-        _hist_cache_time[cache_key] = now
+        if use_cache:
+            _hist_cache[cache_key] = result_df
+            _hist_cache_time[cache_key] = now
         return result_df.copy()
     except Exception as e:
         logger.error(f"Error in get_historical_data: {e}")

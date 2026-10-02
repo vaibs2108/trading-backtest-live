@@ -451,16 +451,38 @@ def init_kernels():
 
 
 def reload_custom_kernels():
-    """Reload all dynamic custom kernels from backend/strategies/custom/."""
-    custom_dir = os.path.join(os.path.dirname(__file__), "strategies", "custom")
-    
-    # Remove existing custom kernels from registry before re-discovering
-    custom_keys = [k for k in list(_kernel_registry.keys()) if k.startswith("custom_")]
-    for k in custom_keys:
-        del _kernel_registry[k]
+    """Reload dynamic custom kernels from backend/strategies/custom/.
 
-    if not os.path.exists(custom_dir):
-        return
+    Non-destructive: new kernel objects are built first and then swapped in -- the
+    registry used to be emptied of every custom strategy before re-discovery, so a live
+    lookup landing mid-reload found its strategy missing. Live strategies
+    (config.LIVE_STRATEGY_IDS) that are already loaded are never replaced or removed:
+    the running live engine keeps the code it started with until a restart, whatever
+    the Backtest page / Research Studio do.
+    """
+    try:
+        from config import LIVE_STRATEGY_IDS as _locked
+    except Exception:
+        _locked = ()
+    custom_dir = os.path.join(os.path.dirname(__file__), "strategies", "custom")
+
+    fresh = {}
+    if os.path.exists(custom_dir):
+        fresh = _discover_custom_kernels(custom_dir)
+
+    # Drop custom strategies whose file is gone -- never a loaded live one.
+    for k in [k for k in list(_kernel_registry) if k.startswith("custom_")
+              and k not in fresh and k not in _locked]:
+        _kernel_registry.pop(k, None)
+    for k, inst in fresh.items():
+        if k in _locked and k in _kernel_registry:
+            continue  # live strategy already loaded: keep it untouched
+        _kernel_registry[k] = inst
+
+
+def _discover_custom_kernels(custom_dir: str) -> dict:
+    """Load every custom strategy file into a {strategy_id: kernel} dict (registry untouched)."""
+    found = {}
     import importlib.util
     for fname in os.listdir(custom_dir):
         if fname.endswith(".py") and not fname.startswith("__"):
@@ -494,11 +516,12 @@ def reload_custom_kernels():
                         primary_cls = candidates[-1]
 
                     inst = primary_cls()
-                    register_kernel(inst)
-                    _kernel_registry[file_strat_id] = inst
+                    found[inst.strategy_id] = inst   # what register_kernel() keyed it by
+                    found[file_strat_id] = inst
                     logger.info(f"Registered custom kernel: {file_strat_id} -> {type(inst).__name__} ({inst.strategy_id})")
             except Exception as ex:
                 logger.warning(f"Could not load custom strategy {fname}: {ex}")
+    return found
 
 
 
