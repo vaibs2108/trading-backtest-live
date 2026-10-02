@@ -1397,6 +1397,14 @@ def _build_chart_signals_from_result(result: dict, strat: str, inst: str, days: 
     return signals
 
 
+def _latest_5m_bar(frames) -> Optional[str]:
+    """Timestamp of the newest 5m bar in a frames dict (None if unavailable)."""
+    try:
+        return str(frames["5"]["timestamp"].max())
+    except Exception:
+        return None
+
+
 @app.get("/api/chart_signals")
 async def get_chart_signals(strategy: Optional[str] = None, instrument: Optional[str] = None, days: int = 10):
     """Run backtest for the selected strategy and return entry/exit markers for chart overlay.
@@ -1426,10 +1434,23 @@ async def get_chart_signals(strategy: Optional[str] = None, instrument: Optional
         _mkt_open = (_now_ist.hour > 9 or (_now_ist.hour == 9 and _now_ist.minute >= 15)) and \
                     (_now_ist.hour < 15 or (_now_ist.hour == 15 and _now_ist.minute <= 30))
     _mkt_open = _mkt_open and _now_ist.weekday() < 5
-    _cache_ttl = 5 if _mkt_open else 1800  # post-close: reuse last result for 30 min instead of 5s
+
+    # The chart's backtest only changes when its input changes: a new 5m candle
+    # (higher-TF bars close on 5m boundaries too) or a new signal (which clears
+    # this cache). It used to re-run every 5s while open -- with the page polling
+    # every 10s that was ~6 full backtests a minute per open tab, all returning
+    # the same markers, on the same CPU the live signal loop needs.
+    _cur_bar = (_latest_5m_bar(_cached_frames)
+                if _cached_frames and _cached_frames_instrument == inst else None)
+    if _mkt_open:
+        _fresh = bool(_bt_cache) and (
+            (_cur_bar is not None and _bt_cache.get("bar") == _cur_bar)
+            or (_now - _bt_cache["ts"]) < 60)
+    else:
+        _fresh = bool(_bt_cache) and (_now - _bt_cache["ts"]) < 1800  # closed: inputs can't change
 
     signals = []
-    if _bt_cache and (_now - _bt_cache["ts"]) < _cache_ttl:
+    if _fresh:
         signals = list(_bt_cache["result"].get("signals", []))
     else:
         # Reuse an already-running computation for this exact strategy+instrument
@@ -1469,12 +1490,16 @@ async def get_chart_signals(strategy: Optional[str] = None, instrument: Optional
                             logger.error(f"chart_signals backtest error ({strat} for {inst}): {e}")
                             return None
 
+                    _bt_t0 = _t.time()
                     result = await asyncio.to_thread(_run_bt)
+                    if _mkt_open:
+                        latency_logger.info(f"{inst} chart backtest {strat} took {_t.time() - _bt_t0:.1f}s")
                     if result:
                         _sigs = _build_chart_signals_from_result(result, strat, inst, days)
                         _chart_signals_cache[cache_key] = {
                             "result": {"signals": _sigs, "strategy": strat, "instrument": inst},
                             "ts": _t.time(),
+                            "bar": _latest_5m_bar(frames),
                         }
                 return _sigs
 
