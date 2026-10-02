@@ -1274,7 +1274,18 @@ function BacktestPanel({ connected, selectedStrategy, onStrategyChange, onSelect
 
       {result?.stats && (
         <Card>
-          <div style={{ color:V('text-primary'), fontWeight:700, marginBottom:14, fontSize:15 }}>Backtest Results</div>
+          <div style={{ color:V('text-primary'), fontWeight:700, marginBottom:6, fontSize:15 }}>Backtest Results</div>
+          {/* What data the backtest actually ran on (and any history shortfall) */}
+          {result.data_range && result.data_range['5'] && (
+            <div style={{ color:V('text-muted'), fontSize:11, marginBottom:4 }}>
+              Data used: 5-min {result.data_range['5'].from} → {result.data_range['5'].to}
+              {result.data_range['1D'] ? ` · daily ${result.data_range['1D'].from} → ${result.data_range['1D'].to}` : ''}
+            </div>
+          )}
+          {(result.data_notes || []).map((n, i) => (
+            <div key={i} style={{ color:V('yellow'), fontSize:11, marginBottom:4 }}>⚠ {n}</div>
+          ))}
+          <div style={{ marginBottom:8 }} />
           <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:8, marginBottom:14 }}>
             <MetricBox label="Total Trades" value={result.stats.total_trades} />
             <MetricBox label="Win Rate" value={`${result.stats.win_rate_pct}%`} color={V('green')} />
@@ -8434,6 +8445,7 @@ export default function App() {
   const [capitalState, setCapitalState] = useState(null)
   const [dataHealth, setDataHealth] = useState(null)
   const [market, setMarket] = useState(null)
+  const [brokerAuthError, setBrokerAuthError] = useState(null)
   const [telegramConfigured, setTelegramConfigured] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const isMobile = useIsMobile()
@@ -8594,6 +8606,7 @@ export default function App() {
         if (s.capital_state) setCapitalState(s.capital_state)
         if (s.data_health) setDataHealth(s.data_health)
         if (s.market) setMarket(s.market)
+        setBrokerAuthError(s.broker_auth_error || null)
         if (s.app_running != null) setAppRunning(s.app_running)
         if (s.max_daily_loss != null) setMaxDailyLoss(s.max_daily_loss)
         if (s.max_daily_profit != null) setMaxDailyProfit(s.max_daily_profit)
@@ -8915,6 +8928,16 @@ export default function App() {
             <StyledButton onClick={toggleAutoTrade} variant="danger" style={{ padding:'3px 12px', fontSize:10 }}>
               STOP AUTO
             </StyledButton>
+          </div>
+        )}
+
+        {/* Dhan rejecting the access token: no fresh data, no orders */}
+        {brokerAuthError && (
+          <div style={{
+            background:V('red-bg'), borderBottom:`1px solid color-mix(in srgb, ${V('red')} 30%, transparent)`,
+            padding:'8px 24px', fontSize:12, color:V('red'), fontWeight:700
+          }}>
+            ⚠ DHAN TOKEN EXPIRED (since {brokerAuthError.since}) — no fresh data and no orders. Update the token in .env and restart the app.
           </div>
         )}
 

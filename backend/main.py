@@ -669,6 +669,7 @@ async def get_status():
         jds["trade_log"] = journal_stats["trade_log"]
 
     market = await asyncio.to_thread(_market_state, cfg.instrument)
+    await asyncio.to_thread(_maybe_alert_token_error)
     return {
         "connected":    broker.is_connected(),
         "instrument":   cfg.instrument,
@@ -681,6 +682,7 @@ async def get_status():
         "ltp":          ltp,
         "trade_state":  trade_state,
         "market":       market,
+        "broker_auth_error": broker.dhan_auth_error(),
         "last_signal":  _display_last_signal(),
         "active_trade_signal": _active_trade_signal,
         "active_entries": _get_active_entries(cfg, tm),
@@ -1078,6 +1080,8 @@ async def run_backtest(req: BacktestRequest):
 
     to_d = req.to_date or now_ist.strftime("%Y-%m-%d")
     from_d = req.from_date or (now_ist - timedelta(days=365)).strftime("%Y-%m-%d")
+    if from_d > to_d:
+        raise HTTPException(status_code=400, detail=f"From date ({from_d}) is after To date ({to_d})")
 
     # Add 100 calendar days of warm-up data before the requested start date
     from_dt = datetime.strptime(from_d, "%Y-%m-%d")
@@ -1087,8 +1091,16 @@ async def run_backtest(req: BacktestRequest):
     frames = await asyncio.to_thread(
         _fetch_frames_range, req.instrument, warmup_from_d, to_d
     )
-    if not frames:
-        raise HTTPException(status_code=500, detail="Failed to fetch backtest data")
+    # Never backtest on missing / cut-short data: it used to run anyway (e.g. 15-min
+    # history ending a year early after the Dhan token expired) and return HTTP 200.
+    data_problems, data_range, data_notes = _check_backtest_frames(frames, from_d, to_d, now_ist)
+    if data_problems:
+        _hint = ("Dhan's access token is invalid or expired — update it and restart."
+                 if broker.dhan_auth_error() else
+                 "Dhan may have no data for this range, or the download failed — try again.")
+        logger.warning(f"Backtest stopped, incomplete data for {req.instrument}: {data_problems}")
+        raise HTTPException(status_code=502, detail="Backtest stopped — incomplete data from Dhan: "
+                            + "; ".join(data_problems) + ". " + _hint)
     # Use dynamic lot size from Dhan API / INSTRUMENT_META
     lot_size = broker.get_lot_size(req.instrument)
     # The backtest runs in a separate worker process (backtest_worker.py) on a COPY of
@@ -1124,6 +1136,8 @@ async def run_backtest(req: BacktestRequest):
 
     result["strategy_used"] = bt_strategy
     result["hold_mode_used"] = bt_hold_mode
+    result["data_range"] = data_range      # what was actually downloaded, per timeframe
+    result["data_notes"] = data_notes      # e.g. history starts later than requested
     return _sanitise_floats(result)
 
 
@@ -2710,6 +2724,32 @@ async def _apply_generic_trailing_sl(pos, cfg, ltp, sig):
     return updated
 
 
+_token_alert_sent_at = None
+
+
+def _maybe_alert_token_error():
+    """Telegram alert (at most once an hour) while Dhan rejects the access token.
+    The app used to keep showing "Connected" and quietly fall back to local files."""
+    global _token_alert_sent_at
+    err = broker.dhan_auth_error()
+    if not err:
+        return
+    now = datetime.now(_IST)
+    if _token_alert_sent_at is not None and (now - _token_alert_sent_at).total_seconds() < 3600:
+        return
+    _token_alert_sent_at = now
+    cfg = get_settings()
+    if cfg.telegram_bot_token and cfg.telegram_chat_id:
+        try:
+            _send_telegram_alert_wrapper(
+                "⚠️ DHAN TOKEN EXPIRED\n"
+                "Dhan is rejecting the access token (DH-901): no fresh data and no orders "
+                "until it is updated in .env and the app is restarted.",
+                cfg.telegram_bot_token, cfg.telegram_chat_id)
+        except Exception as e:
+            logger.warning(f"Token-expiry Telegram alert failed: {e}")
+
+
 def _log_order_latency(cfg, strategy: str, direction: str, result: dict):
     """One latency-log line per entry order result (seconds after the 5m candle close)."""
     try:
@@ -2754,6 +2794,7 @@ async def _signal_polling_loop():
 
             if not broker.is_connected():
                 continue
+            _maybe_alert_token_error()
 
             add_activity_log("Engine Heartbeat: Active & monitoring status.")
             import pytz
@@ -5589,6 +5630,35 @@ def _fetch_all_frames(instrument: str) -> dict:
     return frames
 
 
+def _check_backtest_frames(frames: dict, from_d: str, to_d: str, now_ist):
+    """Is the downloaded data complete enough to backtest on?
+    Returns (problems, data_range, notes): problems stop the backtest (missing timeframe,
+    data ending well before the requested end, or a multi-week hole from a failed
+    90-day chunk); notes are shown with the result (history starting later than
+    requested -- e.g. CRUDEOIL only has the current futures contract's history)."""
+    labels = {"1D": "daily", "60": "60-min", "15": "15-min", "5": "5-min"}
+    req_from = pd.Timestamp(from_d)
+    req_to = min(pd.Timestamp(to_d), pd.Timestamp(now_ist.strftime("%Y-%m-%d")))
+    problems, ranges, notes = [], {}, []
+    for tf in ("1D", "60", "15", "5"):
+        df = (frames or {}).get(tf)
+        if df is None or len(df) < 30:
+            problems.append(f"no {labels[tf]} data")
+            continue
+        ts = pd.to_datetime(df["timestamp"]).sort_values()
+        first, last = ts.iloc[0], ts.iloc[-1]
+        ranges[tf] = {"from": str(first.date()), "to": str(last.date()), "rows": int(len(df))}
+        if last.normalize() < req_to - pd.Timedelta(days=5):
+            problems.append(f"{labels[tf]} data ends {last.date()} (expected up to {req_to.date()})")
+        if tf != "1D":
+            gap = ts.diff().max()
+            if pd.notna(gap) and gap > pd.Timedelta(days=10):
+                problems.append(f"{labels[tf]} data has a {gap.days}-day hole")
+            if first.normalize() > req_from + pd.Timedelta(days=5):
+                notes.append(f"{labels[tf]} history starts {first.date()} (requested {req_from.date()})")
+    return problems, ranges, notes
+
+
 def _fetch_frames_range(instrument: str, from_date: str, to_date: str) -> dict:
     """Fetch multi-TF data for backtest date range."""
     import time
@@ -5623,7 +5693,8 @@ def _fetch_frames_range(instrument: str, from_date: str, to_date: str) -> dict:
         logger.info(f"[Backtest] Fetching {tf_key} data: {query_from} -> {to_date_inclusive}")
         # use_cache=False: a backtest's multi-month download isn't kept in the live
         # process's memory cache (it never expired and grew with every backtest).
-        df = broker.get_historical_data(instrument, tf_dhan, query_from, to_date_inclusive, use_cache=False)
+        df = broker.get_historical_data(instrument, tf_dhan, query_from, to_date_inclusive,
+                                        use_cache=False, local_fallback=False)
         if df is not None and len(df) >= 30:
             frames[tf_key] = df
             logger.info(f"[Backtest] {tf_key}: {len(df)} rows, {df['timestamp'].min()} -> {df['timestamp'].max()}")

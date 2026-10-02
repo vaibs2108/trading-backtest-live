@@ -585,13 +585,21 @@ def _load_local_parquet_cache(
             candidates.extend([
                 base_dir / "scratch" / "research_14L" / "long_cache" / f"{inst_up}_{k}.parquet",
                 base_dir / "scratch" / "research_banknifty" / "live_cache" / f"{inst_up}_{k}.parquet",
-                base_dir / "scratch" / "research_sensex" / "data" / f"sensex_{k}_recent.parquet",
-                base_dir / "scratch" / "research_sensex" / "data" / f"sensex_{k}.parquet",
                 base_dir / "Research" / "data" / "clean" / f"{inst_lo}_{k}.parquet",
                 base_dir / "Research" / "data" / "raw" / f"{inst_lo}_{k}.parquet",
                 base_dir / "Research" / "data" / "clean" / f"{inst_lo}_{k}min.parquet",
                 base_dir / "Research" / "data" / "raw" / f"{inst_lo}_{k}min.parquet",
             ])
+
+        # SENSEX research files only ever stand in for SENSEX itself -- they used to be
+        # tried for EVERY instrument, so an instrument with no file of its own could
+        # silently get SENSEX prices.
+        if inst_up == "SENSEX":
+            for k in tf_keys:
+                candidates.extend([
+                    base_dir / "scratch" / "research_sensex" / "data" / f"sensex_{k}_recent.parquet",
+                    base_dir / "scratch" / "research_sensex" / "data" / f"sensex_{k}.parquet",
+                ])
 
         target_file = None
         for c in candidates:
@@ -638,6 +646,37 @@ def _load_local_parquet_cache(
         return None
 
 
+_dhan_auth_error: Optional[dict] = None   # set while Dhan rejects our token (DH-901)
+_dhan_fail_logged: dict = {}               # error text -> last time it was logged
+
+
+def dhan_auth_error() -> Optional[dict]:
+    """{"since", "message"} while Dhan is rejecting the access token, else None."""
+    return _dhan_auth_error
+
+
+def _note_dhan_response(res, context: str):
+    """Log Dhan's own error text for a failed call (once a minute per message) and track
+    whether Dhan is rejecting the token. Before this, a failed history call left no trace
+    of WHY -- an expired token (DH-901, seen 356 times in past logs) just looked like
+    "no data" and the app silently switched to local cache files."""
+    global _dhan_auth_error
+    if isinstance(res, dict) and res.get("status") == "success":
+        if _dhan_auth_error is not None:
+            logger.info("Dhan accepted the access token again -- token error cleared")
+            _dhan_auth_error = None
+        return
+    text = str(res.get("remarks") if isinstance(res, dict) and res.get("remarks") else res)[:240]
+    now = _time.time()
+    if now - _dhan_fail_logged.get(text, 0) >= 60:
+        _dhan_fail_logged[text] = now
+        logger.warning(f"Dhan {context} failed: {text}")
+    if ("DH-901" in text or "Invalid_Authentication" in text) and _dhan_auth_error is None:
+        _dhan_auth_error = {"since": datetime.now().astimezone().isoformat(timespec="seconds"),
+                            "message": "Dhan access token is invalid or expired (DH-901)"}
+        logger.error("Dhan rejected the access token (DH-901): invalid or expired -- update it in .env and restart")
+
+
 def get_historical_data(
     instrument: str,
     timeframe: str,
@@ -645,11 +684,14 @@ def get_historical_data(
     to_date: Optional[str] = None,
     use_index: bool = True,
     use_cache: bool = True,
+    local_fallback: bool = True,
 ) -> Optional[pd.DataFrame]:
     """
     Fetch historical OHLCV data from Dhan directly using dhanhq client.
     use_cache=False (Backtest page) neither reads nor stores the in-memory cache, so
     backtest downloads don't pile up in the live process's memory.
+    local_fallback=False (Backtest page) never substitutes local cache files when Dhan
+    returns nothing -- the caller gets None/partial data and can report it.
     Supports daily data (historical_daily_data) and intraday timeframes 
     (intraday_minute_data with 90-day chunk limits).
     Falls back gracefully to local parquet cache if broker API is unavailable or returns 451.
@@ -666,6 +708,8 @@ def get_historical_data(
             return _hist_cache[cache_key].copy()
 
     if not _connected or _dhan_client is None:
+        if not local_fallback:
+            return None
         cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_date, to_date)
         if cached_fallback is not None and not cached_fallback.empty:
             if use_cache:
@@ -756,6 +800,7 @@ def get_historical_data(
                 expiry_code=int(expiry_code),
                 oi=True
             )
+            _note_dhan_response(res, f"history {instrument} DAY")
             if isinstance(res, dict) and res.get("status") == "success" and "data" in res:
                 all_dfs.append(pd.DataFrame(res["data"]))
         else:
@@ -776,6 +821,7 @@ def get_historical_data(
                         interval=interval_val,
                         oi=False
                     )
+                    _note_dhan_response(res, f"history {instrument} {timeframe}m {curr_from}..{curr_to}")
                     if isinstance(res, dict) and res.get("status") == "success" and "data" in res and res["data"]:
                         chunk_df = pd.DataFrame(res["data"])
                         break
@@ -801,6 +847,9 @@ def get_historical_data(
                 _time.sleep(0.3)
 
         if not all_dfs:
+            if not local_fallback:
+                logger.warning(f"No historical data from broker API for {instrument} ({timeframe})")
+                return None
             logger.warning(f"No historical data from broker API for {instrument} ({timeframe}), checking local parquet cache...")
             cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_d, to_d)
             if cached_fallback is not None and not cached_fallback.empty:
@@ -836,6 +885,8 @@ def get_historical_data(
         return result_df.copy()
     except Exception as e:
         logger.error(f"Error in get_historical_data: {e}")
+        if not local_fallback:
+            return None
         cached_fallback = _load_local_parquet_cache(instrument, timeframe, from_date, to_date)
         if cached_fallback is not None and not cached_fallback.empty:
             return cached_fallback.copy()
