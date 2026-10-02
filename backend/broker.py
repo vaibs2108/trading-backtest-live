@@ -147,16 +147,18 @@ class DhanFacade:
 
         return order_details
 
-    def send_telegram_alert(self, message: str, receiver_chat_id: str, bot_token: str):
-        """Send telegram alert."""
+    def send_telegram_alert(self, message: str, receiver_chat_id: str, bot_token: str) -> bool:
+        """Send telegram alert. Returns True if Telegram accepted it."""
         import urllib.parse
         try:
             encoded_message = urllib.parse.quote(message)
             send_text = f"https://api.telegram.org/bot{bot_token}/sendMessage?chat_id={receiver_chat_id}&text={encoded_message}"
             response = requests.get(send_text, timeout=10)
             response.raise_for_status()
+            return True
         except Exception as e:
             logger.error(f"Telegram alert send failed: {e}")
+            return False
 
 
 def _load_instrument_df() -> pd.DataFrame:

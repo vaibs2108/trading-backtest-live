@@ -32,6 +32,25 @@ logger = logging.getLogger(__name__)
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
+_LTT_MAX_AGE_SEC = 180
+
+
+def _ltt_is_current(ltt: str, now_ist: datetime) -> bool:
+    """True if a "HH:MM:SS" last-trade-time belongs to a trade happening now.
+    dhanhq formats Dhan's epoch with utcfromtimestamp, and Dhan's epoch base differs
+    by segment (some are IST-shifted), so accept a match against either IST or UTC."""
+    try:
+        h, m, s = (int(x) for x in ltt.split(":"))
+    except ValueError:
+        return True  # unknown format: don't block ticks on a parse problem
+    ltt_sec = h * 3600 + m * 60 + s
+    for ref in (now_ist, now_ist - timedelta(hours=5, minutes=30)):
+        ref_sec = ref.hour * 3600 + ref.minute * 60 + ref.second
+        diff = abs(ltt_sec - ref_sec)
+        if min(diff, 86400 - diff) <= _LTT_MAX_AGE_SEC:
+            return True
+    return False
+
 
 class CandleBuilder:
     """Builds OHLCV candles from tick data for a single timeframe."""
@@ -170,13 +189,29 @@ class LiveFeedManager:
         self.last_price: float = 0.0
         self.last_tick_time: Optional[datetime] = None
         self._tick_count: int = 0
+        self._reset_trade_day()
 
         # Callbacks for candle completion
         self._on_5m_close: Optional[Callable] = None
 
+    def _reset_trade_day(self):
+        # Real (current) trades seen today -- see traded_today()
+        self._trade_day = None
+        self._trade_ticks = 0
+        self._trade_first: Optional[datetime] = None
+        self._trade_last: Optional[datetime] = None
+
+    def traded_today(self, now_ist: datetime) -> bool:
+        """True once the feed has seen real trading today: 20+ current ticks spread over
+        at least a minute. A holiday's re-sent snapshot tick never satisfies this."""
+        return (self._trade_day == now_ist.date() and self._trade_ticks >= 20
+                and (self._trade_last - self._trade_first).total_seconds() >= 60)
+
     def configure(self, instrument: str, security_id: str, exchange_segment: str,
                   loop: asyncio.AbstractEventLoop):
         """Configure the feed for an instrument. Call before start()."""
+        if instrument != self._instrument:
+            self._reset_trade_day()
         self._instrument = instrument
         self._security_id = security_id
         self._exchange_seg = exchange_segment
@@ -334,6 +369,23 @@ class LiveFeedManager:
 
         # Get tick time from data or use current time
         ltt = data.get("LTT") or data.get("ltt") or data.get("last_trade_time")
+        if isinstance(ltt, str) and not _ltt_is_current(ltt, datetime.now(_IST)):
+            # dhanhq hands LTT over as a time-of-day string ("HH:MM:SS"). A real trade is
+            # stamped within seconds of now; Dhan's snapshot of an EARLIER trade (e.g. the
+            # previous session's last tick, re-sent on holidays and after the close) is not.
+            # Candles used to be built from those snapshots at wall-clock time -- on
+            # 2026-10-02 (holiday) that produced flat fake 5m candles that a strategy
+            # traded on. Keep the price, but never build a candle from a stale trade.
+            self._stale_ticks = getattr(self, "_stale_ticks", 0) + 1
+            if self._stale_ticks % 500 == 1:
+                logger.info(f"LiveFeed: ignoring stale tick (last trade {ltt}) for candles "
+                            f"-- no trading right now ({self._stale_ticks} ignored)")
+            return
+        _now_trade = datetime.now(_IST)
+        if self._trade_day != _now_trade.date():
+            self._trade_day, self._trade_ticks, self._trade_first = _now_trade.date(), 0, _now_trade
+        self._trade_ticks += 1
+        self._trade_last = _now_trade
         if isinstance(ltt, (int, float)):
             # EPOCH timestamp — but Dhan segments are inconsistent about the
             # epoch base (MCX quote packets send IST-shifted epochs, which

@@ -56,12 +56,16 @@ def open_entry(sig: dict, instrument: str, lot_size: int):
         return
     entries = _load()
 
-    # Skip if identical entry already exists (same time + instrument + direction still OPEN)
+    # Skip if identical entry already exists (same strategy + time + instrument + direction
+    # still OPEN). Strategy is part of the key: without it, when several strategies entered
+    # on the same bar only the first one was journaled (12 of the last 100 signals).
     entry_time = sig.get("time", "")
+    strategy = str(sig.get("strategy", ""))
     if any(
         e.get("instrument") == instrument and
         e.get("direction") == direction and
         e.get("entry_time") == entry_time and
+        str(e.get("strategy", "")) == strategy and
         e.get("status") == "OPEN"
         for e in entries
     ):

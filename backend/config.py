@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     atr_sl_mult: float = 1.8
     atr_t1_mult: float = 3.0
     atr_t2_mult: float = 5.0
-    max_hold_bars: int = 18              # 5min bars = 90 min max hold
+    max_hold_bars: int = 18              # UNUSED since 2026-10-02 (live 90-min TIME_EXIT removed)
     min_adx: float = 18.0
 
     # ── Agent Engine ──────────────────────────────────────────────────────

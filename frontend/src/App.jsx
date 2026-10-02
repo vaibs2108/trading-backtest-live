@@ -116,6 +116,16 @@ const toIST = (dateStr) => {
     return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false })
   } catch { return '' }
 }
+// Signal times: time only for today, date + time otherwise -- a "15:25:00" left
+// over from yesterday must not read as a fresh signal.
+const toISTSignalTime = (dateStr) => {
+  if (!dateStr) return ''
+  try {
+    const d = new Date(dateStr)
+    const day = x => x.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })
+    return day(d) === day(new Date()) ? toIST(dateStr) : toISTDateTime(dateStr)
+  } catch { return '' }
+}
 const toISTDateTime = (dateStr) => {
   if (!dateStr) return ''
   try {
@@ -637,7 +647,7 @@ function SignalPanel({ signal, onManualTrade, position, connected, ltp, lastEntr
         <div>
           <div style={{ color:V('text-muted'), fontSize:11, marginBottom:4, fontWeight:500 }}>{LIVE_STRATEGY_LABELS[signal.strategy] || 'Strategy Signal'}</div>
           <div style={{ color:sigColor, fontSize:24, fontWeight:800 }}>{sigIcon} {showActiveEntry ? `${lastEntry.signal} (active)` : sig}</div>
-          {signal.time && <div style={{ color:V('text-muted'), fontSize:10, marginTop:2 }}>{toIST(signal.time)}</div>}
+          {signal.time && <div style={{ color:V('text-muted'), fontSize:10, marginTop:2 }}>{toISTSignalTime(signal.time)}</div>}
         </div>
         <div style={{ textAlign:'right' }}>
           <div style={{ color:V('text-primary'), fontSize:20, fontFamily:"'JetBrains Mono', monospace", fontWeight:700 }}>{fmt(ltp || signal.close || signal.entry)}</div>
@@ -740,7 +750,7 @@ function CompactSignalPanel({ signal, strategyLabel, ltp, lastEntry }) {
         <div>
           <div style={{ color:V('text-muted'), fontSize:9, textTransform:'uppercase', letterSpacing:1, marginBottom:3, fontWeight:500 }}>{strategyLabel}</div>
           <div style={{ color:sigColor, fontSize:20, fontWeight:800 }}>{sigIcon} {showActiveEntry ? `${lastEntry.signal} (active)` : sig}</div>
-          {signal.time && <div style={{ color:V('text-muted'), fontSize:9, marginTop:2 }}>{toIST(signal.time)}</div>}
+          {signal.time && <div style={{ color:V('text-muted'), fontSize:9, marginTop:2 }}>{toISTSignalTime(signal.time)}</div>}
         </div>
         <div style={{ textAlign:'right' }}>
           <div style={{ color:V('text-primary'), fontSize:16, fontFamily:"'JetBrains Mono', monospace", fontWeight:700 }}>{fmt(ltp || signal.close || signal.entry)}</div>
@@ -1033,7 +1043,7 @@ function SettingsPanel({ onSaved }) {
             <Row label="Max Daily Profit (₹)">
               <Num val={cfg.max_daily_profit} onChange={v=>set('max_daily_profit',v)} min={1000} max={200000} step={1000} />
             </Row>
-            <Row label="Auto Square-Off (mins before close)">
+            <Row label="Auto Square-Off (mins before close, Intraday mode only)">
               <Num val={cfg.auto_square_off_minutes} onChange={v=>set('auto_square_off_minutes',v)} min={1} max={60} />
             </Row>
             <Row label="Kill Switch">
@@ -6076,7 +6086,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
             {sig.signal==='LONG' ? '📈' : sig.signal==='SHORT' ? '📉' : sig.signal?.includes('EXIT') ? '🚪' : '⏸'} {sig.signal}
           </div>
           <div style={{ color:V('text-muted'), fontSize:11, marginTop:4 }}>
-            {sig.time ? toIST(sig.time) : ''}
+            {sig.time ? toISTSignalTime(sig.time) : ''}
           </div>
           <div style={{ display:'flex', gap:6, marginTop:8, flexWrap:'wrap' }}>
             {sig.ml_prob > 0 && <Badge label={`ML: ${(sig.ml_prob*100).toFixed(0)}%`} color={sig.ml_prob > 0.6 ? V('green') : V('yellow')} />}
@@ -8414,6 +8424,7 @@ export default function App() {
   const [appRunning,    setAppRunning]    = useState(true)
   const [capitalState, setCapitalState] = useState(null)
   const [dataHealth, setDataHealth] = useState(null)
+  const [market, setMarket] = useState(null)
   const [telegramConfigured, setTelegramConfigured] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const isMobile = useIsMobile()
@@ -8573,6 +8584,7 @@ export default function App() {
         if (s.trade_state) setTradeState(s.trade_state)
         if (s.capital_state) setCapitalState(s.capital_state)
         if (s.data_health) setDataHealth(s.data_health)
+        if (s.market) setMarket(s.market)
         if (s.app_running != null) setAppRunning(s.app_running)
         if (s.max_daily_loss != null) setMaxDailyLoss(s.max_daily_loss)
         if (s.max_daily_profit != null) setMaxDailyProfit(s.max_daily_profit)
@@ -8894,6 +8906,16 @@ export default function App() {
             <StyledButton onClick={toggleAutoTrade} variant="danger" style={{ padding:'3px 12px', fontSize:10 }}>
               STOP AUTO
             </StyledButton>
+          </div>
+        )}
+
+        {/* Market closed: everything on the page is last-known data -- say from when */}
+        {tab === 'live' && market && market.open === false && (
+          <div style={{
+            background:V('bg-tertiary'), borderBottom:`1px solid ${V('border')}`,
+            padding:'8px 24px', fontSize:12, color:V('text-secondary'), fontWeight:600
+          }}>
+            ⏸ {market.label}
           </div>
         )}
 

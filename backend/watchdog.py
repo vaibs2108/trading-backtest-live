@@ -32,13 +32,16 @@ RESTART_WINDOW = 3600      # reset restart count after this many seconds
 HEARTBEAT_TIMEOUT = 120    # seconds before considering app dead
 CHECK_INTERVAL = 15        # seconds between health checks
 
-# Setup logging
+# Setup logging -- rotates at midnight, keeps 14 days (it used to grow forever)
+from logging.handlers import TimedRotatingFileHandler
 Path(BASE_DIR / "logs").mkdir(exist_ok=True)
+_wd_file_handler = TimedRotatingFileHandler(str(WATCHDOG_LOG), when="midnight", backupCount=14, encoding="utf-8")
+_wd_file_handler.suffix = "%Y-%m-%d"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [WATCHDOG] %(message)s",
     handlers=[
-        logging.FileHandler(str(WATCHDOG_LOG), encoding="utf-8"),
+        _wd_file_handler,
         logging.StreamHandler(),
     ],
 )
