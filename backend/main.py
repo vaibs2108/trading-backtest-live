@@ -4939,6 +4939,11 @@ def send_telegram_exit_alert(pos, exit_price: float, reason: str, pnl: float, in
     cfg = get_settings()
     if not (cfg.telegram_bot_token and cfg.telegram_chat_id):
         return
+    # Order exit alerts are for real positions only (auto-trade orders and positions
+    # synced from Dhan), matching the order-entry alert. A paper position is not an
+    # order; its strategy exit signal is announced by the strategy-signal alert.
+    if str(getattr(pos, "order_id", "") or "").startswith("PAPER_"):
+        return
 
     # Use index prices for display; option premium only for PnL% calculation
     idx_entry = getattr(pos, 'index_entry_price', 0.0) or pos.entry_price
