@@ -1638,7 +1638,8 @@ async def get_chart_signals(strategy: Optional[str] = None, instrument: Optional
                             # GLOBAL settings, so for the whole run the live loop treated the
                             # chart's strategy as the active one (Telegram, entries, ownership).
                             with settings_override(strategy=strat, instrument=inst):
-                                return strategy_router.run_backtest(frames)
+                                # real lot size (the default was 30 for every instrument)
+                                return strategy_router.run_backtest(frames, lot_size=broker.get_lot_size(inst))
                         except Exception as e:
                             logger.error(f"chart_signals backtest error ({strat} for {inst}): {e}")
                             return None
@@ -5973,7 +5974,7 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
 
         # Log to signal journal (tracks strategy P&L independently of Dhan trades)
         try:
-            lot_size = INSTRUMENT_META.get(cfg.instrument, {}).get("lot_size", 1)
+            lot_size = broker.get_lot_size(cfg.instrument)
             signal_journal_manager.open_entry(sig, cfg.instrument, lot_size)
         except Exception as _sj_err:
             logger.error(f"Signal journal open failed: {_sj_err}")

@@ -1633,50 +1633,60 @@ def get_positions() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def get_lot_size(instrument: str) -> int:
-    global _lot_size_cache
-    inst_upper = instrument.upper()
-    if inst_upper in _lot_size_cache:
-        return _lot_size_cache[inst_upper]
-
-    # Prioritize official exchange lot sizes from INSTRUMENT_META
-    if inst_upper in INSTRUMENT_META and "lot_size" in INSTRUMENT_META[inst_upper]:
-        lot = int(INSTRUMENT_META[inst_upper]["lot_size"])
-        _lot_size_cache[inst_upper] = lot
-        logger.info(f"Using official exchange lot size for {inst_upper}: {lot}")
-        return lot
-
+def _lot_from_scrip_master(inst_upper: str) -> Optional[int]:
+    """Lot size of the nearest unexpired index option/future contract in Dhan's scrip
+    master (the exchange's current lot -- it changes at series boundaries)."""
     try:
+        import pytz
         df = _load_instrument_df()
-        cond = (
-            (df["SEM_TRADING_SYMBOL"] == inst_upper) |
-            df["SEM_TRADING_SYMBOL"].str.startswith(inst_upper + "-", na=False) |
-            df["SEM_TRADING_SYMBOL"].str.startswith(inst_upper + " ", na=False) |
-            (df["SEM_CUSTOM_SYMBOL"] == inst_upper) |
-            df["SEM_CUSTOM_SYMBOL"].str.startswith(inst_upper + " ", na=False)
-        )
-        match = df[cond]
-        deriv_types = ["OPTIDX", "FUTIDX", "OPTSTK", "FUTSTK", "OPTCOM", "FUTCOM", "OPTCUR", "FUTCUR"]
-        deriv_match = match[match["SEM_INSTRUMENT_NAME"].isin(deriv_types)]
-        if not deriv_match.empty:
-            match = deriv_match
-
-        if not match.empty:
-            for lot in match["SEM_LOT_UNITS"].dropna().unique():
-                try:
-                    lot_val = int(float(lot))
-                    if lot_val > 0:
-                        _lot_size_cache[inst_upper] = lot_val
-                        logger.info(f"Lot size for {inst_upper} resolved from CSV: {lot_val}")
-                        return lot_val
-                except (ValueError, TypeError):
-                    continue
+        m = df[df["SEM_INSTRUMENT_NAME"].isin(["OPTIDX", "FUTIDX"]) &
+               df["SEM_TRADING_SYMBOL"].str.startswith(inst_upper + "-", na=False)]
+        if m.empty:
+            return None
+        exp = m["SEM_EXPIRY_DATE"].astype(str).str[:10]
+        today = datetime.now(pytz.timezone("Asia/Kolkata")).date().isoformat()
+        m = m[exp >= today]
+        if m.empty:
+            return None
+        exp = m["SEM_EXPIRY_DATE"].astype(str).str[:10]
+        near = m[exp == exp.min()]["SEM_LOT_UNITS"].dropna()
+        lot = int(float(near.mode().iloc[0])) if not near.empty else 0
+        return lot if lot > 0 else None
     except Exception as e:
-        logger.warning(f"Error fetching lot size from CSV for {inst_upper}: {e}")
+        logger.warning(f"Lot size lookup in scrip master failed for {inst_upper}: {e}")
+        return None
 
-    fallback = 30
-    _lot_size_cache[inst_upper] = fallback
-    return fallback
+
+def get_lot_size(instrument: str) -> int:
+    """Units per lot for orders and P&L.
+
+    Index instruments (NSE/BSE): Dhan's scrip master -- the exchange's current lot.
+    The hard-coded INSTRUMENT_META table used to win here and was out of date
+    (found 2026-10-03: NIFTY 75 vs real 65, SENSEX 10 vs 20, FINNIFTY 65 vs 60,
+    BANKEX 15 vs 30), so NIFTY/SENSEX orders would have had the wrong quantity.
+    MCX: the table, unchanged -- Dhan's scrip master lists MCX lots as 1 (quantity in
+    lots), while the app uses the contract multiplier (e.g. CRUDEOIL 100); not touched
+    until that is verified. Re-checked once a day (lot sizes are revised periodically)."""
+    import pytz
+    inst_upper = instrument.upper()
+    today = datetime.now(pytz.timezone("Asia/Kolkata")).date()
+    cached = _lot_size_cache.get(inst_upper)
+    if cached and cached[0] == today:
+        return cached[1]
+
+    meta = INSTRUMENT_META.get(inst_upper, {})
+    is_mcx = "MCX" in (meta.get("exchange_opt"), meta.get("exchange_fut"))
+    lot = None if is_mcx else _lot_from_scrip_master(inst_upper)
+    source = "scrip master"
+    if lot is None and "lot_size" in meta:
+        lot, source = int(meta["lot_size"]), "INSTRUMENT_META table"
+    if lot is None:
+        lot, source = 30, "default"
+        logger.warning(f"Lot size for {inst_upper} not found -- using default 30")
+    if not cached or cached[1] != lot:
+        logger.info(f"Lot size for {inst_upper}: {lot} ({source})")
+    _lot_size_cache[inst_upper] = (today, lot)
+    return lot
 
 
 def get_balance() -> float:

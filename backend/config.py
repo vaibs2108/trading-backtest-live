@@ -366,8 +366,9 @@ def save_settings(data: dict) -> Settings:
 
 
 # ── Instrument metadata ───────────────────────────────────────────────────────
-# NOTE: lot_size values are FALLBACKS only. At runtime, broker.get_lot_size()
-# fetches the actual lot size from Dhan's instrument file via tsl.get_lot_size().
+# NOTE: lot_size values are FALLBACKS only for index instruments: broker.get_lot_size()
+# reads the current lot from Dhan's scrip master (values here updated 2026-10-03: NIFTY 65,
+# FINNIFTY 60, SENSEX 20, BANKEX 30). MCX entries ARE used as-is (contract multiplier).
 
 INSTRUMENT_META = {
     "BANKNIFTY": {
@@ -383,7 +384,7 @@ INSTRUMENT_META = {
         "exchange_index": "INDEX",
         "exchange_fut":   "NFO",
         "exchange_opt":   "NFO",
-        "lot_size": 75,
+        "lot_size": 65,
         "strike_step": 50,
         "symbol_fut": "NIFTY",
         "symbol_index": "NIFTY",
@@ -392,7 +393,7 @@ INSTRUMENT_META = {
         "exchange_index": "INDEX",
         "exchange_fut":   "NFO",
         "exchange_opt":   "NFO",
-        "lot_size": 65,
+        "lot_size": 60,
         "strike_step": 50,
         "symbol_fut": "FINNIFTY",
         "symbol_index": "FINNIFTY",
@@ -410,7 +411,7 @@ INSTRUMENT_META = {
         "exchange_index": "INDEX",
         "exchange_fut":   "BFO",
         "exchange_opt":   "BFO",
-        "lot_size": 10,
+        "lot_size": 20,
         "strike_step": 100,
         "symbol_fut": "SENSEX",
         "symbol_index": "SENSEX",
@@ -419,7 +420,7 @@ INSTRUMENT_META = {
         "exchange_index": "INDEX",
         "exchange_fut":   "BFO",
         "exchange_opt":   "BFO",
-        "lot_size": 15,
+        "lot_size": 30,
         "strike_step": 100,
         "symbol_fut": "BANKEX",
         "symbol_index": "BANKEX",
