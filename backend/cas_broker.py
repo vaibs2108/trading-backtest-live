@@ -17,7 +17,6 @@ call, so sharing it carries no isolation risk.
 import logging
 import threading
 import time as _time
-from datetime import date as _date
 from typing import Optional
 
 import pandas as pd
@@ -28,11 +27,21 @@ logger = logging.getLogger(__name__)
 # ── Independent rate limiter -- separate lock/state from broker.py's ──────────
 _lock = threading.Lock()
 _last_call_ts = 0.0
-_MIN_SPACING = 1.05  # Dhan's documented option-chain/quote limit is 1 req/sec; small margin
+# Dhan's docs: "Rate limit for Option Chain API is set to one unique request every 3
+# seconds" (dhanhq.co/docs/v2/option-chain). At the old 1.05 s spacing thousands of calls
+# a day failed (10,325 on 2026-10-01, 2,230 of them 09:00-10:00), and the same account's
+# Market Context option chain was refused too. 3.05 s: a full stock sweep takes ~15 min.
+_MIN_SPACING = 3.05
 
 _dhan_client = None
 _connected = False
 _connection_error = ""
+
+
+def _today_ist() -> str:
+    """Today's date in IST (the server may run in UTC: local date is wrong 00:00-05:30 IST)."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    return _dt.now(_tz(_td(hours=5, minutes=30))).date().isoformat()
 
 
 def dhan_cas_api_call(func, *args, **kwargs):
@@ -76,11 +85,19 @@ def is_connected() -> bool:
     return _connected
 
 
+_index_expiry_cache = {}  # (security_id, date) -> nearest expiry
+
+
 def nearest_expiry_for_index(under_security_id: int, under_exchange_segment: str) -> Optional[str]:
     """Live expiry_list lookup for index underlyings (unlike stocks, whose
-    nearest expiry is derivable straight from the static scrip master)."""
+    nearest expiry is derivable straight from the static scrip master).
+    Cached per day: it used to be called on every 30-s index sweep, using half of
+    the option-chain budget (expiry list + chain per index)."""
     if not _connected or _dhan_client is None:
         return None
+    cache_key = (under_security_id, _today_ist())
+    if cache_key in _index_expiry_cache:
+        return _index_expiry_cache[cache_key]
     try:
         res = dhan_cas_api_call(
             _dhan_client.expiry_list,
@@ -92,10 +109,37 @@ def nearest_expiry_for_index(under_security_id: int, under_exchange_segment: str
             if isinstance(dates, dict):
                 dates = dates.get("data", [])
             if isinstance(dates, list) and dates:
-                return sorted(dates)[0]
+                today = _today_ist()
+                future = [d for d in sorted(dates) if d >= today]
+                if future:
+                    _index_expiry_cache[cache_key] = future[0]
+                    return future[0]
         return None
     except Exception as e:
         logger.debug(f"CAS scanner: expiry_list failed for sec_id={under_security_id}: {e}")
+        return None
+
+
+def traded_today(today_str: str) -> Optional[bool]:
+    """Did NSE trade today? True if NIFTY has 1-minute bars dated today, False if none
+    (exchange holiday / not opened yet), None if the check itself failed. Uses the
+    historical-data API, not the option-chain budget."""
+    if not _connected or _dhan_client is None:
+        return None
+    try:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        nxt = (_dt.strptime(today_str, "%Y-%m-%d") + _td(days=1)).strftime("%Y-%m-%d")
+        res = _dhan_client.intraday_minute_data(security_id="13", exchange_segment="IDX_I",
+                                                instrument_type="INDEX", from_date=today_str,
+                                                to_date=nxt, interval=1)
+        if not isinstance(res, dict) or res.get("status") != "success":
+            return None
+        data = res.get("data") or {}
+        ts = data.get("timestamp", []) if isinstance(data, dict) else []
+        ist = _tz(_td(hours=5, minutes=30))
+        return any(_dt.fromtimestamp(x, ist).date().isoformat() == today_str for x in ts)
+    except Exception as e:
+        logger.debug(f"CAS scanner: traded-today check failed: {e}")
         return None
 
 
@@ -144,14 +188,18 @@ def option_chain(under_security_id: int, under_exchange_segment: str, expiry: st
 
 # ── F&O stock universe -- built from the same scrip master broker.py uses ────
 _fo_stock_universe: Optional[list] = None  # cached: [{"symbol", "security_id", "nearest_expiry"}, ...]
+_fo_stock_universe_date: Optional[str] = None  # day it was built -- rebuilt daily
 
 
 def get_fo_stock_universe() -> list:
     """Return the list of NSE F&O stock underlyings with their equity
     security_id and nearest option expiry, built once from the scrip master
     (static daily file, safe to derive from broker.py's cached DataFrame)."""
-    global _fo_stock_universe
-    if _fo_stock_universe is not None:
+    global _fo_stock_universe, _fo_stock_universe_date
+    # Rebuilt once a day: each stock's nearest expiry is fixed when the list is built, so
+    # a process running across monthly expiry kept asking for the lapsed expiry and every
+    # stock's option chain failed until a restart.
+    if _fo_stock_universe is not None and _fo_stock_universe_date == _today_ist():
         return _fo_stock_universe
 
     import broker  # only for _load_instrument_df() -- no client/connection state touched
@@ -172,7 +220,7 @@ def get_fo_stock_universe() -> list:
     # every stock's option_chain call failed identically until this filter --
     # this recurs every month right after stock-options expiry day unless we
     # drop dates that are already in the past.
-    today_str = _date.today().isoformat()
+    today_str = _today_ist()
 
     universe = []
     for symbol, grp in opt.groupby("underlying"):
@@ -192,6 +240,7 @@ def get_fo_stock_universe() -> list:
         })
 
     _fo_stock_universe = universe
+    _fo_stock_universe_date = today_str
     logger.info(f"CAS scanner: resolved {len(universe)} F&O stock underlyings from scrip master")
     return universe
 

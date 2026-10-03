@@ -66,8 +66,48 @@ def _in_continuous_session(now: datetime) -> bool:
 # Skipping the sweep entirely for the first cas_index_opening_range_minutes
 # means tracking only ever starts from a genuinely settled baseline once
 # the window ends.
+def _market_traded_today(now: datetime) -> bool:
+    """Weekday and NSE actually traded today (NIFTY has 1-minute bars dated today --
+    no bars on an exchange holiday). A "yes" is kept for the day; a "no" is re-checked
+    every 3 minutes (bars appear a minute or so after 09:15). If the check itself fails,
+    scanning goes ahead (a Dhan hiccup must not silently stop the scanner)."""
+    import cas_broker
+    if now.weekday() >= 5:
+        return False
+    today = now.date().isoformat()
+    td = _trading_day
+    if td["date"] == today and td["traded"] is True:
+        return True
+    if td["date"] == today and td["traded"] is False and _time.time() - td["checked_at"] < 180:
+        return False
+    traded = cas_broker.traded_today(today)
+    if traded is None:
+        return True
+    td.update(date=today, traded=traded, checked_at=_time.time())
+    if not traded:
+        logger.info(f"CAS scanner: no NSE trading today so far ({today}) -- paused")
+    return traded
+
+
+def _market_open(now: datetime) -> bool:
+    """Scanner works only while the F&O market is really open: 09:15-15:30 IST on a day
+    NSE traded. It used to run around the clock -- 18,261 failed option-chain calls on
+    the 2 Oct holiday, digests at 19:52/20:10 repeating end-of-day data."""
+    if now.weekday() >= 5:
+        reason = "Weekend"
+    elif not _in_continuous_session(now):
+        reason = "Outside market hours (09:15-15:30 IST)"
+    elif not _market_traded_today(now):
+        reason = "Market not trading today (holiday)"
+    else:
+        reason = None
+    _status["market_open"] = reason is None
+    _status["paused_reason"] = reason
+    return reason is None
+
+
 def _index_tracking_allowed(now: datetime, cfg) -> bool:
-    if not _in_continuous_session(now):
+    if not _market_open(now):
         return False
     open_dt = now.replace(hour=9, minute=15, second=0, microsecond=0)
     return now >= open_dt + timedelta(minutes=cfg.cas_index_opening_range_minutes)
@@ -93,6 +133,15 @@ _running = False
 _thread: Optional[threading.Thread] = None
 _index_thread: Optional[threading.Thread] = None
 _state_lock = threading.Lock()
+
+# What the CAS page shows about the scanner itself (so "nothing flagged" can be told
+# apart from "not running" / "market closed").
+_status = {
+    "market_open": False, "paused_reason": None,
+    "last_sweep_at": None, "last_sweep_seconds": None, "last_sweep_stocks": 0, "last_sweep_failures": 0,
+    "last_index_sweep_at": None,
+}
+_trading_day = {"date": None, "traded": None, "checked_at": 0.0}
 
 _at_risk: list = []          # Mode A shortlist
 _undercurrent: list = []     # Mode B flagged list
@@ -887,6 +936,8 @@ def _sweep_once(cfg):
 
     duration = _time.time() - sweep_start
     n_fail = len(stock_fetch_failures)
+    _status.update(last_sweep_at=_now_ist().isoformat(timespec="seconds"), last_sweep_seconds=round(duration),
+                   last_sweep_stocks=len(universe), last_sweep_failures=n_fail)
     _trace(sweep_id, "SWEEP_DONE",
            f"duration={duration:.1f}s at_risk={len(new_at_risk)} undercurrent={len(final_undercurrent)} "
            f"(stock_confirmed={n_confirmed}, tracked={len(sweep_strike_state)}) "
@@ -1084,6 +1135,7 @@ def _index_sweep_once(cfg):
     if fetch_failures:
         logger.warning(f"CAS index sweep {sweep_id}: fetch failed for {fetch_failures}")
     _trace(sweep_id, "CSWEEP_DONE", f"undercurrent={len(new_index_undercurrent)} tracked={len(index_state)}")
+    _status["last_index_sweep_at"] = _now_ist().isoformat(timespec="seconds")
 
 
 # Human-readable flow labels for the Telegram message -- same OI-price
@@ -1332,8 +1384,12 @@ def _run():
                 _time.sleep(15)
                 continue
 
+            if not _market_open(_now_ist()):
+                _time.sleep(30)
+                continue
+
             now = _time.time()
-            if now - last_sweep >= 300:  # 5 min
+            if now - last_sweep >= 300:  # 5 min (a sweep itself takes ~15 min at Dhan's 1-per-3s limit)
                 _sweep_once(cfg)
                 last_sweep = now
 
@@ -1378,4 +1434,5 @@ def get_state() -> dict:
             "alerts_b": list(_alerts_b),
             "heatmap": list(_heatmap),
             "running": _running,
+            "status": dict(_status),
         }

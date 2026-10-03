@@ -739,6 +739,10 @@ async def _reconnect_dhan_slot(slot: str) -> list:
         if not await asyncio.to_thread(cas_broker.connect, cfg.dhan_cas_client_code, cfg.dhan_cas_access_token):
             raise HTTPException(status_code=502, detail="Saved, but the CAS scanner could not reconnect to Dhan")
         notes.append("CAS scanner reconnected")
+        import cas_scanner
+        if not cas_scanner.get_state()["running"]:
+            cas_scanner.start()
+            notes.append("CAS scanner started")
     return notes
 
 
@@ -1712,6 +1716,22 @@ async def get_cas_undercurrent_endpoint():
     return {"undercurrent": cas_scanner.get_state()["undercurrent"]}
 
 
+@app.get("/api/cas_status")
+async def get_cas_status_endpoint():
+    """CAS scanner health for the CAS page: running, Dhan connection, CAS token, market
+    open/paused, last sweep times -- so an empty page can be told apart from a broken one."""
+    import cas_scanner, cas_broker, dhan_tokens
+    cfg = get_settings()
+    state = cas_scanner.get_state()
+    return {
+        "enabled": bool(cfg.cas_scanner_enabled),
+        "running": state["running"],
+        "connected": cas_broker.is_connected(),
+        "token": dhan_tokens.status("cas"),
+        **state["status"],
+    }
+
+
 @app.get("/api/cas_heatmap")
 async def get_cas_heatmap_endpoint():
     """CAS scanner Mode B: per-underlying heatmap over the full F&O universe,
@@ -2086,7 +2106,8 @@ async def startup_event():
             asyncio.run_coroutine_threadsafe(ws_manager.broadcast(msg), _main_loop)
 
         def _cas_telegram(message: str):
-            _send_telegram_alert_wrapper(message, cfg.telegram_bot_token, cfg.telegram_chat_id)
+            _tg = get_settings()   # current settings, not the ones from startup
+            _send_telegram_alert_wrapper(message, _tg.telegram_bot_token, _tg.telegram_chat_id)
 
         cas_scanner.set_broadcast_hooks(_cas_ws_broadcast, _cas_telegram)
         cas_scanner.start()

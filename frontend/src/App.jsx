@@ -1862,9 +1862,41 @@ function _casDetail(c) {
   return `${ratio}${mins}${cluster}${flow}`
 }
 
+// Scanner health line for the CAS page: without it, "Nothing flagged" looked the same
+// whether the market was quiet, closed, or the scanner had stopped / its token expired.
+const _casTime = iso => iso ? new Date(iso).toLocaleString('en-IN', { timeZone:'Asia/Kolkata', weekday:'short', day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit', hour12:false }) : null
+
+function CasStatusBar({ st }) {
+  if (!st) return null
+  const tokenBad = st.token && ['expired', 'missing', 'unreadable'].includes(st.token.state)
+  let tone = 'green', head = 'Scanning'
+  if (!st.enabled) { tone = 'muted'; head = 'Scanner switched off in Settings' }
+  else if (tokenBad) { tone = 'red'; head = `CAS Dhan token ${st.token.state} — update it in Settings → Dhan Connection` }
+  else if (!st.running || !st.connected) { tone = 'red'; head = 'Scanner not running (no Dhan connection)' }
+  else if (!st.market_open) { tone = 'yellow'; head = `Paused — ${st.paused_reason || 'market closed'}` }
+  const color = tone === 'green' ? V('green') : tone === 'red' ? V('red') : tone === 'yellow' ? V('yellow') : V('text-muted')
+  const parts = []
+  if (st.last_sweep_at) parts.push(`Stocks last swept ${_casTime(st.last_sweep_at)} (${st.last_sweep_stocks} stocks, ${st.last_sweep_failures} failed, took ${Math.round((st.last_sweep_seconds || 0) / 60)} min)`)
+  else parts.push('No stock sweep yet since the app started')
+  if (st.last_index_sweep_at) parts.push(`indices last swept ${_casTime(st.last_index_sweep_at)}`)
+  return (
+    <div style={{ border:`1px solid color-mix(in srgb, ${color} 35%, transparent)`, background:`color-mix(in srgb, ${color} 8%, transparent)`, borderRadius:V('radius-md'), padding:'10px 14px', display:'flex', flexDirection:'column', gap:3 }}>
+      <div style={{ color, fontWeight:700, fontSize:13 }}>● {head}</div>
+      <div style={{ color:V('text-muted'), fontSize:11 }}>{parts.join(' · ')}. Lists below are from the last sweep.</div>
+    </div>
+  )
+}
+
 function CasAlertsPage({ alertsA, alertsB, alertsC, atRisk, undercurrent, heatmap }) {
   const [subTab, setSubTab] = useState('alerts')
   const m = window.innerWidth < 768
+  const [casStatus, setCasStatus] = useState(null)
+  useEffect(() => {
+    const load = () => API.get('/api/cas_status').then(setCasStatus).catch(() => {})
+    load()
+    const id = setInterval(load, 15000)
+    return () => clearInterval(id)
+  }, [])
 
   const pillStyle = (active) => ({
     padding: '6px 16px', borderRadius: 20, fontSize: 13, fontWeight: 600, cursor: 'pointer',
@@ -1875,6 +1907,7 @@ function CasAlertsPage({ alertsA, alertsB, alertsC, atRisk, undercurrent, heatma
 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+      <CasStatusBar st={casStatus} />
       <div style={{ display:'flex', gap:8 }}>
         <div style={pillStyle(subTab === 'alerts')} onClick={() => setSubTab('alerts')}>Alerts</div>
         <div style={pillStyle(subTab === 'heatmap')} onClick={() => setSubTab('heatmap')}>Heatmap</div>
@@ -1912,7 +1945,7 @@ function CasAlertsTab({ alertsA, alertsB, alertsC, atRisk, undercurrent }) {
 
         <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(3,1fr)', gap:10, marginBottom:16 }}>
           <MetricBox label="Fired Alerts Today" value={alertsA.length} color={alertsA.length ? '#ef4444' : V('text-primary')} />
-          <MetricBox label="At-Risk Shortlist" value={atRisk.length} sub="updates every ~5 min" />
+          <MetricBox label="At-Risk Shortlist" value={atRisk.length} sub="refreshed after each stock sweep (~15 min)" />
           <MetricBox label="Top Risk Score" value={atRisk[0] ? atRisk[0].score.toFixed(0) : '—'} sub={atRisk[0] ? `${atRisk[0].symbol} ${atRisk[0].strike}${atRisk[0].option_type}` : ''} />
         </div>
 
@@ -1999,7 +2032,7 @@ function CasAlertsTab({ alertsA, alertsB, alertsC, atRisk, undercurrent }) {
 
         <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(2,1fr)', gap:10, marginBottom:16 }}>
           <MetricBox label="Fired Alerts Today" value={alertsB.length} color={alertsB.length ? '#f59e0b' : V('text-primary')} />
-          <MetricBox label="Currently Flagged" value={undercurrent.length} sub="updates every ~5 min" />
+          <MetricBox label="Currently Flagged" value={undercurrent.length} sub="refreshed after each stock sweep (~15 min)" />
         </div>
 
         {alertsB.length > 0 && (
