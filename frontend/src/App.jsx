@@ -5,7 +5,7 @@ import {
   Wifi, WifiOff, RefreshCw, Play, Square, AlertCircle,
   ChevronDown, CheckCircle, XCircle, Clock, Zap, BookOpen, Send, Cpu,
   Moon, Sun, LayoutDashboard, Globe, ChevronLeft, ChevronRight, Menu,
-  Calendar, Target, Trash2, Filter, Code2, Sparkles, Briefcase
+  Calendar, Target, Trash2, Filter, Code2, Sparkles, Briefcase, LogOut, Lock
 } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ReTooltip, ResponsiveContainer, Area, AreaChart } from 'recharts'
 import ResearchStudio from './components/ResearchStudio.jsx'
@@ -411,6 +411,20 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
           borderRadius: V('radius-sm'), cursor:'pointer', fontSize:13, width:'100%',
         }}>
           <Settings size={16}/> {(!collapsed || isMobile) && <span>Settings</span>}
+        </button>
+
+        {/* Logout */}
+        <button onClick={async () => {
+          try { await fetch('/api/auth/logout', { method:'POST' }) } catch (_) {}
+          window.location.reload()
+        }} title={collapsed ? 'Log out' : undefined} style={{
+          display:'flex', alignItems:'center', gap:12,
+          padding: collapsed ? '10px 0' : '10px 14px',
+          justifyContent: collapsed ? 'center' : 'flex-start',
+          background:'transparent', color:V('sidebar-text'), border:'none',
+          borderRadius: V('radius-sm'), cursor:'pointer', fontSize:13, width:'100%',
+        }}>
+          <LogOut size={16}/> {(!collapsed || isMobile) && <span>Log out</span>}
         </button>
 
         {/* Theme toggle */}
@@ -8623,7 +8637,7 @@ function LiveOiAnalysisPanel({ data, loading }) {
 
 
 // ── Main App ────────────────────────────────────────────────────────────────
-export default function App() {
+function MainApp() {
   const { theme, toggle: toggleTheme } = useTheme()
   const [tab,         setTab]         = useState('dashboard')
   const [connected,   setConnected]   = useState(false)
@@ -9485,4 +9499,86 @@ export default function App() {
       {showConnect  && <ConnectModal  onClose={()=>setShowConnect(false)}  onConnected={()=>setConnected(true)} />}
     </div>
   )
+}
+
+
+// ── Login gate (2026-10-03) ─────────────────────────────────────────────────
+// The backend refuses every /api call and the WebSocket without a session cookie (auth.py).
+// Any /api response "401 Not logged in" (e.g. the 12-hour session ran out) brings the login
+// screen back -- caught at fetch level so every call in the app is covered.
+if (typeof window !== 'undefined' && !window.__authFetchWrapped) {
+  window.__authFetchWrapped = true
+  const _fetch = window.fetch.bind(window)
+  window.fetch = async (input, init) => {
+    const res = await _fetch(input, init)
+    const url = typeof input === 'string' ? input : (input?.url || '')
+    if (res.status === 401 && url.includes('/api/') && !url.includes('/api/auth/')) {
+      window.dispatchEvent(new Event('auth-required'))
+    }
+    return res
+  }
+}
+
+function LoginPage({ onLoggedIn }) {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const submit = async (e) => {
+    e.preventDefault()
+    setBusy(true); setError('')
+    try {
+      const r = await fetch('/api/auth/login', { method:'POST', headers:{'Content-Type':'application/json'},
+                                                 body: JSON.stringify({ username, password }) })
+      const d = await r.json().catch(() => ({}))
+      if (r.ok) { onLoggedIn(d.username) }
+      else { setError(d.detail || 'Login failed'); setPassword('') }
+    } catch (_) { setError('Cannot reach the server.') }
+    setBusy(false)
+  }
+  const input = { width:'100%', boxSizing:'border-box', background:V('bg-input'), color:V('text-primary'),
+                  border:`1px solid ${V('border')}`, borderRadius:V('radius-sm'), padding:'10px 12px', fontSize:14, outline:'none' }
+  return (
+    <div style={{ minHeight:'100vh', display:'flex', alignItems:'center', justifyContent:'center', background:V('bg-primary'), padding:16 }}>
+      <form onSubmit={submit} style={{ width:360, maxWidth:'100%', background:V('bg-secondary'), border:`1px solid ${V('border')}`,
+                                       borderRadius:V('radius-xl'), padding:28, boxShadow:V('shadow-lg'), display:'flex', flexDirection:'column', gap:14 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+          <div style={{ width:36, height:36, borderRadius:10, background:V('accent-bg'), display:'flex', alignItems:'center', justifyContent:'center' }}>
+            <Lock size={18} style={{ color:V('accent') }} />
+          </div>
+          <div>
+            <div style={{ color:V('text-primary'), fontWeight:700, fontSize:17 }}>AlgoTrader Pro</div>
+            <div style={{ color:V('text-muted'), fontSize:12 }}>Sign in to continue</div>
+          </div>
+        </div>
+        <div>
+          <div style={{ color:V('text-secondary'), fontSize:12, marginBottom:4 }}>Username</div>
+          <input autoFocus autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} style={input} />
+        </div>
+        <div>
+          <div style={{ color:V('text-secondary'), fontSize:12, marginBottom:4 }}>Password</div>
+          <input type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} style={input} />
+        </div>
+        {error && <div style={{ color:V('red'), fontSize:12 }}>{error}</div>}
+        <StyledButton variant="primary" disabled={busy || !username || !password} style={{ padding:'10px 14px', fontSize:14, fontWeight:700 }}>
+          {busy ? 'Signing in…' : 'Sign in'}
+        </StyledButton>
+        <div style={{ color:V('text-muted'), fontSize:11, textAlign:'center' }}>Session lasts 12 hours</div>
+      </form>
+    </div>
+  )
+}
+
+export default function App() {
+  const [auth, setAuth] = useState({ checked:false, user:null })
+  useEffect(() => {
+    fetch('/api/auth/me').then(r => r.ok ? r.json() : null).then(d => setAuth({ checked:true, user: d?.username || null }))
+      .catch(() => setAuth({ checked:true, user:null }))
+    const onAuthRequired = () => setAuth({ checked:true, user:null })
+    window.addEventListener('auth-required', onAuthRequired)
+    return () => window.removeEventListener('auth-required', onAuthRequired)
+  }, [])
+  if (!auth.checked) return <div style={{ minHeight:'100vh', background:V('bg-primary') }} />
+  if (!auth.user) return <LoginPage onLoggedIn={(user) => setAuth({ checked:true, user })} />
+  return <MainApp />
 }

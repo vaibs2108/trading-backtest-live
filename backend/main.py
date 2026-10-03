@@ -76,10 +76,10 @@ def _format_ist_timestamp(ts_val) -> str:
             dt = datetime.now(_IST)
     return dt.isoformat()
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 import broker
@@ -182,6 +182,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Login gate (auth.py) ─────────────────────────────────────────────────────
+# Every /api call (and FastAPI's /docs, /openapi.json, which list every endpoint) needs a valid
+# session cookie. The page itself (/, /assets) stays open so the login screen can load.
+_AUTH_OPEN_PATHS = {"/api/auth/login", "/api/auth/me", "/api/auth/logout"}
+_AUTH_PROTECTED = ("/api", "/docs", "/redoc", "/openapi.json")
+
+
+@app.middleware("http")
+async def _require_login(request: Request, call_next):
+    path = request.url.path
+    if path.startswith(_AUTH_PROTECTED) and path not in _AUTH_OPEN_PATHS and request.method != "OPTIONS":
+        import auth
+        if not auth.check_session(request.cookies.get(auth.COOKIE)):
+            return JSONResponse({"detail": "Not logged in"}, status_code=401)
+    return await call_next(request)
+
 
 # Serve React frontend
 FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
@@ -1997,8 +2014,74 @@ async def cancel_all():
 
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def _login_telegram(message: str):
+    """Fire-and-forget Telegram note for logins / lockouts (never delays the response)."""
+    cfg = get_settings()
+    if cfg.telegram_bot_token and cfg.telegram_chat_id:
+        asyncio.get_event_loop().run_in_executor(
+            None, _send_telegram_alert_wrapper, message, cfg.telegram_bot_token, cfg.telegram_chat_id)
+
+
+def _client_label(request: Request) -> str:
+    ua = request.headers.get("user-agent", "")
+    device = "phone" if any(k in ua for k in ("Android", "iPhone", "Mobile")) else "computer"
+    browser = next((b for b in ("Edg", "Chrome", "Firefox", "Safari") if b in ua), "browser")
+    return f"{'Edge' if browser == 'Edg' else browser} on {device}"
+
+
+@app.post("/api/auth/login")
+async def auth_login(req: LoginRequest, request: Request):
+    import auth
+    ip = request.client.host if request.client else "unknown"
+    ok, msg, just_locked = auth.check_login(ip, req.username, req.password)
+    now = datetime.now(_IST).strftime("%d %b %H:%M:%S")
+    if not ok:
+        logger.warning(f"Login failed from {ip}: {msg}")
+        if just_locked:
+            add_activity_log(f"Login locked for {auth.LOCK_MINUTES} min after {auth.LOCK_AFTER} wrong attempts from {ip}")
+            _login_telegram(f"\u26a0\ufe0f AlgoTrader: {auth.LOCK_AFTER} wrong passwords from {ip} "
+                            f"({_client_label(request)}) -- login locked for {auth.LOCK_MINUTES} min. {now} IST")
+        return JSONResponse({"detail": msg}, status_code=429 if "Too many" in msg else 401)
+    resp = JSONResponse({"success": True, "username": req.username})
+    resp.set_cookie(auth.COOKIE, auth.make_session(req.username), max_age=auth.SESSION_HOURS * 3600,
+                    httponly=True, samesite="strict", secure=request.url.scheme == "https", path="/")
+    logger.info(f"Login: {req.username} from {ip}")
+    add_activity_log(f"Login: {req.username} from {ip} ({_client_label(request)})")
+    _login_telegram(f"\U0001F510 AlgoTrader login: {req.username} from {ip} ({_client_label(request)}) at {now} IST")
+    return resp
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    import auth
+    user = auth.check_session(request.cookies.get(auth.COOKIE))
+    if not user:
+        return JSONResponse({"detail": "Not logged in"}, status_code=401)
+    return {"username": user, "session_hours": auth.SESSION_HOURS}
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    import auth
+    resp = JSONResponse({"success": True})
+    resp.delete_cookie(auth.COOKIE, path="/")
+    user = auth.check_session(request.cookies.get(auth.COOKIE))
+    if user:
+        add_activity_log(f"Logout: {user}")
+    return resp
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    import auth
+    if not auth.check_session(ws.cookies.get(auth.COOKIE)):
+        await ws.close(code=4401)   # not logged in (live prices/positions are pushed here)
+        return
     await ws_manager.connect(ws)
     logger.info("WebSocket client connected")
     try:
@@ -2069,6 +2152,11 @@ async def _feed_reconcile_loop():
 @app.on_event("startup")
 async def startup_event():
     Path("logs").mkdir(exist_ok=True)
+    try:
+        import auth
+        auth.ensure_env_defaults()
+    except Exception as e:
+        logger.error(f"auth: could not set login defaults in .env: {e}")
     _load_signal_history()
     add_activity_log("Trading Engine Booted successfully.")
     
