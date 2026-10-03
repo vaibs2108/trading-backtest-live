@@ -142,7 +142,11 @@ class Settings(BaseSettings):
     dhan_cas_access_token: str = ""
     cas_scanner_enabled: bool = True
     cas_premium_floor: float = 5.0          # Mode A: premium below this counts as "near-worthless"
-    cas_max_days_to_expiry: int = 3         # Mode A: shortlist strikes expiring within N sessions (0 = today)
+    # Mode A, 2026-10-03: expiry day only (was 3 days before it) and the top-scoring
+    # cas_mode_a_top_n contracts only -- on 29 Sep the shortlist was ~6,000 contracts and
+    # one pass over it (15:05-15:28) took ~10 min; Mode A had never fired.
+    cas_max_days_to_expiry: int = 0         # Mode A: shortlist strikes expiring within N calendar days (0 = today)
+    cas_mode_a_top_n: int = 100             # Mode A: keep only the N highest-scoring contracts
     cas_spike_multiple: float = 5.0         # Mode A: alert when price >= this x its recent rolling minimum
     cas_lookback_minutes: int = 10          # Mode A: rolling-minimum window for spike detection
     # Mode B redesign (2026-08-26): a single-sweep ratio snapshot fired on

@@ -926,6 +926,10 @@ def _sweep_once(cfg):
     # Mode C's own immediate alert.
     for c in new_undercurrent:
         c["_source"] = "stock"
+    # Mode A shortlist: the top cas_mode_a_top_n contracts by score across all stocks
+    # (cheaper + sooner + more near-ATM OI rank higher -- see score_mode_a)
+    new_at_risk.sort(key=lambda c: c["score"], reverse=True)
+    new_at_risk = new_at_risk[:cfg.cas_mode_a_top_n]
     with _state_lock:
         _at_risk = new_at_risk
         _strike_activity_state = sweep_strike_state
