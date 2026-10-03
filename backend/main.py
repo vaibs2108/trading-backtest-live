@@ -699,39 +699,19 @@ async def get_status():
     }
 
 
-class DhanTokenUpdate(BaseModel):
-    slot: str            # "main" (trading) | "cas" (CAS scanner)
-    access_token: str
-
-
-@app.get("/api/dhan/tokens")
-async def get_dhan_tokens():
-    """Masked client ID / token and expiry for both Dhan tokens (never the token itself)."""
-    import dhan_tokens
-    return dhan_tokens.all_status()
-
-
-@app.post("/api/dhan/token")
-async def update_dhan_token(req: DhanTokenUpdate):
-    """Replace a Dhan access token from the Settings page: check it, save it to .env,
-    and reconnect everything that uses it -- no restart, no .env editing."""
-    import dhan_tokens
-    if req.slot not in dhan_tokens.SLOTS:
-        raise HTTPException(status_code=400, detail="slot must be 'main' or 'cas'")
-    ok, why = await asyncio.to_thread(dhan_tokens.check_new_token, req.slot, req.access_token)
-    if not ok:
-        raise HTTPException(status_code=400, detail=why)
-    await asyncio.to_thread(dhan_tokens.save_token, req.slot, req.access_token)
+async def _reconnect_dhan_slot(slot: str) -> list:
+    """Apply the (just saved) credentials of one Dhan slot without a restart.
+    main: broker reconnect, live price feed + order-update feed restart.  cas: CAS scanner reconnect."""
     cfg = get_settings()
     notes = []
-    if req.slot == "main":
+    if slot == "main":
         success, msg = await asyncio.to_thread(broker.connect, cfg.dhan_client_code, cfg.dhan_access_token)
         if not success:
-            raise HTTPException(status_code=502, detail=f"Token saved, but reconnecting to Dhan failed: {msg}")
+            raise HTTPException(status_code=502, detail=f"Saved, but reconnecting to Dhan failed: {msg}")
         broker._dhan_auth_error = None   # the old token's rejection no longer applies
         notes.append("Broker reconnected")
-        # Live price feed: restart on the new token if it was running (otherwise the
-        # signal loop starts it with the new token at the next market open).
+        # Live price feed: restart on the new credentials if it was running (otherwise
+        # the signal loop starts it with them at the next market open).
         _feed = get_live_feed()
         if _feed.is_running:
             _old = getattr(_feed, "_thread", None)
@@ -757,8 +737,109 @@ async def update_dhan_token(req: DhanTokenUpdate):
     else:
         import cas_broker
         if not await asyncio.to_thread(cas_broker.connect, cfg.dhan_cas_client_code, cfg.dhan_cas_access_token):
-            raise HTTPException(status_code=502, detail="Token saved, but the CAS scanner could not reconnect to Dhan")
+            raise HTTPException(status_code=502, detail="Saved, but the CAS scanner could not reconnect to Dhan")
         notes.append("CAS scanner reconnected")
+    return notes
+
+
+class DhanClientUpdate(BaseModel):
+    slot: str            # "main" | "cas"
+    client_id: str
+    access_token: str    # must belong to client_id (a token is tied to one client ID)
+
+
+class TelegramUpdate(BaseModel):
+    bot_token: Optional[str] = None   # only when replacing it
+    chat_id: Optional[str] = None
+
+
+@app.get("/api/config/credentials")
+async def get_config_credentials():
+    """Configuration panel: Dhan client IDs + Telegram chat ID (editable), bot token masked."""
+    import dhan_tokens
+    return dhan_tokens.get_config()
+
+
+@app.post("/api/config/dhan-client")
+async def update_dhan_client(req: DhanClientUpdate):
+    """Change a Dhan client ID together with a token for it: checked with Dhan, saved
+    to .env, applied without a restart."""
+    import dhan_tokens
+    if req.slot not in dhan_tokens.SLOTS:
+        raise HTTPException(status_code=400, detail="slot must be 'main' or 'cas'")
+    client_id = (req.client_id or "").strip()
+    if not client_id.isdigit():
+        raise HTTPException(status_code=400, detail="Dhan client ID should be digits only.")
+    ok, why = await asyncio.to_thread(dhan_tokens.check_new_token, req.slot, req.access_token, client_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail=why)
+    await asyncio.to_thread(dhan_tokens.save_client_and_token, req.slot, client_id, req.access_token)
+    notes = await _reconnect_dhan_slot(req.slot)
+    add_activity_log(f"{dhan_tokens.SLOTS[req.slot]['label']} Dhan client ID updated from Settings")
+    return {"success": True, "config": dhan_tokens.get_config(), "status": dhan_tokens.status(req.slot), "notes": notes}
+
+
+@app.post("/api/config/telegram")
+async def update_telegram_config(req: TelegramUpdate):
+    """Replace the Telegram bot token and/or chat ID (checked, saved to .env, used at once)."""
+    import dhan_tokens
+    values = {}
+    if req.bot_token is not None and req.bot_token.strip():
+        ok, why = await asyncio.to_thread(dhan_tokens.check_telegram_token, req.bot_token)
+        if not ok:
+            raise HTTPException(status_code=400, detail=why)
+        values[dhan_tokens.TELEGRAM_TOKEN_ENV] = req.bot_token.strip()
+    if req.chat_id is not None and req.chat_id.strip():
+        ok, why = dhan_tokens.check_chat_id(req.chat_id)
+        if not ok:
+            raise HTTPException(status_code=400, detail=why)
+        values[dhan_tokens.TELEGRAM_CHAT_ENV] = req.chat_id.strip()
+    if not values:
+        raise HTTPException(status_code=400, detail="Nothing to change.")
+    await asyncio.to_thread(dhan_tokens.write_env, values)
+    add_activity_log("Telegram details updated from Settings")
+    return {"success": True, "config": dhan_tokens.get_config()}
+
+
+@app.post("/api/config/telegram/test")
+async def send_telegram_config_test():
+    """Send a short test message with the saved Telegram details."""
+    cfg = get_settings()
+    if not (cfg.telegram_bot_token and cfg.telegram_chat_id):
+        raise HTTPException(status_code=400, detail="Telegram bot token / chat ID are not set.")
+    try:
+        await asyncio.to_thread(_send_telegram_alert_wrapper,
+                                "\u2705 AlgoTrader: Telegram is set up correctly (test message from Settings).",
+                                cfg.telegram_bot_token, cfg.telegram_chat_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Telegram send failed: {e}")
+    return {"success": True}
+
+
+class DhanTokenUpdate(BaseModel):
+    slot: str            # "main" (trading) | "cas" (CAS scanner)
+    access_token: str
+
+
+@app.get("/api/dhan/tokens")
+async def get_dhan_tokens():
+    """Masked client ID / token and expiry for both Dhan tokens (never the token itself)."""
+    import dhan_tokens
+    return dhan_tokens.all_status()
+
+
+@app.post("/api/dhan/token")
+async def update_dhan_token(req: DhanTokenUpdate):
+    """Replace a Dhan access token from the Settings page: check it, save it to .env,
+    and reconnect everything that uses it -- no restart, no .env editing."""
+    import dhan_tokens
+    if req.slot not in dhan_tokens.SLOTS:
+        raise HTTPException(status_code=400, detail="slot must be 'main' or 'cas'")
+    ok, why = await asyncio.to_thread(dhan_tokens.check_new_token, req.slot, req.access_token)
+    if not ok:
+        raise HTTPException(status_code=400, detail=why)
+    await asyncio.to_thread(dhan_tokens.save_token, req.slot, req.access_token)
+    notes = await _reconnect_dhan_slot(req.slot)
     add_activity_log(f"{dhan_tokens.SLOTS[req.slot]['label']} Dhan token updated from Settings")
     return {"success": True, "status": dhan_tokens.status(req.slot), "notes": notes}
 

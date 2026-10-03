@@ -1,5 +1,5 @@
 """
-dhan_tokens.py — Dhan access tokens: expiry status and updating them from the Settings page.
+dhan_tokens.py — Dhan access tokens / client IDs and Telegram details, edited from the Settings page.
 
 Dhan access tokens are JWTs that carry their own expiry ("exp") and client ID
 ("dhanClientId"), so the expiry can be read locally without calling Dhan. They last
@@ -79,9 +79,10 @@ def all_status() -> dict:
     return {slot: status(slot) for slot in SLOTS}
 
 
-def check_new_token(slot: str, token: str) -> tuple[bool, str]:
+def check_new_token(slot: str, token: str, client_id: Optional[str] = None) -> tuple[bool, str]:
     """Validate a pasted token before saving: readable, not expired, belongs to the
-    configured client ID, and accepted by Dhan's profile API."""
+    client ID (the configured one, or `client_id` when that is being changed), and
+    accepted by Dhan's profile API."""
     meta = SLOTS[slot]
     token = (token or "").strip()
     claims = decode(token)
@@ -89,11 +90,13 @@ def check_new_token(slot: str, token: str) -> tuple[bool, str]:
         return False, "That doesn't look like a Dhan access token."
     if datetime.fromtimestamp(int(claims["exp"]), _IST) <= datetime.now(_IST):
         return False, "This token has already expired — generate a new one on Dhan."
-    client = (getattr(get_settings(), meta["client_field"], "") or "").strip()
+    client = (client_id if client_id is not None else (getattr(get_settings(), meta["client_field"], "") or "")).strip()
     if not client:
         return False, f"No client ID configured for {meta['label']} ({meta['client_env']} in .env)."
     if str(claims.get("dhanClientId", "")) != client:
-        return False, f"This token belongs to a different Dhan client ID than {meta['label']} uses."
+        return False, (f"This token belongs to a different Dhan client ID than {client}."
+                       if client_id is not None else
+                       f"This token belongs to a different Dhan client ID than {meta['label']} uses.")
     try:
         r = requests.get("https://api.dhan.co/v2/profile",
                          headers={"access-token": token, "dhanClientId": client, "Accept": "application/json"},
@@ -113,7 +116,20 @@ def save_token(slot: str, token: str) -> None:
     """Write the token to .env (replacing the old line, or appending) and to this
     process's environment, then reload settings so the new token is in effect."""
     meta = SLOTS[slot]
-    key, token = meta["token_env"], token.strip()
+    write_env({meta["token_env"]: token.strip()})
+    logger.info(f"{meta['label']} Dhan token updated (expires {status(slot)['expires_at']})")
+
+
+def write_env(values: dict) -> None:
+    """Set KEY=value lines in .env (replace in place, or append) and in this process's
+    environment, then reload settings. Only those values change in the file."""
+    for key, token in values.items():
+        _write_env_line(key, str(token).strip())
+    from config import reload_settings
+    reload_settings()
+
+
+def _write_env_line(key: str, token: str) -> None:
     with _env_lock:
         # newline="" on both read and write: change only the token value and leave every
         # other byte (incl. CRLF/LF line endings) exactly as it was.
@@ -128,6 +144,55 @@ def save_token(slot: str, token: str) -> None:
         with _ENV_PATH.open("w", encoding="utf-8", newline="") as f:
             f.write(text)
         os.environ[key] = token
-    from config import reload_settings
-    reload_settings()
-    logger.info(f"{meta['label']} Dhan token updated (expires {status(slot)['expires_at']})")
+
+
+# ── Configuration panel: client IDs + Telegram ──────────────────────────────
+
+TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ENV = "TELEGRAM_CHAT_ID"
+
+
+def get_config() -> dict:
+    """What the Configuration panel shows. Client IDs and the Telegram chat ID are
+    returned so they can be edited; the bot token and Dhan tokens only masked."""
+    cfg = get_settings()
+    return {
+        "dhan": {slot: {"label": m["label"], "client_id": (getattr(cfg, m["client_field"], "") or "").strip()}
+                 for slot, m in SLOTS.items()},
+        "telegram": {"bot_token": _mask((cfg.telegram_bot_token or "").strip()),
+                     "chat_id": (cfg.telegram_chat_id or "").strip(),
+                     "configured": bool(cfg.telegram_bot_token and cfg.telegram_chat_id)},
+    }
+
+
+def save_client_and_token(slot: str, client_id: str, token: str) -> None:
+    meta = SLOTS[slot]
+    write_env({meta["client_env"]: client_id.strip(), meta["token_env"]: token.strip()})
+    logger.info(f"{meta['label']} Dhan client ID + token updated")
+
+
+def _telegram_base() -> str:
+    # Same base the app sends through (a proxy may be set via TELEGRAM_API_URL in .env)
+    return os.environ.get("TELEGRAM_API_URL", "https://api.telegram.org").strip().rstrip("/")
+
+
+def check_telegram_token(token: str) -> tuple[bool, str]:
+    """Ask Telegram whether a bot token is valid (getMe)."""
+    token = (token or "").strip()
+    if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{20,}", token):
+        return False, "That doesn't look like a Telegram bot token (expected 123456789:ABC...)."
+    try:
+        r = requests.get(f"{_telegram_base()}/bot{token}/getMe", timeout=10)
+        d = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        if r.status_code == 200 and d.get("ok"):
+            return True, f"Bot @{d.get('result', {}).get('username', '?')}"
+        return False, f"Telegram rejected the bot token (HTTP {r.status_code}): {str(d.get('description') or r.text)[:120]}"
+    except Exception as e:
+        return False, f"Could not reach Telegram to check the bot token: {e}"
+
+
+def check_chat_id(chat_id: str) -> tuple[bool, str]:
+    chat_id = (chat_id or "").strip()
+    if re.fullmatch(r"-?\d{3,}", chat_id) or re.fullmatch(r"@[A-Za-z0-9_]{4,}", chat_id):
+        return True, "OK"
+    return False, "Chat ID should be a number (e.g. 123456789, or -100... for a group) or @channelname."

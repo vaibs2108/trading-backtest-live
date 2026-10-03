@@ -1019,9 +1019,113 @@ function DhanTokenCard() {
   )
 }
 
+// ── Configuration panel: Dhan client IDs + Telegram details (saved to .env) ──
+const _cfgInput = { width:'100%', boxSizing:'border-box', background:V('bg-input'), color:V('text-primary'), border:`1px solid ${V('border')}`, borderRadius:V('radius-sm'), padding:'8px 12px', fontSize:12, outline:'none' }
+const _cfgLabel = { color:V('text-secondary'), fontSize:12, marginBottom:4, fontWeight:500 }
+async function _postJson(url, body) {
+  const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined })
+  let d = {}; try { d = await r.json() } catch (_) {}
+  return { ok: r.ok && d.success !== false, d }
+}
+
+function DhanClientSection({ slot, current, onSaved }) {
+  const [client, setClient] = useState(current.client_id || '')
+  const [tok, setTok] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState(null)
+  const changed = client.trim() !== (current.client_id || '')
+  const save = async () => {
+    setBusy(true); setMsg(null)
+    const { ok, d } = await _postJson('/api/config/dhan-client', { slot, client_id: client.trim(), access_token: tok.trim() })
+    setBusy(false)
+    if (ok) { setTok(''); setMsg({ ok:true, text:'Saved. ' + (d.notes || []).join(', ') + '.' }); onSaved() }
+    else setMsg({ ok:false, text: d.detail || 'Save failed' })
+  }
+  return (
+    <div style={{ padding:'10px 0', borderBottom:`1px solid ${V('border-light')}` }}>
+      <div style={{ fontSize:13, fontWeight:600, color:V('text-primary'), marginBottom:8 }}>{current.label}</div>
+      <div style={_cfgLabel}>Dhan client ID</div>
+      <input value={client} onChange={e=>setClient(e.target.value)} placeholder="e.g. 1100012345" style={_cfgInput} />
+      <div style={{ ..._cfgLabel, marginTop:8 }}>Access token for this client ID {changed ? '(required)' : ''}</div>
+      <input type="password" autoComplete="off" value={tok} onChange={e=>setTok(e.target.value)} placeholder="A token belongs to one client ID — paste it with the new ID" style={_cfgInput} />
+      <div style={{ display:'flex', justifyContent:'flex-end', marginTop:8 }}>
+        <StyledButton onClick={save} variant="primary" disabled={busy || !client.trim() || !tok.trim()} style={{ padding:'6px 16px', fontSize:12 }}>
+          {busy ? 'Checking…' : 'Save'}
+        </StyledButton>
+      </div>
+      {msg && <div style={{ fontSize:11, marginTop:4, color: msg.ok ? V('green') : V('red') }}>{msg.text}</div>}
+    </div>
+  )
+}
+
+function TelegramSection({ current, onSaved }) {
+  const [tok, setTok] = useState('')
+  const [chat, setChat] = useState(current.chat_id || '')
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState(null)
+  const chatChanged = chat.trim() !== (current.chat_id || '')
+  const save = async () => {
+    setBusy(true); setMsg(null)
+    const body = {}
+    if (tok.trim()) body.bot_token = tok.trim()
+    if (chatChanged) body.chat_id = chat.trim()
+    const { ok, d } = await _postJson('/api/config/telegram', body)
+    setBusy(false)
+    if (ok) { setTok(''); setMsg({ ok:true, text:'Saved — new details are used for the next alert.' }); onSaved() }
+    else setMsg({ ok:false, text: d.detail || 'Save failed' })
+  }
+  const test = async () => {
+    setBusy(true); setMsg(null)
+    const { ok, d } = await _postJson('/api/config/telegram/test')
+    setBusy(false)
+    setMsg(ok ? { ok:true, text:'Test message sent — check Telegram.' } : { ok:false, text: d.detail || 'Test failed' })
+  }
+  return (
+    <div style={{ padding:'10px 0' }}>
+      <div style={_cfgLabel}>Bot token {current.bot_token ? `(current ${current.bot_token})` : '(not set)'}</div>
+      <input type="password" autoComplete="off" value={tok} onChange={e=>setTok(e.target.value)} placeholder="Paste a new bot token to replace it (leave empty to keep)" style={_cfgInput} />
+      <div style={{ ..._cfgLabel, marginTop:8 }}>Chat ID</div>
+      <input value={chat} onChange={e=>setChat(e.target.value)} placeholder="e.g. 123456789" style={_cfgInput} />
+      <div style={{ display:'flex', justifyContent:'flex-end', gap:8, marginTop:8 }}>
+        <StyledButton onClick={test} variant="default" disabled={busy || !current.configured} style={{ padding:'6px 14px', fontSize:12 }}>Send test message</StyledButton>
+        <StyledButton onClick={save} variant="primary" disabled={busy || (!tok.trim() && !chatChanged)} style={{ padding:'6px 16px', fontSize:12 }}>
+          {busy ? 'Checking…' : 'Save'}
+        </StyledButton>
+      </div>
+      {msg && <div style={{ fontSize:11, marginTop:4, color: msg.ok ? V('green') : V('red') }}>{msg.text}</div>}
+    </div>
+  )
+}
+
+function ConfigurationModal({ onClose }) {
+  const [conf, setConf] = useState(null)
+  const load = () => fetch('/api/config/credentials').then(r => r.json()).then(setConf).catch(() => {})
+  useEffect(() => { load() }, [])
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.5)', backdropFilter:'blur(4px)', zIndex:100, display:'flex', alignItems:'center', justifyContent:'center', padding:16 }}>
+      <div style={{ background:V('bg-secondary'), border:`1px solid ${V('border')}`, borderRadius:V('radius-xl'), width:520, maxWidth:'100%', maxHeight:'90vh', overflowY:'auto', padding:24, boxShadow:V('shadow-lg') }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:4 }}>
+          <h2 style={{ margin:0, color:V('text-primary'), fontSize:18, fontWeight:700 }}>Configuration</h2>
+          <StyledButton onClick={onClose} variant="default" style={{ padding:'4px 12px', fontSize:12 }}>Close</StyledButton>
+        </div>
+        <p style={{ color:V('text-muted'), fontSize:12, margin:'0 0 12px' }}>
+          Account details saved to the app's .env file — everything is checked before it is saved and used straight away.
+        </p>
+        {!conf ? <div style={{ fontSize:12, color:V('text-muted') }}>Loading…</div> : (<>
+          <div style={{ fontSize:11, fontWeight:700, color:V('text-head'), textTransform:'uppercase', marginTop:6 }}>Dhan account</div>
+          {['main', 'cas'].map(k => conf.dhan[k] && <DhanClientSection key={k + (conf.dhan[k].client_id || '')} slot={k} current={conf.dhan[k]} onSaved={load} />)}
+          <div style={{ fontSize:11, fontWeight:700, color:V('text-head'), textTransform:'uppercase', marginTop:16 }}>Telegram alerts</div>
+          <TelegramSection key={conf.telegram.chat_id + conf.telegram.bot_token} current={conf.telegram} onSaved={load} />
+        </>)}
+      </div>
+    </div>
+  )
+}
+
 function SettingsPanel({ onSaved }) {
   const [cfg, setCfg] = useState({})
   const [orig, setOrig] = useState({})   // values as loaded -- Save sends only what you changed
+  const [showConfig, setShowConfig] = useState(false)
   const [saved, setSaved] = useState(false)
 
   const load = () => API.get('/api/settings').then(c => { setCfg(c); setOrig(c) })
@@ -1067,6 +1171,12 @@ function SettingsPanel({ onSaved }) {
 
   return (
     <div className="fade-in" style={{ display:'flex', flexDirection:'column', gap:16 }}>
+      <div style={{ display:'flex', justifyContent:'flex-end' }}>
+        <StyledButton onClick={() => setShowConfig(true)} variant="primary" style={{ padding:'8px 18px', fontSize:13, fontWeight:700 }}>
+          <Settings size={14} /> Configuration
+        </StyledButton>
+      </div>
+      {showConfig && <ConfigurationModal onClose={() => { setShowConfig(false); load() }} />}
       <DhanTokenCard />
       {/* 2-column grid layout */}
       <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
