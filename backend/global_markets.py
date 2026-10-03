@@ -712,6 +712,21 @@ def _score_headline(title: str) -> dict:
     }
 
 
+_NEWS_MAX_AGE_SEC = 3 * 24 * 3600
+
+
+def _parse_pub_date(text):
+    """RSS pubDate -> aware UTC datetime, or None if missing/unparseable."""
+    if not text:
+        return None
+    try:
+        from email.utils import parsedate_to_datetime
+        d = parsedate_to_datetime(text)
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 def fetch_news_sentiment() -> dict:
     """Fetch and analyze news headlines with weighted keyword scoring."""
     cached = _get_cached("news_sentiment", 600)
@@ -725,6 +740,7 @@ def fetch_news_sentiment() -> dict:
     total_bull = 0.0
     total_bear = 0.0
     total_scored = 0
+    skipped_old = 0
 
     for feed_url, source in RSS_FEEDS:
         try:
@@ -746,6 +762,12 @@ def fetch_news_sentiment() -> dict:
                 title = title_el.text or ""
                 title_clean = re.sub(r"<[^>]+>", "", title).strip()
                 if not title_clean:
+                    continue
+                # Feeds mix in months- or years-old items (e.g. a 23 Apr 2024 headline seen
+                # on 2026-10-03); they must not drive today's sentiment.
+                _pub = _parse_pub_date(pub_el.text if pub_el is not None else None)
+                if _pub is not None and (datetime.now(timezone.utc) - _pub).total_seconds() > _NEWS_MAX_AGE_SEC:
+                    skipped_old += 1
                     continue
 
                 scored = _score_headline(title_clean)
@@ -797,6 +819,7 @@ def fetch_news_sentiment() -> dict:
         "bear_count": round(total_bear, 1),
         "total_headlines": len(headlines),
         "scored_headlines": total_scored,
+        "skipped_old_headlines": skipped_old,   # older than 3 days, left out
         "calculation": f"Weighted: ({total_bull:.1f} bull - {total_bear:.1f} bear) / ({total_bull:.1f} + {total_bear:.1f}) × 100 = {news_score}",
         "method": "Weighted keywords (crash=3, rally=3, drop=2, gain=2, up=1) with negation detection & context scoring",
         "refresh_seconds": 600,
@@ -1353,17 +1376,26 @@ def fetch_oi_analysis(instrument: str = "BANKNIFTY", expiry: str = None) -> dict
 
         # 2. Fetch option chain
         # Dhan API: POST /optionchain → {"data": {"last_price": ..., "oc": {...}}, "status": "success"}
-        oc_resp = broker.dhan_api_call(
-            "market_data",
-            client.option_chain,
-            under_security_id=sec_id,
-            under_exchange_segment=exch_seg,
-            expiry=nearest_expiry
-        )
+        # Dhan allows very few option-chain requests per account (the CAS scanner uses the
+        # same account and calls it ~1/sec), so a refused call is often just "too soon":
+        # wait and retry, and never cache a failure (it used to stick for 3 minutes).
+        oc_resp = None
+        for _attempt in range(3):
+            oc_resp = broker.dhan_api_call(
+                "market_data",
+                client.option_chain,
+                under_security_id=sec_id,
+                under_exchange_segment=exch_seg,
+                expiry=nearest_expiry
+            )
+            if isinstance(oc_resp, dict) and oc_resp.get("status") == "success":
+                break
+            if _attempt < 2:
+                time.sleep(3.1)
 
         if not isinstance(oc_resp, dict) or oc_resp.get("status") != "success":
-            result["error"] = f"Option chain fetch failed: {oc_resp.get('remarks', oc_resp.get('errorMessage', 'unknown'))}"
-            _set_cached(cache_key, result)
+            _remarks = oc_resp.get('remarks', oc_resp.get('errorMessage', 'unknown')) if isinstance(oc_resp, dict) else oc_resp
+            result["error"] = f"Option chain fetch failed (Dhan refused 3 tries): {_remarks}"
             return result
 
         # Parse response — Dhan docs: {"data": {"last_price": ..., "oc": {...}}}

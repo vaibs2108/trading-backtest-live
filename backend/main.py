@@ -696,53 +696,31 @@ async def get_status():
 
 @app.get("/api/sparkline")
 async def get_sparkline():
+    """Dashboard mini-chart: last 20 daily closes of the live instrument.
+    Uses the app's normal history download (rate limiter, token-error tracking, and
+    MCX futures for CRUDEOIL) -- it used to call Dhan directly with a hard-coded index
+    map that had no CRUDEOIL, so CRUDEOIL showed BANKNIFTY's chart."""
     cfg = get_settings()
     instrument = cfg.instrument
-    inst_map = {
-        "NIFTY": {"id": 13, "seg": "IDX_I"},
-        "BANKNIFTY": {"id": 25, "seg": "IDX_I"},
-        "FINNIFTY": {"id": 27, "seg": "IDX_I"},
-        "MIDCPNIFTY": {"id": 442, "seg": "IDX_I"},
-        "SENSEX": {"id": 51, "seg": "IDX_I"}
-    }
-    
-    meta = inst_map.get(instrument.upper(), {"id": 25, "seg": "IDX_I"})
-    
     if not broker.is_connected():
         return {"instrument": instrument, "closes": [], "pct_change": 0.0}
-        
     try:
-        from datetime import datetime, timedelta
         import pytz
-        _IST = pytz.timezone("Asia/Kolkata")
-        now_ist = datetime.now(_IST)
-        from_date = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
-        to_date = now_ist.strftime("%Y-%m-%d")
-        
-        res = await asyncio.to_thread(
-            broker._dhan_client.historical_daily_data,
-            security_id=meta["id"],
-            exchange_segment=meta["seg"],
-            instrument_type="INDEX",
-            from_date=from_date,
-            to_date=to_date,
-            expiry_code=0
+        now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+        df = await asyncio.to_thread(
+            broker.get_historical_data, instrument, "DAY",
+            (now_ist - timedelta(days=45)).strftime("%Y-%m-%d"),
+            (now_ist + timedelta(days=1)).strftime("%Y-%m-%d"),
         )
-        if isinstance(res, dict) and res.get("status") == "success" and "data" in res and isinstance(res["data"], dict) and "close" in res["data"]:
-            closes = [float(val) for val in res["data"]["close"] if val is not None]
-            closes = closes[-20:]
-            
+        if df is not None and len(df):
+            closes = [float(c) for c in df["close"].dropna().tolist()][-20:]
             pct_change = 0.0
-            if len(closes) >= 2:
-                last_c = closes[-1]
-                first_c = closes[0]
-                if first_c > 0:
-                    pct_change = round(((last_c - first_c) / first_c) * 100, 2)
-                    
-            return {"instrument": instrument, "closes": closes, "pct_change": pct_change}
+            if len(closes) >= 2 and closes[0] > 0:
+                pct_change = round((closes[-1] - closes[0]) / closes[0] * 100, 2)
+            return {"instrument": instrument, "closes": closes, "pct_change": pct_change,
+                    "as_of": str(pd.to_datetime(df["timestamp"].max()).date())}
     except Exception as e:
         logger.error(f"Error fetching sparkline: {e}")
-        
     return {"instrument": instrument, "closes": [], "pct_change": 0.0}
 
 

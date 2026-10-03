@@ -5961,7 +5961,40 @@ function PerformancePanel({ theme }) {
 }
 
 // ── Dashboard Page ──────────────────────────────────────────────────────────
-function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, todayPnl, lotSize, tradeState, signal, strategy, instrument, ltp, capitalState, dataHealth, toggleAppRunning, allSignals, lastEntries, telegramConfigured, refreshSettings, maxDailyLoss, maxDailyProfit }) {
+// Capital-drawdown flag: while it's on, the backend refuses every auto-trade entry
+// (capital_tracker.can_trade). It used to be invisible in the UI -- it sat stuck on
+// from 2026-06-25 with 0% drawdown. Shown on Dashboard and Auto Trade with a reset.
+function CapitalBreachNotice({ capitalState }) {
+  const [busy, setBusy] = useState(false)
+  const [hidden, setHidden] = useState(false)
+  if (!capitalState?.drawdown_breached || hidden) return null
+  const reset = async () => {
+    if (!window.confirm('Reset the capital drawdown flag?\n\nAuto-trade entries are refused while it is on. ' +
+      `Current drawdown: ${(capitalState.current_drawdown_pct ?? 0).toFixed(1)}% (limit ${capitalState.max_drawdown_pct}%).`)) return
+    setBusy(true)
+    try {
+      const r = await API.post('/api/capital/reset-breach')
+      if (r && r.success) setHidden(true)
+      else alert('Reset failed')
+    } catch (e) { alert('Reset failed: ' + e.message) }
+    finally { setBusy(false) }
+  }
+  return (
+    <div style={{ background:V('red-bg'), border:`1px solid color-mix(in srgb, ${V('red')} 35%, transparent)`,
+                  borderRadius:V('radius'), padding:'10px 14px', display:'flex', alignItems:'center', gap:12, flexWrap:'wrap' }}>
+      <div style={{ flex:1, minWidth:240, color:V('red'), fontSize:12, fontWeight:600, lineHeight:1.5 }}>
+        ⛔ Auto-trade entries are BLOCKED — the capital drawdown flag is on (since {capitalState.last_updated}).
+        Current drawdown {(capitalState.current_drawdown_pct ?? 0).toFixed(1)}% of a {capitalState.max_drawdown_pct}% limit.
+        Every new auto-trade entry is refused until the flag is reset.
+      </div>
+      <StyledButton onClick={reset} variant="danger" disabled={busy} style={{ padding:'6px 14px', fontSize:12 }}>
+        {busy ? 'Resetting…' : 'Reset flag'}
+      </StyledButton>
+    </div>
+  )
+}
+
+function DashboardPage({ connected, appRunning, autoTrade, toggleAutoTrade, balance, livePnl, todayPnl, lotSize, tradeState, signal, strategy, instrument, ltp, capitalState, dataHealth, toggleAppRunning, allSignals, lastEntries, telegramConfigured, refreshSettings, maxDailyLoss, maxDailyProfit }) {
   const m = window.innerWidth < 768
   const d = tradeState?.day_stats
   // Backend always keeps day_stats.gross_pnl in sync with today_pnl, so the
@@ -6036,9 +6069,10 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
     }
   }
 
-  // Toggle Auto-trade state
+  // Toggle Auto-trade state -- same confirmation as the Live / Auto Trade pages
+  // (this button used to switch real auto-trading on with no confirmation).
   const handleToggleAutoTrade = async () => {
-    await API.post('/api/settings', { auto_trade: !autoTrade })
+    await toggleAutoTrade()
     refreshSettings()
   }
 
@@ -6138,6 +6172,7 @@ function DashboardPage({ connected, appRunning, autoTrade, balance, livePnl, tod
 
   return (
     <div className="fade-in" style={{ display:'flex', flexDirection:'column', gap:14 }}>
+      <CapitalBreachNotice capitalState={capitalState} />
       {/* Welcome header — title only */}
       <div style={{
         background:`linear-gradient(135deg, ${V('accent')} 0%, ${V('purple')} 100%)`,
@@ -6419,6 +6454,7 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
   if (!autoTrade) {
     return (
       <div className="fade-in" style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', minHeight:'60vh', gap:20 }}>
+        <div style={{ width:'100%' }}><CapitalBreachNotice capitalState={capitalState} /></div>
         <div style={{ width:80, height:80, borderRadius:'50%', background:V('red-bg'), display:'flex', alignItems:'center', justifyContent:'center' }}>
           <Zap size={36} style={{ color:V('red') }} />
         </div>
@@ -6517,6 +6553,7 @@ function AutoTradeMonitorPage({ autoTrade, toggleAutoTrade, journal, allSignals,
 
   return (
     <div className="fade-in" style={{ display:'flex', flexDirection:'column', gap:16 }}>
+      <CapitalBreachNotice capitalState={capitalState} />
 
       {/* Top row: Confidence Score + Strategy Agreement + Capital Utilization */}
       <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : '1fr 1fr 1fr', gap:12 }}>
@@ -7350,6 +7387,7 @@ function MarketContextPage() {
             )}
             <div style={{ fontSize:9, color:V('text-muted'), marginTop:4 }}>
               {sentiment.total_headlines ? `${sentiment.total_headlines} headlines scanned, ${sentiment.scored_headlines} with keywords` : ''}
+              {sentiment.skipped_old_headlines ? ` · ${sentiment.skipped_old_headlines} older than 3 days left out` : ''}
             </div>
           </div>
 
@@ -7369,6 +7407,9 @@ function MarketContextPage() {
                   <div style={{ flex:1 }}>
                     <div style={{ fontSize:11, color:V('text-primary'), lineHeight:1.4 }}>{h.title}</div>
                     <div style={{ fontSize:9, color:V('text-muted'), marginTop:1 }}>{h.source}
+                      {h.pub_date && !isNaN(new Date(h.pub_date)) && (
+                        <span style={{ marginLeft:6 }}>· {toISTDateTime(h.pub_date)}</span>
+                      )}
                       {h.score != null && h.score !== 0 && (
                         <span style={{ marginLeft:6, fontWeight:600, color: h.score > 0 ? V('green') : V('red'), fontFamily:"'JetBrains Mono', monospace" }}>
                           {h.score > 0 ? '+' : ''}{h.score}
@@ -8849,6 +8890,9 @@ export default function App() {
         'Strategy: ' + strategy + '\n' +
         'Instrument: ' + instrument + '\n\n' +
         'Make sure your Dhan account has sufficient margin.\n' +
+        (capitalState?.drawdown_breached
+          ? '\nWARNING: the capital drawdown flag is ON -- every entry will be REFUSED until you reset it (Dashboard / Auto Trade page).\n\n'
+          : '') +
         'Click OK to enable.'
       )
       if (!confirmed) return
@@ -8942,7 +8986,7 @@ export default function App() {
         )}
 
         {/* Market closed: everything on the page is last-known data -- say from when */}
-        {tab === 'live' && market && market.open === false && (
+        {['live', 'dashboard', 'market_ctx', 'auto_monitor'].includes(tab) && market && market.open === false && (
           <div style={{
             background:V('bg-tertiary'), borderBottom:`1px solid ${V('border')}`,
             padding:'8px 24px', fontSize:12, color:V('text-secondary'), fontWeight:600
@@ -9044,7 +9088,7 @@ export default function App() {
           {/* Page bodies */}
           {tab === 'dashboard' && (
             <DashboardPage
-              connected={connected} appRunning={appRunning} autoTrade={autoTrade}
+              connected={connected} appRunning={appRunning} autoTrade={autoTrade} toggleAutoTrade={toggleAutoTrade}
               balance={balance} livePnl={livePnl} todayPnl={todayPnl} lotSize={lotSize}
               tradeState={tradeState} signal={signal} strategy={strategy}
               instrument={instrument} ltp={ltp} capitalState={capitalState} dataHealth={dataHealth}
