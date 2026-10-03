@@ -476,6 +476,7 @@ class SettingsUpdate(BaseModel):
     auto_kill_switch: Optional[bool] = None
     auto_kill_switch_max_failures: Optional[int] = None
     starting_capital: Optional[float] = None
+    position_hold_mode: Optional[str] = None   # "CARRY_FORWARD" | "INTRADAY"
     data_stale_threshold_min: Optional[int] = None
     # Regime Strategy settings
     regime_trail_mult: Optional[float] = None
@@ -731,13 +732,20 @@ async def get_activity_logs():
 
 @app.get("/api/settings")
 async def get_settings_endpoint():
+    from config import CRED_FIELDS
     cfg = get_settings()
-    return cfg.model_dump(exclude={"dhan_access_token", "dhan_client_code"})
+    # No credentials to the browser (Telegram token and the CAS Dhan token used to be
+    # included); the page only needs to know whether Telegram is set up.
+    data = cfg.model_dump(exclude=set(CRED_FIELDS))
+    data["telegram_configured"] = bool(cfg.telegram_bot_token and cfg.telegram_chat_id)
+    return data
 
 
 @app.post("/api/settings")
 async def update_settings(req: SettingsUpdate):
     data = {k: v for k, v in req.model_dump().items() if v is not None}
+    if "position_hold_mode" in data and data["position_hold_mode"] not in ("CARRY_FORWARD", "INTRADAY"):
+        raise HTTPException(status_code=400, detail="position_hold_mode must be CARRY_FORWARD or INTRADAY")
     cfg = save_settings(data)
     tm = get_trade_manager()
     tm.update_limits(cfg.max_daily_loss, cfg.max_daily_profit)
@@ -749,8 +757,7 @@ async def update_settings(req: SettingsUpdate):
     if "instrument" in data:
         log_msgs.append(f"Changed target instrument to {data['instrument']}")
     if "strategy" in data:
-        strat_lbl = "Multi-Agent" if data["strategy"] == "multi_agent" else "Regime T/R"
-        log_msgs.append(f"Changed strategy to {strat_lbl}")
+        log_msgs.append(f"Changed strategy to {data['strategy']}")
     if "auto_trade" in data:
         status_lbl = "ENABLED" if data["auto_trade"] else "DISABLED"
         log_msgs.append(f"Auto-trading {status_lbl}")
@@ -2728,6 +2735,14 @@ def _maybe_alert_token_error():
             logger.warning(f"Token-expiry Telegram alert failed: {e}")
 
 
+def _maybe_trip_kill_switch(cfg, fail_count: int):
+    """Kill switch: after N consecutive failed entry orders, turn auto-trade off.
+    Used by both entry routes (it used to be checked on the legacy route only)."""
+    if cfg.auto_kill_switch and cfg.auto_trade and fail_count >= cfg.auto_kill_switch_max_failures:
+        logger.error(f"Kill switch triggered after {fail_count} consecutive failures — disabling auto_trade")
+        save_settings({"auto_trade": False})
+
+
 def _log_order_latency(cfg, strategy: str, direction: str, result: dict):
     """One latency-log line per entry order result (seconds after the 5m candle close)."""
     try:
@@ -2833,9 +2848,6 @@ async def _signal_polling_loop():
             await asyncio.to_thread(_sync_dhan_positions, cfg, tm, latest_ts)
             _t_sync = datetime.now(_IST)
 
-            # ── Data staleness check ─────────────────────────────────────
-            _check_data_staleness(frames, cfg)
-
             # ── Has the market actually traded today? ────────────────────
             # The weekday/hours check above has no holiday calendar, so on
             # 2026-10-02 (exchange holiday) the loop ran on flat candles built
@@ -2849,6 +2861,11 @@ async def _signal_polling_loop():
                     logger.info(f"No trading seen today for {cfg.instrument} yet (holiday or pre-open) "
                                 f"-- signals, entries and alerts paused")
                 continue
+
+            # ── Data staleness check ─────────────────────────────────────
+            # After the traded-today gate: on a holiday / before the first trade there's
+            # nothing to be stale about (it used to alert "DATA STALE" every such day).
+            _check_data_staleness(frames, cfg)
 
             if frames:
                 global _last_signal, _last_telegram_signal_key, _pending_telegram_signal
@@ -3130,8 +3147,9 @@ async def _signal_polling_loop():
                                             await ws_manager.broadcast({"type": "trade_opened", "data": result})
                                             logger.info(f"Instant trade executed: {_live_sig.signal} {cfg.instrument}")
                                         else:
-                                            tm.record_order_failure()
+                                            fail_count = tm.record_order_failure()
                                             logger.error(f"Trade execution failed: {result.get('error')}")
+                                            _maybe_trip_kill_switch(cfg, fail_count)
                                     else:
                                         logger.info(f"Instant trade blocked: {reason}")
 
@@ -3585,10 +3603,7 @@ async def _signal_polling_loop():
                                 else:
                                     fail_count = tm.record_order_failure()
                                     logger.error(f"Trade execution failed: {result.get('error')}")
-                                    # Kill switch check
-                                    if cfg.auto_kill_switch and fail_count >= cfg.auto_kill_switch_max_failures:
-                                        logger.error(f"Kill switch triggered after {fail_count} consecutive failures — disabling auto_trade")
-                                        save_settings({"auto_trade": False})
+                                    _maybe_trip_kill_switch(cfg, fail_count)
                             else:
                                 logger.info(f"Trade blocked: {reason}")
                         else:
@@ -5326,7 +5341,15 @@ def _check_data_staleness(frames: dict, cfg) -> None:
             last_candle_ist = pytz.timezone("Asia/Kolkata").localize(
                 pd.Timestamp(last_ts).to_pydatetime()
             )
-        staleness_sec = (now_ist - last_candle_ist).total_seconds()
+        # Measure from today's session open if the last candle is from before it -- at
+        # 09:16 the newest candle is still yesterday's, which is not "stale data".
+        _open_h, _open_m = (9, 0) if INSTRUMENT_META.get(cfg.instrument, {}).get("exchange_index") == "MCX" else (9, 15)
+        _session_open = now_ist.replace(hour=_open_h, minute=_open_m, second=0, microsecond=0)
+        # A 5m candle's timestamp is its START; its data runs to start + 5 min. Measuring
+        # from the start made a normal, up-to-date candle look 5-10 min old.
+        _candle_end = last_candle_ist + timedelta(minutes=5)
+        _ref = max(_candle_end, _session_open) if now_ist >= _session_open else _candle_end
+        staleness_sec = (now_ist - _ref).total_seconds()
         threshold_sec = cfg.data_stale_threshold_min * 60
 
         _data_health_state["last_candle_time"] = last_candle_ist.isoformat()

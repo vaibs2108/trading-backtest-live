@@ -960,14 +960,21 @@ function DayStats({ state, balance, livePnl, todayPnl, lotSize }) {
 // ── Settings Modal ──────────────────────────────────────────────────────────
 function SettingsPanel({ onSaved }) {
   const [cfg, setCfg] = useState({})
+  const [orig, setOrig] = useState({})   // values as loaded -- Save sends only what you changed
   const [saved, setSaved] = useState(false)
 
-  useEffect(() => { API.get('/api/settings').then(setCfg) }, [])
+  const load = () => API.get('/api/settings').then(c => { setCfg(c); setOrig(c) })
+  useEffect(() => { load() }, [])
 
   const set = (k,v) => setCfg(p => ({...p, [k]:v}))
 
+  // Save used to re-send EVERY setting as it was when the page opened -- including
+  // auto_trade / instrument / strategy -- silently undoing changes made elsewhere
+  // meanwhile (e.g. auto-trade switched off by the kill switch or on the Live page).
   const save = async () => {
-    await API.post('/api/settings', cfg)
+    const changed = Object.fromEntries(Object.entries(cfg).filter(([k, v]) => v !== orig[k]))
+    if (Object.keys(changed).length) await API.post('/api/settings', changed)
+    await load()
     setSaved(true); setTimeout(() => { setSaved(false); onSaved(); }, 1200)
   }
 
@@ -978,9 +985,11 @@ function SettingsPanel({ onSaved }) {
     </div>
   )
   const Sel = ({ val, opts, onChange }) => (
-    <select value={val||''} onChange={e=>onChange(e.target.value)} style={{
+    // `o.v ?? o`, not `o.v || o`: an option whose value is 0 ("Current Expiry") used to
+    // become "[object Object]", so it could never be selected again.
+    <select value={val ?? ''} onChange={e=>onChange(e.target.value)} style={{
       background:V('bg-input'), color:V('text-primary'), border:`1px solid ${V('border')}`, borderRadius:V('radius-sm'), padding:'5px 10px', fontSize:12, outline:'none'
-    }}>{opts.map(o=><option key={o.v||o} value={o.v||o}>{o.l||o}</option>)}</select>
+    }}>{opts.map(o=><option key={o.v ?? o} value={o.v ?? o}>{o.l ?? o}</option>)}</select>
   )
   const Num = ({ val, onChange, min, max, step=1 }) => (
     <input type="number" value={val||0} min={min} max={max} step={step} onChange={e=>onChange(Number(e.target.value))} style={{
@@ -1008,7 +1017,10 @@ function SettingsPanel({ onSaved }) {
               <Sel val={cfg.strategy} opts={LIVE_STRATEGY_OPTIONS} onChange={v=>set('strategy',v)} />
             </Row>
             <Row label="Instrument">
-              <Sel val={cfg.instrument} opts={['NIFTY','BANKNIFTY','FINNIFTY','MIDCPNIFTY','CRUDEOIL']} onChange={v=>set('instrument',v)} />
+              <Sel val={cfg.instrument} opts={['NIFTY','BANKNIFTY','SENSEX','CRUDEOIL']} onChange={v=>set('instrument',v)} />
+            </Row>
+            <Row label="Position Hold Mode">
+              <Sel val={cfg.position_hold_mode} opts={[{v:'CARRY_FORWARD',l:'Carry Forward (hold overnight)'},{v:'INTRADAY',l:'Intraday (exit by close)'}]} onChange={v=>set('position_hold_mode',v)} />
             </Row>
             <Row label="Trade Mode">
               <Sel val={cfg.trade_mode} opts={['INDEX','OPTIONS']} onChange={v=>set('trade_mode',v)} />
@@ -1059,15 +1071,12 @@ function SettingsPanel({ onSaved }) {
           {/* Telegram Alerts */}
           <Card>
             <SectionTitle label="Telegram Alerts" icon={<Send size={16} style={{color:V('cyan')}} />} />
-            <Row label="Bot Token">
-              <input value={cfg.telegram_bot_token||''} onChange={e=>set('telegram_bot_token',e.target.value)} placeholder="Bot Token" style={{
-                background:V('bg-input'), color:V('text-primary'), border:`1px solid ${V('border')}`, borderRadius:V('radius-sm'), padding:'5px 10px', fontSize:12, width:240, outline:'none'
-              }} />
-            </Row>
-            <Row label="Chat ID">
-              <input value={cfg.telegram_chat_id||''} onChange={e=>set('telegram_chat_id',e.target.value)} placeholder="Chat ID" style={{
-                background:V('bg-input'), color:V('text-primary'), border:`1px solid ${V('border')}`, borderRadius:V('radius-sm'), padding:'5px 10px', fontSize:12, width:240, outline:'none'
-              }} />
+            {/* Bot token / chat ID are read only from .env (never saved from here) --
+                editable boxes here used to look like they saved but were discarded. */}
+            <Row label="Bot Token & Chat ID">
+              <span style={{ fontSize:12, fontWeight:600, color: cfg.telegram_configured ? V('green') : V('yellow') }}>
+                {cfg.telegram_configured ? '✓ Configured in .env' : 'Not set — add them to .env and restart'}
+              </span>
             </Row>
           </Card>
         </div>
@@ -1076,8 +1085,11 @@ function SettingsPanel({ onSaved }) {
         <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
           {/* Strategy Specific Settings */}
           <Card>
-            <SectionTitle label="Strategy Parameters" icon={<Target size={16} style={{color:V('yellow')}} />} />
-            <div style={{ fontSize:11, color:V('text-muted'), fontWeight:600, margin:'8px 0 4px', textTransform:'uppercase' }}>Strategy Configuration</div>
+            <SectionTitle label="Positions Imported from Dhan" icon={<Target size={16} style={{color:V('yellow')}} />} />
+            <div style={{ fontSize:11, color:V('text-muted'), margin:'8px 0 4px', lineHeight:1.5 }}>
+              SL / T1 / T2 levels set on positions the app picks up from your Dhan account (e.g. manual trades).
+              The live strategies use their own levels, not these.
+            </div>
             <Row label="SL Multiplier (ATR×)">
               <Num val={cfg.atr_sl_mult} onChange={v=>set('atr_sl_mult',v)} min={0.5} max={3} step={0.1} />
             </Row>
@@ -1088,19 +1100,6 @@ function SettingsPanel({ onSaved }) {
               <Num val={cfg.atr_t2_mult} onChange={v=>set('atr_t2_mult',v)} min={2} max={8} step={0.1} />
             </Row>
 
-            <div style={{ fontSize:11, color:V('text-muted'), fontWeight:600, margin:'16px 0 4px', textTransform:'uppercase' }}>Regime Strategy</div>
-            <Row label="Trail Multiplier (ATR×)">
-              <Num val={cfg.regime_trail_mult} onChange={v=>set('regime_trail_mult',v)} min={0.5} max={4.0} step={0.1} />
-            </Row>
-            <Row label="Trail Activation (ATR×)">
-              <Num val={cfg.regime_trail_activation} onChange={v=>set('regime_trail_activation',v)} min={0.0} max={2.0} step={0.1} />
-            </Row>
-            <Row label="BE Trigger (ATR×)">
-              <Num val={cfg.regime_be_trigger} onChange={v=>set('regime_be_trigger',v)} min={0.0} max={2.0} step={0.1} />
-            </Row>
-            <Row label="BE Buffer (ATR×)">
-              <Num val={cfg.regime_be_buffer} onChange={v=>set('regime_be_buffer',v)} min={0.0} max={2.0} step={0.1} />
-            </Row>
           </Card>
 
           {/* Capital Protection & System Tuning */}
@@ -1109,6 +1108,9 @@ function SettingsPanel({ onSaved }) {
             <Row label="Starting Capital (₹)">
               <Num val={cfg.starting_capital} onChange={v=>set('starting_capital',v)} min={10000} max={10000000} step={10000} />
             </Row>
+            <div style={{ fontSize:10, color:V('text-muted'), margin:'-4px 0 6px' }}>
+              Changing this restarts the drawdown tracker (equity and peak reset to the new value, block flag cleared).
+            </div>
             <Row label="Data Stale Threshold (min)">
               <Num val={cfg.data_stale_threshold_min} onChange={v=>set('data_stale_threshold_min',v)} min={5} max={30} />
             </Row>
@@ -8624,7 +8626,7 @@ export default function App() {
       setInstrument(cfg.instrument)
       setChartTf(cfg.chart_timeframe)
       if (cfg.strategy) setStrategy(cfg.strategy)
-      setTelegramConfigured(!!(cfg.telegram_bot_token && cfg.telegram_chat_id))
+      setTelegramConfigured(!!cfg.telegram_configured)
     }
   }, [])
 
