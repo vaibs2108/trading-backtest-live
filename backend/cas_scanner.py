@@ -1206,7 +1206,8 @@ def _fire_index_alerts(candidates: list, cfg):
             continue
         _last_alerted[key] = now
         fired_any = True
-        _index_alerts_since_digest += 1
+        if cfg.cas_mode_c_telegram:
+            _index_alerts_since_digest += 1
         _trace(tid, "C_DETECTED", f"{c['symbol']} trigger={c.get('trigger')} confidence={c.get('confidence')}")
         # "mode" lives on the stored alert dict itself, not just the WS
         # broadcast wrapper -- otherwise a REST fallback poll (or a client
@@ -1216,8 +1217,11 @@ def _fire_index_alerts(candidates: list, cfg):
         with _state_lock:
             _alerts_b.append(alert)
         _broadcast({"type": "cas_alert", "data": alert})
-        _trace(tid, "C_TELEGRAM", "sending")
-        _send_telegram(_index_alert_message(c))
+        if cfg.cas_mode_c_telegram:
+            _trace(tid, "C_TELEGRAM", "sending")
+            _send_telegram(_index_alert_message(c))
+        else:
+            _trace(tid, "C_PAGE_ONLY", "Telegram off (cas_mode_c_telegram)")
     if fired_any:
         _save_day_state()
 

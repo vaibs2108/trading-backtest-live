@@ -1996,7 +1996,7 @@ function CasAlertsTab({ alertsA, alertsB, alertsC, atRisk, undercurrent }) {
       {/* ── Mode C: Index Burst ── */}
       <Card>
         <div style={{ fontSize:16, fontWeight:700, color:V('text-primary'), marginBottom:2 }}>Index Burst</div>
-        <div style={{ fontSize:12, color:V('text-muted'), marginBottom:14 }}>NIFTY/BANKNIFTY/SENSEX only · same Vol/OI accumulation signal as Undercurrent, but a much shorter confirm window (minutes, not 30) · fires immediately, not digest-batched</div>
+        <div style={{ fontSize:12, color:V('text-muted'), marginBottom:14 }}>NIFTY/BANKNIFTY/SENSEX only · same Vol/OI accumulation signal as Undercurrent, but a much shorter confirm window (minutes, not 30) · shown here only — Telegram off since 3 Oct (a replay showed buying its alerts lost money)</div>
 
         <div style={{ display:'grid', gridTemplateColumns: m ? '1fr' : 'repeat(1,1fr)', gap:10, marginBottom:16 }}>
           <MetricBox label="Fired Alerts Today" value={alertsC.length} color={alertsC.length ? '#f59e0b' : V('text-primary')} />
