@@ -5987,7 +5987,10 @@ function PerformancePanel({ theme }) {
       {ec.length > 0 && (
         <Card>
           <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>
-            <div style={{ color:V('text-primary'), fontWeight:700, fontSize:15 }}>Equity Curve</div>
+            <div>
+              <div style={{ color:V('text-primary'), fontWeight:700, fontSize:15 }}>Cumulative P&L</div>
+              <div style={{ color:V('text-muted'), fontSize:11 }}>Gross, trade by trade, in order of exit — not account equity</div>
+            </div>
             <StyledButton onClick={fetchPerf} variant="primary" style={{ padding:'4px 12px', fontSize:11 }}>
               <RefreshCw size={11}/> Refresh
             </StyledButton>
@@ -6020,11 +6023,13 @@ function PerformancePanel({ theme }) {
                     <ReTooltip
                       contentStyle={{ background:colors.bg, border:`1px solid ${colors.border}`, borderRadius:8, fontSize:11 }}
                       labelStyle={{ color:colors.textPrimary }}
-                      formatter={(v, name) => [name === 'equity' ? `₹${fmt(v)}` : `₹${fmt(v)}`, name === 'equity' ? 'Equity' : 'Cumul. PnL']}
-                      labelFormatter={l => `Trade #${l}`}
+                      formatter={(v) => [fmtPnl(v), 'Cumulative P&L']}
+                      labelFormatter={(l, payload) => {
+                        const p = payload && payload[0] && payload[0].payload
+                        return p ? `Trade #${l} · exit ${p.date} ${p.time || ''} · ${fmtPnl(p.pnl)} · ${p.symbol || ''}` : `Trade #${l}`
+                      }}
                     />
-                    <Area type="monotone" dataKey="equity" stroke="#4f6ef7" fill="url(#eqGrad)" strokeWidth={2} dot={false} />
-                    <Line type="monotone" dataKey="cumulative_pnl" stroke="#10b981" strokeWidth={1.5} dot={false} strokeDasharray="4 2" />
+                    <Area type="monotone" dataKey="cumulative_pnl" stroke="#4f6ef7" fill="url(#eqGrad)" strokeWidth={2} dot={true} />
                   </AreaChart>
                 </ResponsiveContainer>
               )
