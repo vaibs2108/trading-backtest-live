@@ -697,6 +697,15 @@ def get_historical_data(
     Falls back gracefully to local parquet cache if broker API is unavailable or returns 451.
     """
     global _hist_cache, _hist_cache_time
+    # "5m" / "15m" / "1h" -> Dhan's "5" / "15" / "60". Something passed "5m" on 2026-09-28
+    # (2 failed calls, caller unknown): accept it, and log the caller so it can be found.
+    _tf = str(timeframe).strip()
+    _norm = _tf[:-1] if (_tf[-1:] in ("m", "M") and _tf[:-1].isdigit()) else ("60" if _tf.lower() == "1h" else None)
+    if _norm:
+        import traceback
+        _caller = " <- ".join(f"{f.name}:{f.lineno}" for f in reversed(traceback.extract_stack(limit=5)[:-1]))
+        logger.warning(f"get_historical_data: timeframe '{timeframe}' -> '{_norm}' (caller: {_caller})")
+        timeframe = _norm
     cache_key = (instrument, timeframe, from_date, to_date, use_index)
     import pytz
     now = datetime.now(pytz.timezone("Asia/Kolkata"))

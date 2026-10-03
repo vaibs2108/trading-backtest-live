@@ -4035,15 +4035,13 @@ function CapitalProtectionCard() {
       <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, fontSize:12 }}>
         <div><span style={{color:V('text-muted')}}>Equity:</span> <span style={{color:V('text-primary'), fontWeight:600}}>Rs.{fmt(cap.current_equity)}</span></div>
         <div><span style={{color:V('text-muted')}}>Peak:</span> <span style={{color:V('text-primary'), fontWeight:600}}>Rs.{fmt(cap.peak_equity)}</span></div>
-        {cap.is_profit ? (
-          <div><span style={{color:V('text-muted')}}>Profit Today:</span> <span style={{color:V('green'), fontWeight:600}}>+Rs.{fmt(cap.today_pnl)}</span></div>
-        ) : (
-          <div><span style={{color:V('text-muted')}}>Drawdown:</span> <span style={{color:V('red'), fontWeight:600}}>Rs.{fmt(cap.current_drawdown)} ({cap.current_drawdown_pct?.toFixed(1)}%)</span></div>
-        )}
-        <div><span style={{color:V('text-muted')}}>Limit (10%):</span> <span style={{color:V('text-primary'), fontWeight:600}}>Rs.{fmt(cap.drawdown_limit)}</span></div>
+        <div><span style={{color:V('text-muted')}}>Drawdown from peak:</span> <span style={{color: cap.current_drawdown > 0 ? V('red') : V('green'), fontWeight:600}}>Rs.{fmt(cap.current_drawdown)} ({cap.current_drawdown_pct?.toFixed(1)}%)</span></div>
+        <div><span style={{color:V('text-muted')}}>Limit ({cap.max_drawdown_pct}%):</span> <span style={{color:V('text-primary'), fontWeight:600}}>Rs.{fmt(cap.drawdown_limit)}</span></div>
+        <div><span style={{color:V('text-muted')}}>Today:</span> <span style={{color:clr(cap.today_pnl), fontWeight:600}}>{fmtPnl(cap.today_pnl)}</span></div>
+        <div><span style={{color:V('text-muted')}}>Auto-trade entries:</span> <span style={{color: cap.drawdown_breached ? V('red') : V('green'), fontWeight:600}}>{cap.drawdown_breached ? 'BLOCKED (limit hit)' : 'allowed'}</span></div>
       </div>
       <div style={{ marginTop:8, height:5, background:V('bg-tertiary'), borderRadius:3, overflow:'hidden' }}>
-        <div style={{ height:'100%', width:`${cap.is_profit ? 0 : Math.min(100, (cap.current_drawdown / cap.drawdown_limit) * 100)}%`, background: cap.current_drawdown_pct > 7 ? '#ef4444' : cap.current_drawdown_pct > 4 ? '#f59e0b' : '#10b981', borderRadius:3, transition:'width 0.3s' }}/>
+        <div style={{ height:'100%', width:`${cap.drawdown_limit > 0 ? Math.min(100, (cap.current_drawdown / cap.drawdown_limit) * 100) : 0}%`, background: cap.current_drawdown_pct > cap.max_drawdown_pct * 0.7 ? '#ef4444' : cap.current_drawdown_pct > cap.max_drawdown_pct * 0.4 ? '#f59e0b' : '#10b981', borderRadius:3, transition:'width 0.3s' }}/>
       </div>
     </Card>
   )
@@ -8645,6 +8643,10 @@ export default function App() {
   const [chartTf,     setChartTf]     = useState('5')
   const [sigHistory,  setSigHistory]  = useState([])
   const [chartSignals, setChartSignals] = useState([])
+  // Live signals received today (signal_event). The chart's own reload (/api/chart_signals)
+  // recomputes on a different data window than the live processor and could drop a signal
+  // that was really sent (marker appeared, then vanished) -- these are merged back in.
+  const liveChartSignalsRef = useRef({ key: '', day: '', list: [] })
   const [chartSignalsLoading, setChartSignalsLoading] = useState(false)
   const [allSignals,  setAllSignals]  = useState({})
   const [lastEntries, setLastEntries] = useState({})
@@ -8747,7 +8749,13 @@ export default function App() {
             if (msg.type === 'trade_opened') { setRefreshChart(r=>r+1) }
             if (msg.type === 'trade_closed') { setRefreshChart(r=>r+1) }
             if (msg.type === 'signal_event') {
-              if (!msg.data?.strategy || msg.data.strategy === strategyRef.current) {
+              if ((!msg.data?.strategy || msg.data.strategy === strategyRef.current) &&
+                  (!msg.data?.instrument || msg.data.instrument === instrumentRef.current)) {
+                const store = liveChartSignalsRef.current
+                const key = `${strategyRef.current}|${instrumentRef.current}`
+                const day = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
+                if (store.key !== key || store.day !== day) { store.key = key; store.day = day; store.list = [] }
+                store.list.push(msg.data)
                 setChartSignals(prev => [...(prev || []), msg.data])
                 setRefreshChart(r => r + 1)
               }
@@ -8883,7 +8891,17 @@ export default function App() {
     try {
       const r = await API.get(`/api/chart_signals?strategy=${strategy}&instrument=${instrument}&days=10`)
       if (r && r.signals) {
-        setChartSignals(r.signals)
+        // Keep today's live signals the reload doesn't contain (same 5-min bar + signal type)
+        const store = liveChartSignalsRef.current
+        const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
+        const bar = s => String(s?.time || '').replace('T', ' ').slice(0, 16)
+        let merged = r.signals
+        if (store.key === `${strategy}|${instrument}` && store.day === today && store.list.length) {
+          const have = new Set(r.signals.map(s => `${bar(s)}|${s.signal}`))
+          const missing = store.list.filter(s => !have.has(`${bar(s)}|${s.signal}`))
+          if (missing.length) merged = [...r.signals, ...missing].sort((a, b) => bar(a).localeCompare(bar(b)))
+        }
+        setChartSignals(merged)
         setRefreshChart(c => c + 1)
       }
     } catch(e) { console.error('fetchChartSignals error:', e) }
@@ -9239,6 +9257,7 @@ export default function App() {
                 if (!window.confirm('Clear all chart signal markers and signal history?')) return
                 await fetch('/api/signal_history', { method:'DELETE' })
                 setSigHistory([])
+                liveChartSignalsRef.current = { key: '', day: '', list: [] }
                 setChartSignals([])
                 setRefreshChart(r => r + 1)
               }} variant="danger">
@@ -9378,6 +9397,13 @@ export default function App() {
                     </span>
                   </div>
                   <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+                    {optCtx?.as_of && (
+                      <span style={{ color: optCtx.stale ? V('yellow') : V('text-muted'), fontSize:10, fontWeight: optCtx.stale ? 600 : 400 }}
+                            title={optCtx.stale ? `Latest refresh failed: ${optCtx.refresh_error || ''}` : undefined}>
+                        {optCtx.stale ? '⚠ Latest refresh failed — showing data from ' : 'Updated '}
+                        {new Date(optCtx.as_of).toLocaleString('en-IN', { timeZone:'Asia/Kolkata', day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false })}
+                      </span>
+                    )}
                     {optCtx?.data_quality === 'poor' && (
                       <span style={{ color:V('yellow'), fontSize:10, fontWeight:500 }}>⚠ Limited data quality</span>
                     )}

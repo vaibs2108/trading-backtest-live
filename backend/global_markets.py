@@ -29,6 +29,13 @@ def _set_cached(key: str, data):
     with _cache_lock:
         _cache[key] = {"data": data, "ts": time.time()}
 
+
+def _cache_age(key: str) -> float:
+    """Seconds since the key was cached (inf if absent)."""
+    with _cache_lock:
+        entry = _cache.get(key)
+    return (time.time() - entry["ts"]) if entry else float("inf")
+
 def clear_all_cache():
     """Clear all cached data — called by refresh endpoint."""
     with _cache_lock:
@@ -1332,7 +1339,7 @@ def fetch_oi_analysis(instrument: str = "BANKNIFTY", expiry: str = None) -> dict
     """
     cache_key = f"oi_analysis_{instrument}_{expiry or 'nearest'}"
     cached = _get_cached(cache_key, 180)
-    if cached:
+    if cached and (cached.get("status") == "ok" or _cache_age(cache_key) < 20):
         return cached
 
     result = {
@@ -1807,7 +1814,30 @@ def fetch_oi_analysis(instrument: str = "BANKNIFTY", expiry: str = None) -> dict
 
 # ── Options Context for Live Trading ─────────────────────────────────────────
 
+_last_good_options_context = {}   # (instrument, expiry, direction) -> last successful result
+
+
 def fetch_options_context(instrument: str = "BANKNIFTY", expiry: str = None, direction: str = None) -> dict:
+    """Options Awareness for Live Trading. When a refresh fails (Dhan refused the option chain,
+    network), the last successful result is returned marked stale -- with its time and the
+    failure reason -- instead of an error that blanked every panel."""
+    key = (instrument, expiry or "nearest", (direction or "").upper())
+    res = _fetch_options_context_live(instrument, expiry, direction)
+    if res.get("status") == "ok":
+        res["as_of"] = res.get("data_time") or res.get("timestamp")
+        res["stale"] = False
+        _last_good_options_context[key] = res
+        return res
+    prev = _last_good_options_context.get(key)
+    if prev:
+        out = dict(prev)
+        out["stale"] = True
+        out["refresh_error"] = res.get("error") or "refresh failed"
+        return out
+    return res
+
+
+def _fetch_options_context_live(instrument: str = "BANKNIFTY", expiry: str = None, direction: str = None) -> dict:
     """
     Options awareness data for Live Trading screen.
     Reuses cached OI analysis and enriches with:
@@ -1831,6 +1861,7 @@ def fetch_options_context(instrument: str = "BANKNIFTY", expiry: str = None, dir
     if oi.get("status") != "ok":
         result["error"] = oi.get("error", "OI analysis unavailable")
         return result
+    result["data_time"] = oi.get("timestamp")   # when the option chain behind this was fetched (UTC)
 
     spot = oi.get("spot_price", 0)
     atm_strike = oi.get("atm_strike", 0)

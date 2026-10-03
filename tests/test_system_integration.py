@@ -1,12 +1,15 @@
 """
-tests/test_system_integration.py — End-to-End System Deep Verification Suite.
+tests/test_system_integration.py -- system checks for the strategies the app trades today.
 
-Tests:
-  1. Multi-Regime Parity Verification (Trending Up, Trending Down, Sideways/Chop)
-  2. Strategy Kernel Registry Integrity & Dynamic Loading
-  3. API Endpoint Response Validation (/api/strategies, /api/chart_signals)
-  4. WebSocket Payload Serialization & Schema Integrity (SignalEvent -> dict -> JSON)
-  5. Backtest Execution Across All 4 Registered Strategies
+Run:  .venv\Scripts\python.exe tests\test_system_integration.py      (no pytest needed)
+
+  1. Every locked live strategy (config.LIVE_STRATEGY_IDS) is registered and loads.
+  2. Each live strategy backtests cleanly on synthetic up / down / sideways data and returns well-formed trades.
+  3. The lot size reaches backtest P&L (NIFTY 65 vs BANKNIFTY 30 must scale P&L by 65/30).
+  4. SignalEvent serializes to the chart-marker / WebSocket dicts.
+
+Rewritten 2026-10-03: the old version expected 4 kernels with only regime_trend_range live, and compared
+against strategies/regime_strategy.py (superseded; stop-loss fills now use the real price on gaps).
 """
 import sys
 from pathlib import Path
@@ -15,16 +18,16 @@ import logging
 import numpy as np
 import pandas as pd
 
-# Add backend directory to sys.path
 backend_dir = Path(__file__).parent.parent / "backend"
 sys.path.insert(0, str(backend_dir))
 
-from strategy_kernel import get_kernel, get_all_kernels, get_kernel_list, SignalEvent
-from strategies.regime_strategy import run_backtest as old_regime_bt
-import strategy_router
+from config import LIVE_STRATEGY_IDS
+from strategy_kernel import get_kernel, SignalEvent
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("DeepTest")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("SystemTest")
+logger.setLevel(logging.INFO)
+REQUIRED_TRADE_KEYS = {"direction", "entry_time", "entry_price", "exit_time", "exit_price", "exit_reason", "pnl"}
 
 
 def generate_regime_frames(regime_type: str = "TRENDING_UP", num_days: int = 15) -> dict:
@@ -71,48 +74,45 @@ def generate_regime_frames(regime_type: str = "TRENDING_UP", num_days: int = 15)
     return {"5": df_5m, "15": df_15m, "60": df_60m, "1D": df_1d}
 
 
-def test_1_kernel_registry():
-    logger.info("--- Test 1: Kernel Registry & Dropdown Integrity ---")
-    kernels = get_all_kernels()
-    kernel_list = get_kernel_list()
-    
-    assert len(kernels) == 4, f"Expected 4 kernels, got {len(kernels)}"
-    expected_ids = {"regime_trend_range", "trend_reversal", "multi_agent"}
-    assert set(kernels.keys()) == expected_ids, f"Mismatch in kernel IDs: {set(kernels.keys())}"
-
-    # Check live capability flag
-    live_ids = {k.strategy_id for k in kernels.values() if k.live_capable}
-    assert live_ids == {"regime_trend_range"}, f"Unexpected live kernels: {live_ids}"
-
-    logger.info(f"✅ Test 1 Passed: 4 strategy kernels registered cleanly (Live: {live_ids})")
+def test_1_live_strategies_registered():
+    logger.info("--- Test 1: live strategies registered ---")
+    missing = [s for s in LIVE_STRATEGY_IDS if get_kernel(s) is None]
+    assert not missing, f"Live strategies not registered: {missing}"
+    logger.info(f"  OK: all {len(LIVE_STRATEGY_IDS)} live strategies load")
     return True
 
 
-def test_2_multi_regime_parity():
-    logger.info("--- Test 2: Multi-Regime 100% Parity Check ---")
-    regimes = ["TRENDING_UP", "TRENDING_DOWN", "SIDEWAYS"]
-
-    for r in regimes:
-        logger.info(f"Testing parity on regime: {r}...")
-        frames = generate_regime_frames(r, num_days=20)
-
-        # 1. Regime Trend Range Parity
-        res_old_trend = old_regime_bt(frames)
-        res_new_trend = get_kernel("regime_trend_range").run_backtest(frames)
-        
-        t_old = res_old_trend.get("trades", [])
-        t_new = res_new_trend.get("trades", [])
-        assert len(t_old) == len(t_new), f"Regime {r} Trend trade count mismatch: {len(t_old)} vs {len(t_new)}"
-        assert res_old_trend["stats"]["total_pnl"] == res_new_trend["stats"]["total_pnl"], f"Regime {r} Trend PnL mismatch"
-
-        logger.info(f"  ✓ {r}: Trend ({len(t_old)} trades, ₹{res_old_trend['stats']['total_pnl']:.2f}) 100% matched.")
-
-    logger.info("✅ Test 2 Passed: 100% Backtest Parity verified across all market regimes.")
+def test_2_live_backtests_all_regimes():
+    logger.info("--- Test 2: live strategy backtests on up / down / sideways data ---")
+    for regime in ("TRENDING_UP", "TRENDING_DOWN", "SIDEWAYS"):
+        frames = generate_regime_frames(regime, num_days=15)
+        for sid in LIVE_STRATEGY_IDS:
+            res = get_kernel(sid).run_backtest(frames, lot_size=30)
+            assert isinstance(res, dict) and "trades" in res, f"{sid} {regime}: no trades list ({str(res)[:120]})"
+            for tr in res["trades"]:
+                missing = REQUIRED_TRADE_KEYS - set(tr)
+                assert not missing, f"{sid} {regime}: trade missing {missing}"
+                assert tr["direction"] in ("LONG", "SHORT"), f"{sid}: bad direction {tr['direction']}"
+                assert str(tr["exit_time"]) >= str(tr["entry_time"]), f"{sid}: exit before entry {tr}"
+            logger.info(f"  OK: {sid:36s} {regime:14s} {len(res['trades']):3d} trades")
     return True
 
 
-def test_3_signal_event_serialization():
-    logger.info("--- Test 3: SignalEvent Serialization & Schema Integrity ---")
+def test_3_lot_size_scales_pnl():
+    logger.info("--- Test 3: lot size reaches backtest P&L ---")
+    frames = generate_regime_frames("TRENDING_UP", num_days=15)
+    for sid in LIVE_STRATEGY_IDS:
+        k = get_kernel(sid)
+        p30 = sum(t["pnl"] for t in k.run_backtest(frames, lot_size=30)["trades"])
+        p65 = sum(t["pnl"] for t in k.run_backtest(frames, lot_size=65)["trades"])
+        if p30:
+            assert abs(p65 / p30 - 65 / 30) < 0.01, f"{sid}: P&L ratio {p65 / p30:.3f}, expected {65 / 30:.3f}"
+        logger.info(f"  OK: {sid:36s} P&L x{(p65 / p30 if p30 else 0):.3f} for lot 65 vs 30")
+    return True
+
+
+def test_4_signal_event_serialization():
+    logger.info("--- Test 4: SignalEvent Serialization & Schema Integrity ---")
     sig = SignalEvent(
         signal="LONG",
         direction="LONG",
@@ -140,37 +140,22 @@ def test_3_signal_event_serialization():
     assert chart_marker["sl"] == 52350.00
     assert ui_dict["close"] == 52500.50
 
-    logger.info("✅ Test 3 Passed: SignalEvent serializes cleanly to valid JSON schema.")
-    return True
-
-
-def test_4_all_strategy_backtests():
-    logger.info("--- Test 4: Backtest Execution Across All 4 Kernels ---")
-    frames = generate_regime_frames("TRENDING_UP", num_days=10)
-
-    for strat_id in ["regime_trend_range", "trend_reversal", "multi_agent"]:
-        kernel = get_kernel(strat_id)
-        assert kernel is not None, f"Kernel not found: {strat_id}"
-        
-        res = kernel.run_backtest(frames)
-        assert "trades" in res or "error" in res, f"Invalid backtest output for {strat_id}"
-        num_trades = len(res.get("trades", []))
-        logger.info(f"  ✓ {strat_id:20s}: Backtest executed successfully ({num_trades} trades)")
-
-    logger.info("✅ Test 4 Passed: All 4 strategy kernels execute backtests without errors.")
+    logger.info("✅ Test 4 Passed: SignalEvent serializes cleanly to valid JSON schema.")
     return True
 
 
 if __name__ == "__main__":
-    logger.info("🚀 STARTING FULL SYSTEM INTEGRATION & DEEP TESTING...")
-    t1 = test_1_kernel_registry()
-    t2 = test_2_multi_regime_parity()
-    t3 = test_3_signal_event_serialization()
-    t4 = test_4_all_strategy_backtests()
-
-    if t1 and t2 and t3 and t4:
-        logger.info("🎉 DEEP SYSTEM TESTING PASSED 100%! ALL ARCHITECTURAL REQUIREMENTS VERIFIED!")
-        sys.exit(0)
-    else:
-        logger.error("❌ DEEP SYSTEM TESTING FAILED!")
+    tests = [test_1_live_strategies_registered, test_2_live_backtests_all_regimes,
+             test_3_lot_size_scales_pnl, test_4_signal_event_serialization]
+    failed = []
+    for fn in tests:
+        try:
+            fn()
+        except AssertionError as e:
+            failed.append(f"{fn.__name__}: {e}")
+            logger.error(f"FAILED {fn.__name__}: {e}")
+    if failed:
+        logger.error(f"{len(failed)} of {len(tests)} tests FAILED")
         sys.exit(1)
+    logger.info(f"ALL {len(tests)} TESTS PASSED")
+    sys.exit(0)

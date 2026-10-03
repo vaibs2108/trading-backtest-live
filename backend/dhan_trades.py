@@ -141,36 +141,51 @@ def reconstruct(executions: list, today: str = None) -> list:
     return out
 
 
-# Executions cache shared by both pages. Reading ~4 months of history is ~15 pages (~7 s),
-# so it's fetched at most every CACHE_SECONDS, one fetch at a time (the Broker Journal
-# polls every 5 s; without the lock, polls arriving during a fetch would each start one).
+# Executions cache shared by both pages. Reading ~4 months of history is ~15 pages (~7-10 s),
+# and executions older than a few days never change -- so the OLD part is read once a day
+# (or when an earlier start is needed), and only the last RECENT_DAYS are re-read every
+# CACHE_SECONDS. One fetch at a time (the Broker Journal polls every 5 s).
 CACHE_SECONDS = 120
-_cache = {"from": None, "at": 0.0, "execs": []}
+RECENT_DAYS = 3
+_old = {"from": None, "day": None, "execs": {}}      # executions before the recent window
+_recent = {"at": 0.0, "since": None, "execs": {}}    # executions in the recent window
 _cache_lock = threading.Lock()
 
 
+def _keyed(raw: list) -> dict:
+    out = {}
+    for idx, t in enumerate(raw):
+        etid = t.get("exchangeTradeId") or t.get("tradeId")
+        if etid and etid != "0":
+            key = etid
+        else:
+            key = f"{t.get('orderId')}_{t.get('transactionType')}_{t.get('tradedPrice')}_{idx}"
+        out[key] = t
+    return out
+
+
 def _executions_since(fetch_from: str) -> list:
-    """All executions from fetch_from up to today (cached)."""
+    """All executions from fetch_from up to today (cached as described above)."""
     import broker
     with _cache_lock:
-        fresh = (time.time() - _cache["at"]) < CACHE_SECONDS
-        if fresh and _cache["from"] and _cache["from"] <= fetch_from:
-            return _cache["execs"]
-        today = datetime.now(_IST).strftime("%Y-%m-%d")
+        now = datetime.now(_IST)
+        today = now.strftime("%Y-%m-%d")
+        recent_from = (now - timedelta(days=RECENT_DAYS)).strftime("%Y-%m-%d")
+        old_to = (now - timedelta(days=RECENT_DAYS + 1)).strftime("%Y-%m-%d")
         # Always up to today: a trade opened inside the range but closed after it still
         # needs its exit (otherwise it looks open / expired).
-        raw = broker.get_trade_history(fetch_from, today) or []
-        execs = {}
-        for idx, t in enumerate(raw):
-            etid = t.get("exchangeTradeId") or t.get("tradeId")
-            if etid and etid != "0":
-                key = etid
-            else:
-                key = f"{t.get('orderId')}_{t.get('transactionType')}_{t.get('tradedPrice')}_{idx}"
-            execs[key] = t
-        _cache.update({"from": fetch_from, "at": time.time(), "execs": list(execs.values())})
-        logger.info(f"{len(raw)} executions since {fetch_from}")
-        return _cache["execs"]
+        if fetch_from <= old_to and (_old["day"] != today or _old["from"] is None or fetch_from < _old["from"]):
+            # read far enough back for both pages at once (Performance: 30 days + look-back)
+            start = min(fetch_from, (now - timedelta(days=30 + LOOKBACK_DAYS)).strftime("%Y-%m-%d"))
+            raw = broker.get_trade_history(start, old_to) or []
+            _old.update(**{"from": start, "day": today, "execs": _keyed(raw)})
+            logger.info(f"{len(raw)} executions {start}..{old_to} (older part, kept for the day)")
+        if time.time() - _recent["at"] >= CACHE_SECONDS or _recent["since"] != recent_from:
+            raw = broker.get_trade_history(recent_from, today) or []
+            _recent.update(**{"at": time.time(), "since": recent_from, "execs": _keyed(raw)})
+        merged = dict(_old["execs"]) if fetch_from <= old_to else {}
+        merged.update(_recent["execs"])
+        return list(merged.values())
 
 
 def fetch_trades(from_date: str, to_date: str) -> list:

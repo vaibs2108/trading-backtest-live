@@ -4104,33 +4104,17 @@ async def get_capital_state():
             unrealized_pnl = tm.position.current_pnl
         today_pnl = realized_pnl + unrealized_pnl
 
-    # 3. Calculate peak, drawdown, and limit
-    if today_pnl < 0:
-        # Loss scenario: Peak = Equity + Loss
-        loss = abs(today_pnl)
-        peak = equity + loss
-        drawdown = loss
-        drawdown_pct = (drawdown / peak) * 100 if peak > 0 else 0.0
-    else:
-        # Profit scenario: Peak = Equity
-        peak = equity
-        drawdown = 0.0
-        drawdown_pct = 0.0
-
-    limit = peak * 0.10
-
+    # 3. Peak / drawdown / limit: the capital tracker's own figures -- the ones that actually
+    # block auto-trade entries (capital_tracker.can_trade). This used to compute a separate
+    # "today's loss vs a hard-coded 10%" drawdown, so the Capital Protection card could
+    # disagree with what was really blocking (or allowing) trading.
+    state = ct.get_state()
     return {
-        "starting_capital": float(state["starting_capital"]),
-        "peak_equity": round(float(peak), 2),
-        "current_equity": round(float(equity), 2),
-        "max_drawdown_pct": 10.0,
-        "drawdown_limit": round(float(limit), 2),
-        "current_drawdown": round(float(drawdown), 2),
-        "current_drawdown_pct": round(float(drawdown_pct), 2),
-        "drawdown_breached": bool(state["drawdown_breached"]),
-        "last_updated": state["last_updated"],
+        **{k: state[k] for k in ("starting_capital", "peak_equity", "current_equity", "max_drawdown_pct",
+                                 "drawdown_limit", "current_drawdown", "current_drawdown_pct",
+                                 "drawdown_breached", "last_updated")},
         "today_pnl": round(float(today_pnl), 2),
-        "is_profit": bool(today_pnl >= 0)
+        "is_profit": bool(today_pnl >= 0),
     }
 
 
