@@ -1,4 +1,4 @@
-"""
+r"""
 tests/test_system_integration.py -- system checks for the strategies the app trades today.
 
 Run:  .venv\Scripts\python.exe tests\test_system_integration.py      (no pytest needed)
