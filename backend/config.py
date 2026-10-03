@@ -325,6 +325,14 @@ def _load_settings() -> Settings:
     return settings
 
 
+def reload_settings() -> Settings:
+    """Re-read .env + settings.json (e.g. after a Dhan token is updated from Settings)."""
+    global _settings
+    with _settings_lock:
+        _settings = _load_settings()
+        return _settings
+
+
 def save_settings(data: dict) -> Settings:
     """Persist non-credential settings to JSON file and reload.
     

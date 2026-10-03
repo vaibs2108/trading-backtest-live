@@ -671,6 +671,9 @@ async def get_status():
 
     market = await asyncio.to_thread(_market_state, cfg.instrument)
     await asyncio.to_thread(_maybe_alert_token_error)
+    import dhan_tokens
+    tokens = dhan_tokens.all_status()
+    await asyncio.to_thread(_maybe_alert_token_expiry, tokens)
     return {
         "connected":    broker.is_connected(),
         "instrument":   cfg.instrument,
@@ -684,6 +687,7 @@ async def get_status():
         "trade_state":  trade_state,
         "market":       market,
         "broker_auth_error": broker.dhan_auth_error(),
+        "dhan_tokens": {k: {f: v[f] for f in ("label", "state", "expires_at", "minutes_left")} for k, v in tokens.items()},
         "last_signal":  _display_last_signal(),
         "active_trade_signal": _active_trade_signal,
         "active_entries": _get_active_entries(cfg, tm),
@@ -693,6 +697,70 @@ async def get_status():
         "max_daily_loss": cfg.max_daily_loss,
         "max_daily_profit": cfg.max_daily_profit,
     }
+
+
+class DhanTokenUpdate(BaseModel):
+    slot: str            # "main" (trading) | "cas" (CAS scanner)
+    access_token: str
+
+
+@app.get("/api/dhan/tokens")
+async def get_dhan_tokens():
+    """Masked client ID / token and expiry for both Dhan tokens (never the token itself)."""
+    import dhan_tokens
+    return dhan_tokens.all_status()
+
+
+@app.post("/api/dhan/token")
+async def update_dhan_token(req: DhanTokenUpdate):
+    """Replace a Dhan access token from the Settings page: check it, save it to .env,
+    and reconnect everything that uses it -- no restart, no .env editing."""
+    import dhan_tokens
+    if req.slot not in dhan_tokens.SLOTS:
+        raise HTTPException(status_code=400, detail="slot must be 'main' or 'cas'")
+    ok, why = await asyncio.to_thread(dhan_tokens.check_new_token, req.slot, req.access_token)
+    if not ok:
+        raise HTTPException(status_code=400, detail=why)
+    await asyncio.to_thread(dhan_tokens.save_token, req.slot, req.access_token)
+    cfg = get_settings()
+    notes = []
+    if req.slot == "main":
+        success, msg = await asyncio.to_thread(broker.connect, cfg.dhan_client_code, cfg.dhan_access_token)
+        if not success:
+            raise HTTPException(status_code=502, detail=f"Token saved, but reconnecting to Dhan failed: {msg}")
+        broker._dhan_auth_error = None   # the old token's rejection no longer applies
+        notes.append("Broker reconnected")
+        # Live price feed: restart on the new token if it was running (otherwise the
+        # signal loop starts it with the new token at the next market open).
+        _feed = get_live_feed()
+        if _feed.is_running:
+            _old = getattr(_feed, "_thread", None)
+            await asyncio.wait_for(asyncio.to_thread(_feed.stop), timeout=15)
+            if _old is not None:
+                await asyncio.to_thread(_old.join, 5)
+            _feed.start(cfg.dhan_client_code, cfg.dhan_access_token)
+            notes.append("live price feed restarted")
+        # Order-update feed (speed-up for fill confirmation only)
+        try:
+            import order_update_feed
+            _ot = getattr(order_update_feed, "_thread", None)
+            order_update_feed.stop()
+            if _ot is not None:
+                await asyncio.to_thread(_ot.join, 5)
+            if _ot is None or not _ot.is_alive():
+                order_update_feed.start(cfg.dhan_client_code, cfg.dhan_access_token)
+                notes.append("order-update feed restarted")
+            else:
+                notes.append("order-update feed will use the new token after the next restart")
+        except Exception as e:
+            notes.append(f"order-update feed not restarted ({e})")
+    else:
+        import cas_broker
+        if not await asyncio.to_thread(cas_broker.connect, cfg.dhan_cas_client_code, cfg.dhan_cas_access_token):
+            raise HTTPException(status_code=502, detail="Token saved, but the CAS scanner could not reconnect to Dhan")
+        notes.append("CAS scanner reconnected")
+    add_activity_log(f"{dhan_tokens.SLOTS[req.slot]['label']} Dhan token updated from Settings")
+    return {"success": True, "status": dhan_tokens.status(req.slot), "notes": notes}
 
 
 @app.get("/api/sparkline")
@@ -770,7 +838,8 @@ async def update_settings(req: SettingsUpdate):
     else:
         add_activity_log(f"Settings updated: {list(data.keys())}")
         
-    return {"success": True, "settings": cfg.model_dump(exclude={"dhan_access_token"})}
+    from config import CRED_FIELDS
+    return {"success": True, "settings": cfg.model_dump(exclude=set(CRED_FIELDS))}
 
 
 @app.get("/api/chart/{timeframe}")
@@ -2743,6 +2812,33 @@ def _maybe_trip_kill_switch(cfg, fail_count: int):
         save_settings({"auto_trade": False})
 
 
+_token_expiry_alerts_sent: set = set()   # (slot, token exp, "1h"|"expired")
+
+
+def _maybe_alert_token_expiry(tokens: dict):
+    """Telegram once ~1 hour before a Dhan token expires and once when it has expired
+    (per token -- a new token starts fresh)."""
+    cfg = get_settings()
+    if not (cfg.telegram_bot_token and cfg.telegram_chat_id):
+        return
+    for slot, st in tokens.items():
+        if st["state"] not in ("expiring", "expired") or st["minutes_left"] is None:
+            continue
+        stage = "expired" if st["state"] == "expired" else ("1h" if st["minutes_left"] <= 60 else None)
+        key = (slot, st["expires_at"], stage)
+        if stage is None or key in _token_expiry_alerts_sent:
+            continue
+        _token_expiry_alerts_sent.add(key)
+        when = datetime.fromisoformat(st["expires_at"]).strftime("%a %d %b, %H:%M")
+        msg = (f"\u26a0\ufe0f DHAN TOKEN EXPIRED ({st['label']})\nExpired {when} IST. Paste a new token in Settings -> Dhan Connection."
+               if stage == "expired" else
+               f"\u23f0 Dhan token ({st['label']}) expires {when} IST (in {st['minutes_left']} min).\nPaste a new one in Settings -> Dhan Connection.")
+        try:
+            _send_telegram_alert_wrapper(msg, cfg.telegram_bot_token, cfg.telegram_chat_id)
+        except Exception as e:
+            logger.warning(f"Token expiry Telegram alert failed: {e}")
+
+
 def _log_order_latency(cfg, strategy: str, direction: str, result: dict):
     """One latency-log line per entry order result (seconds after the 5m candle close)."""
     try:
@@ -2788,6 +2884,11 @@ async def _signal_polling_loop():
             if not broker.is_connected():
                 continue
             _maybe_alert_token_error()
+            try:
+                import dhan_tokens
+                _maybe_alert_token_expiry(dhan_tokens.all_status())
+            except Exception as _tok_err:
+                logger.debug(f"Token expiry check failed: {_tok_err}")
 
             add_activity_log("Engine Heartbeat: Active & monitoring status.")
             import pytz

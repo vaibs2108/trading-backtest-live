@@ -958,6 +958,67 @@ function DayStats({ state, balance, livePnl, todayPnl, lotSize }) {
 }
 
 // ── Settings Modal ──────────────────────────────────────────────────────────
+// ── Dhan Connection: view expiry, paste a new token (no .env editing / restart) ──
+const _tokenWhen = iso => iso ? new Date(iso).toLocaleString('en-IN', { timeZone:'Asia/Kolkata', weekday:'short', day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit', hour12:false }) : ''
+const _tokenLeft = m => m == null ? '' : m <= 0 ? 'expired' : m < 60 ? `${m} min left` : `${Math.floor(m/60)} h ${m%60} min left`
+const _tokenColor = s => s === 'ok' ? V('green') : s === 'expiring' ? V('yellow') : V('red')
+
+function DhanTokenRow({ st, onUpdated }) {
+  const [val, setVal] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState(null)
+  const update = async () => {
+    if (!val.trim()) return
+    setBusy(true); setMsg(null)
+    try {
+      const r = await fetch('/api/dhan/token', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ slot: st.slot, access_token: val.trim() }) })
+      const d = await r.json()
+      if (r.ok && d.success) { setVal(''); setMsg({ ok:true, text: 'Saved. ' + (d.notes || []).join(', ') + '.' }); onUpdated() }
+      else setMsg({ ok:false, text: d.detail || 'Update failed' })
+    } catch (e) { setMsg({ ok:false, text: 'Update failed: ' + e.message }) }
+    finally { setBusy(false) }
+  }
+  const stateText = st.state === 'missing' ? 'Not set' : st.state === 'unreadable' ? 'Token unreadable'
+    : st.state === 'expired' ? `Expired ${_tokenWhen(st.expires_at)}` : `Valid until ${_tokenWhen(st.expires_at)} (${_tokenLeft(st.minutes_left)})`
+  return (
+    <div style={{ padding:'10px 0', borderBottom:`1px solid ${V('border-light')}` }}>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+        <div style={{ fontSize:13, fontWeight:600, color:V('text-primary') }}>{st.label} token</div>
+        <div style={{ fontSize:12, fontWeight:600, color:_tokenColor(st.state) }}>{stateText}</div>
+      </div>
+      <div style={{ fontSize:11, color:V('text-muted'), margin:'4px 0 8px' }}>Client ID {st.client_id || '—'} · Token {st.token || '—'}</div>
+      <div style={{ display:'flex', gap:8 }}>
+        <input type="password" autoComplete="off" value={val} onChange={e=>setVal(e.target.value)} placeholder="Paste new access token"
+          style={{ flex:1, background:V('bg-input'), color:V('text-primary'), border:`1px solid ${V('border')}`, borderRadius:V('radius-sm'), padding:'6px 10px', fontSize:12, outline:'none' }} />
+        <StyledButton onClick={update} variant="primary" disabled={busy || !val.trim()} style={{ padding:'6px 14px', fontSize:12 }}>
+          {busy ? 'Checking…' : 'Update'}
+        </StyledButton>
+      </div>
+      {msg && <div style={{ fontSize:11, marginTop:6, color: msg.ok ? V('green') : V('red') }}>{msg.text}</div>}
+    </div>
+  )
+}
+
+function DhanTokenCard() {
+  const [tokens, setTokens] = useState(null)
+  const load = () => fetch('/api/dhan/tokens').then(r => r.json()).then(setTokens).catch(() => {})
+  useEffect(() => { load(); const id = setInterval(load, 60000); return () => clearInterval(id) }, [])
+  return (
+    <Card>
+      <div style={{ display:'flex', alignItems:'center', gap:8, borderBottom:`2px solid ${V('border')}`, paddingBottom:8, marginBottom:4 }}>
+        <Shield size={16} style={{color:V('accent')}} />
+        <span style={{ fontSize:14, fontWeight:700, color:V('text-primary') }}>Dhan Connection</span>
+      </div>
+      <div style={{ fontSize:11, color:V('text-muted'), margin:'4px 0 2px' }}>
+        Dhan access tokens last about a day. Paste a new one here when it expires — it is checked with Dhan,
+        saved, and the app reconnects without a restart. The token is never shown again (only its last 4 characters).
+      </div>
+      {tokens ? ['main', 'cas'].map(k => tokens[k] && <DhanTokenRow key={k} st={tokens[k]} onUpdated={load} />)
+              : <div style={{ fontSize:12, color:V('text-muted'), padding:10 }}>Loading…</div>}
+    </Card>
+  )
+}
+
 function SettingsPanel({ onSaved }) {
   const [cfg, setCfg] = useState({})
   const [orig, setOrig] = useState({})   // values as loaded -- Save sends only what you changed
@@ -1006,6 +1067,7 @@ function SettingsPanel({ onSaved }) {
 
   return (
     <div className="fade-in" style={{ display:'flex', flexDirection:'column', gap:16 }}>
+      <DhanTokenCard />
       {/* 2-column grid layout */}
       <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
         {/* Left Column */}
@@ -8489,6 +8551,7 @@ export default function App() {
   const [dataHealth, setDataHealth] = useState(null)
   const [market, setMarket] = useState(null)
   const [brokerAuthError, setBrokerAuthError] = useState(null)
+  const [dhanTokens, setDhanTokens] = useState(null)
   const [telegramConfigured, setTelegramConfigured] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const isMobile = useIsMobile()
@@ -8650,6 +8713,7 @@ export default function App() {
         if (s.data_health) setDataHealth(s.data_health)
         if (s.market) setMarket(s.market)
         setBrokerAuthError(s.broker_auth_error || null)
+        setDhanTokens(s.dhan_tokens || null)
         if (s.app_running != null) setAppRunning(s.app_running)
         if (s.max_daily_loss != null) setMaxDailyLoss(s.max_daily_loss)
         if (s.max_daily_profit != null) setMaxDailyProfit(s.max_daily_profit)
@@ -8976,6 +9040,21 @@ export default function App() {
             </StyledButton>
           </div>
         )}
+
+        {/* Dhan token expiring (< 2 h) or expired -- update it in Settings */}
+        {dhanTokens && Object.values(dhanTokens).filter(x => x.state === 'expiring' || x.state === 'expired').map(x => (
+          <div key={x.label} style={{
+            background: x.state === 'expired' ? V('red-bg') : V('yellow-bg'),
+            borderBottom:`1px solid color-mix(in srgb, ${x.state === 'expired' ? V('red') : V('yellow')} 30%, transparent)`,
+            padding:'8px 24px', fontSize:12, fontWeight:700, color: x.state === 'expired' ? V('red') : V('yellow'),
+            display:'flex', alignItems:'center', gap:12, flexWrap:'wrap'
+          }}>
+            <span>{x.state === 'expired' ? '⚠' : '⏰'} Dhan {x.label} token {x.state === 'expired'
+              ? `EXPIRED ${_tokenWhen(x.expires_at)}`
+              : `expires ${_tokenWhen(x.expires_at)} (${_tokenLeft(x.minutes_left)})`} — paste a new one in Settings → Dhan Connection.</span>
+            {tab !== 'settings' && <button onClick={() => setTab('settings')} style={{ background:'none', border:`1px solid currentColor`, color:'inherit', borderRadius:6, padding:'2px 10px', fontSize:11, fontWeight:700, cursor:'pointer' }}>Update now</button>}
+          </div>
+        ))}
 
         {/* Dhan rejecting the access token: no fresh data, no orders */}
         {brokerAuthError && (
