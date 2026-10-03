@@ -49,6 +49,13 @@ def _save(entries: List[Dict]):
         logger.error(f"Error saving signal journal: {e}")
 
 
+def _bar_key(ts) -> str:
+    """Entry time as 'YYYY-MM-DD HH:MM' -- the two code paths that open entries write the
+    same bar as '2026-09-29 10:55:00' and '2026-09-29T10:55:00+05:30'."""
+    s = str(ts or "").strip().replace("T", " ")
+    return s[:16]
+
+
 def open_entry(sig: dict, instrument: str, lot_size: int):
     """Record a strategy LONG or SHORT signal as an open journal entry."""
     direction = sig.get("signal")
@@ -59,12 +66,13 @@ def open_entry(sig: dict, instrument: str, lot_size: int):
     # Skip if identical entry already exists (same strategy + time + instrument + direction
     # still OPEN). Strategy is part of the key: without it, when several strategies entered
     # on the same bar only the first one was journaled (12 of the last 100 signals).
+    # Times are compared per bar (_bar_key): comparing the text let 14 entries in twice.
     entry_time = sig.get("time", "")
     strategy = str(sig.get("strategy", ""))
     if any(
         e.get("instrument") == instrument and
         e.get("direction") == direction and
-        e.get("entry_time") == entry_time and
+        _bar_key(e.get("entry_time")) == _bar_key(entry_time) and
         str(e.get("strategy", "")) == strategy and
         e.get("status") == "OPEN"
         for e in entries
@@ -161,7 +169,7 @@ def close_entry(exit_sig: dict, instrument: str, exit_reason: str = "", index_pr
         "exit_reason": exit_reason or exit_sig.get("reason", "SIGNAL_EXIT"),
         "pnl_pts":     pnl_pts,
         "pnl_inr":     pnl_inr,
-        "status":      "WIN" if pnl_pts > 0 else "LOSS",
+        "status":      "WIN" if pnl_pts > 0 else ("LOSS" if pnl_pts < 0 else "FLAT"),
     })
     _save(entries)
     logger.info(
@@ -200,14 +208,15 @@ def auto_close_stale_entries():
             continue
         if entry_date < today:
             entry_price = float(e.get("entry_price", 0) or 0)
-            # Close at entry price (flat) since we don't know the actual close
+            # Close at entry price (flat) since we don't know the actual close. Status
+            # DAY_END (not LOSS): no exit price was seen, so it isn't counted as a result.
             e.update({
                 "exit_time": datetime.now(_IST).isoformat(),
                 "exit_price": entry_price,
                 "exit_reason": "STALE_DAY_CLOSE",
                 "pnl_pts": 0.0,
                 "pnl_inr": 0.0,
-                "status": "LOSS",
+                "status": "DAY_END",
             })
             changed = True
             logger.info(f"Auto-closed stale OPEN entry from {entry_date}: {e.get('direction')} {e.get('instrument')}")
@@ -216,5 +225,9 @@ def auto_close_stale_entries():
         _save(entries)
 
 
-def clear_journal():
-    _save([])
+def clear_journal() -> int:
+    """Remove closed entries. OPEN entries are kept: Live Trading reads them to know each
+    strategy's position and to send virtual-exit alerts. Returns how many were kept."""
+    kept = [e for e in _load() if e.get("status") == "OPEN"]
+    _save(kept)
+    return len(kept)

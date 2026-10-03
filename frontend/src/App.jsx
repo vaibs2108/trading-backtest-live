@@ -92,7 +92,9 @@ const chartColors = (theme) => theme === 'dark' ? {
 // ── Utility ─────────────────────────────────────────────────────────────────
 const V = (name) => `var(--${name})`
 const fmt = n => n == null ? '—' : Number(n).toLocaleString('en-IN', {maximumFractionDigits:2})
-const fmtPnl = n => n == null ? '—' : (n>=0?'+':'') + '₹' + Math.abs(n).toLocaleString('en-IN',{maximumFractionDigits:0})
+// Signed rupee amount. Negative amounts used to lose their minus sign (only the red
+// colour showed a loss): -45 was shown as "₹45".
+const fmtPnl = n => n == null ? '—' : (n>=0?'+':'-') + '₹' + Math.abs(n).toLocaleString('en-IN',{maximumFractionDigits:0})
 const clr = n => n > 0 ? V('green') : n < 0 ? V('red') : V('text-muted')
 
 class ErrorBoundary extends React.Component {
@@ -1614,6 +1616,23 @@ const extractISODate = (e) => {
 
 
 // ── Signal Journal Panel ────────────────────────────────────────────────────
+// Strategy Signals Log -- every strategy signal with its theoretical result (index points).
+// Statuses: OPEN, WIN, LOSS, FLAT (break-even), DAY_END (still open next morning, closed at
+// 09:15 with no exit price -- not a result), VOID (bad data: no/stale exit, holiday signal).
+// Only WIN / LOSS / FLAT count towards win rate and P&L.
+const _SJ_RESULT = new Set(['WIN', 'LOSS', 'FLAT'])
+// Names for strategies that are no longer live but still appear in older log entries
+const _SJ_OLD_LABELS = {
+  multi_agent: 'Multi-Agent Optimized',
+  regime_trend_range: 'Regime T/R Optimized',
+  custom_halftrend_hull_standalone: 'HalfTrend + Hull (retired)',
+  regime_trend_v2: 'Regime Trend V2 — Selective',
+  regime_trend_v2b: 'Regime Trend V2-B — Balanced',
+  donchian_5m_swing: 'Donchian 5m Swing',
+  donchian_5m_intraday: 'Donchian 5m Intraday',
+}
+const _sjStrategyLabel = s => LIVE_STRATEGY_LABELS[s] || _SJ_OLD_LABELS[s] || s
+
 function SignalJournalPanel({ entries, onRefresh }) {
   const m = window.innerWidth < 768
   const [draftStrategy, setDraftStrategy] = React.useState('ALL')
@@ -1628,43 +1647,26 @@ function SignalJournalPanel({ entries, onRefresh }) {
     fromDate: '',
     toDate: ''
   })
+  const [dateError, setDateError] = React.useState('')
+
+  // Filter choices come from the log itself (no hard-coded lists of old strategies)
+  const strategyOptions = React.useMemo(() => [...new Set(entries.map(e => e.strategy).filter(Boolean))].sort((a, b) => _sjStrategyLabel(a).localeCompare(_sjStrategyLabel(b))), [entries])
+  const instrumentOptions = React.useMemo(() => [...new Set(entries.map(e => e.instrument).filter(Boolean))].sort(), [entries])
 
   const handleSubmitFilters = (e) => {
     if (e) e.preventDefault()
-    const nextFilters = {
-      strategy: draftStrategy,
-      instrument: draftInstrument,
-      fromDate: draftFromDate,
-      toDate: draftToDate
+    if (draftFromDate && draftToDate && draftFromDate > draftToDate) {
+      setDateError('The From date is after the To date.')
+      return
     }
-    setAppliedFilters(nextFilters)
-    if (onRefresh) onRefresh(nextFilters)
+    setDateError('')
+    setAppliedFilters({ strategy: draftStrategy, instrument: draftInstrument, fromDate: draftFromDate, toDate: draftToDate })
+    if (onRefresh) onRefresh()
   }
 
-  // Apply filters robustly
   const filteredEntries = entries.filter(e => {
-    if (appliedFilters.strategy !== 'ALL') {
-      const s = (e.strategy || '').toLowerCase()
-      const f = appliedFilters.strategy.toLowerCase()
-      if (s) {
-        if (f === 'regime_trend_range' && !s.includes('regime') && !s.includes('trend') && !s.includes('range')) return false
-        if (f === 'multi_agent' && !s.includes('multi')) return false
-        if (f !== 'regime_trend_range' && f !== 'multi_agent' && s !== f && !s.includes(f)) return false
-      }
-    }
-
-    if (appliedFilters.instrument !== 'ALL') {
-      const target = appliedFilters.instrument.toUpperCase()
-      const inst = (e.instrument || e.underlying || e.index || '').toUpperCase()
-      const sym = (e.symbol || e.trading_symbol || '').toUpperCase()
-      if (inst) {
-        if (inst !== target && !inst.includes(target) && !target.includes(inst)) return false
-      } else if (sym && (sym.includes('NIFTY') || sym.includes('SENSEX') || sym.includes('BANKEX') || sym.includes('CRUDE') || sym.includes('GOLD'))) {
-        if (!sym.includes(target)) return false
-      }
-    }
-
-
+    if (appliedFilters.strategy !== 'ALL' && e.strategy !== appliedFilters.strategy) return false
+    if (appliedFilters.instrument !== 'ALL' && e.instrument !== appliedFilters.instrument) return false
     const dateStr = extractISODate(e)
     if (dateStr && dateStr.length === 10) {
       if (appliedFilters.fromDate && dateStr < appliedFilters.fromDate) return false
@@ -1673,22 +1675,24 @@ function SignalJournalPanel({ entries, onRefresh }) {
     return true
   })
 
+  const results  = filteredEntries.filter(e => _SJ_RESULT.has(e.status))
+  const wins     = results.filter(e => e.status === 'WIN').length
+  const losses   = results.filter(e => e.status === 'LOSS').length
+  const flats    = results.filter(e => e.status === 'FLAT').length
+  const dayEnd   = filteredEntries.filter(e => e.status === 'DAY_END').length
+  const voided   = filteredEntries.filter(e => e.status === 'VOID').length
+  const totalPts = results.reduce((s, e) => s + (e.pnl_pts || 0), 0)
+  const totalInr = results.reduce((s, e) => s + (e.pnl_inr || 0), 0)
+  const winRate  = results.length > 0 ? (wins / results.length * 100).toFixed(0) : '—'
 
-  const closed  = filteredEntries.filter(e => e.status !== 'OPEN')
-  const wins    = closed.filter(e => e.status === 'WIN').length
-  const losses  = closed.filter(e => e.status === 'LOSS').length
-  const totalPts = closed.reduce((s, e) => s + (e.pnl_pts || 0), 0)
-  const totalInr = closed.reduce((s, e) => s + (e.pnl_inr || 0), 0)
-  const winRate  = closed.length > 0 ? (wins / closed.length * 100).toFixed(0) : '—'
-
-  const statusColor = s => s === 'WIN' ? V('green') : s === 'LOSS' ? V('red') : V('yellow')
-  const statusLabel = s => s === 'WIN' ? '✓ WIN' : s === 'LOSS' ? '✗ LOSS' : '● OPEN'
+  const statusColor = s => s === 'WIN' ? V('green') : s === 'LOSS' ? V('red') : s === 'OPEN' ? V('yellow') : V('text-muted')
+  const statusLabel = s => ({ WIN:'✓ WIN', LOSS:'✗ LOSS', OPEN:'● OPEN', FLAT:'= FLAT', DAY_END:'Day-end close', VOID:'Void' }[s] || s)
 
   const handleDownloadCSV = () => {
-    const headers = ['Date', 'Strategy', 'Instrument', 'Direction', 'Entry Price', 'SL', 'Target 1', 'Target 2', 'Regime', 'Score', 'Exit Time', 'Exit Price', 'P&L pts', 'P&L INR', 'Exit Reason', 'Status']
+    const headers = ['Date', 'Strategy', 'Instrument', 'Direction', 'Entry Price', 'SL', 'Target 1', 'Target 2', 'Regime', 'Score', 'Exit Time', 'Exit Price', 'P&L pts', 'P&L INR (index pts x lot)', 'Exit Reason', 'Status', 'Note']
     const rows = filteredEntries.map(e => [
       e.entry_time,
-      LIVE_STRATEGY_LABELS[e.strategy] || (e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy),
+      _sjStrategyLabel(e.strategy),
       e.instrument,
       e.direction,
       e.entry_price,
@@ -1698,13 +1702,14 @@ function SignalJournalPanel({ entries, onRefresh }) {
       e.regime || '',
       e.weighted_score || e.ml_prob || '',
       e.exit_time || '',
-      e.exit_price || '',
-      e.pnl_pts || '',
-      e.pnl_inr || '',
+      e.exit_price ?? '',
+      e.pnl_pts ?? '',
+      e.pnl_inr ?? '',
       e.exit_reason || '',
-      e.status
+      e.status,
+      e.void_reason || ''
     ])
-    
+
     const csvContent = [headers.join(','), ...rows.map(r => r.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))].join('\n')
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
     const url = URL.createObjectURL(blob)
@@ -1716,111 +1721,54 @@ function SignalJournalPanel({ entries, onRefresh }) {
     document.body.removeChild(link)
   }
 
+  const selStyle = {
+    background: V('bg-input'),
+    color: V('text-primary'),
+    border: `1px solid ${V('border')}`,
+    borderRadius: V('radius-sm'),
+    padding: '4px 8px',
+    fontSize: 11,
+    outline: 'none'
+  }
+
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
       <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(5,1fr)', gap:8 }}>
-        <MetricBox label="Total Signals" value={filteredEntries.length} color={V('accent')} />
-        <MetricBox label="Win Rate" value={`${winRate}%`} color={V('green')} sub={`${wins}W / ${losses}L`} />
-        <MetricBox label="Total P&L (pts)" value={totalPts >= 0 ? `+${totalPts.toFixed(0)}` : totalPts.toFixed(0)} color={clr(totalPts)} />
-        <MetricBox label="Total P&L (₹)" value={fmtPnl(totalInr)} color={clr(totalInr)} />
+        <MetricBox label="Total Signals" value={filteredEntries.length} color={V('accent')} sub={(dayEnd || voided) ? `${dayEnd} day-end · ${voided} void — not counted` : undefined} />
+        <MetricBox label="Win Rate" value={`${winRate}%`} color={V('green')} sub={`${wins}W / ${losses}L${flats ? ` / ${flats} flat` : ''}`} />
+        <MetricBox label="Total P&L (pts)" value={totalPts >= 0 ? `+${totalPts.toFixed(0)}` : totalPts.toFixed(0)} color={clr(totalPts)} sub="index points" />
+        <MetricBox label="Theoretical P&L (₹)" value={fmtPnl(totalInr)} color={clr(totalInr)} sub="index pts × lot size, not option P&L" />
         <MetricBox label="Open" value={filteredEntries.filter(e=>e.status==='OPEN').length} color={V('yellow')} />
       </div>
 
       <Card>
         <form onSubmit={handleSubmitFilters} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12, flexWrap:'wrap', gap:8 }}>
           <div style={{ color:V('text-primary'), fontWeight:700, fontSize:15 }}>Strategy Signals Log</div>
-          
+
           <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
             <div style={{ display:'flex', alignItems:'center', gap:4 }}>
               <span style={{ fontSize:11, color:V('text-muted') }}>Strategy:</span>
-              <select 
-                value={draftStrategy} 
-                onChange={e => setDraftStrategy(e.target.value)} 
-                style={{
-                  background: V('bg-input'),
-                  color: V('text-primary'),
-                  border: `1px solid ${V('border')}`,
-                  borderRadius: V('radius-sm'),
-                  padding: '4px 8px',
-                  fontSize: 11,
-                  outline: 'none'
-                }}
-              >
+              <select value={draftStrategy} onChange={e => setDraftStrategy(e.target.value)} style={selStyle}>
                 <option value="ALL">All Strategies</option>
-                <option value="custom_alpha_combo_cusum125">Alpha Combo (CUSUM 1.25)</option>
-                <option value="custom_time_gated_alpha_combo">Time-Gated Alpha Combo</option>
-                <option value="custom_regime_v1_trend_range_final">Regime T/R V1 Final</option>
-                <option value="custom_option_b_ram_rf">Option B: Ram &gt; Range Filter</option>
-                <option value="custom_halftrend_hull_standalone">HalfTrend + Hull (retired)</option>
-                <option value="custom_cusum15_nodonchian_cd8">CUSUM 1.5 (No Donchian)</option>
-                <option value="regime_trend_range">Regime T/R Optimized</option>
-                <option value="regime_trend_v2">Regime Trend V2 — Selective</option>
-                <option value="regime_trend_v2b">Regime Trend V2-B — Balanced</option>
-                <option value="donchian_5m_swing">Donchian 5m Swing</option>
-                <option value="donchian_5m_intraday">Donchian 5m Intraday</option>
+                {strategyOptions.map(s => <option key={s} value={s}>{_sjStrategyLabel(s)}</option>)}
               </select>
             </div>
 
             <div style={{ display:'flex', alignItems:'center', gap:4 }}>
               <span style={{ fontSize:11, color:V('text-muted') }}>Instrument:</span>
-              <select 
-                value={draftInstrument} 
-                onChange={e => setDraftInstrument(e.target.value)} 
-                style={{
-                  background: V('bg-input'),
-                  color: V('text-primary'),
-                  border: `1px solid ${V('border')}`,
-                  borderRadius: V('radius-sm'),
-                  padding: '4px 8px',
-                  fontSize: 11,
-                  outline: 'none'
-                }}
-              >
+              <select value={draftInstrument} onChange={e => setDraftInstrument(e.target.value)} style={selStyle}>
                 <option value="ALL">All Instruments</option>
-                <option value="BANKNIFTY">BANKNIFTY</option>
-                <option value="NIFTY">NIFTY</option>
-                <option value="FINNIFTY">FINNIFTY</option>
-                <option value="MIDCPNIFTY">MIDCPNIFTY</option>
-                <option value="SENSEX">SENSEX</option>
-                <option value="CRUDEOIL">CRUDEOIL</option>
+                {instrumentOptions.map(i => <option key={i} value={i}>{i}</option>)}
               </select>
             </div>
 
             <div style={{ display:'flex', alignItems:'center', gap:4 }}>
               <span style={{ fontSize:11, color:V('text-muted') }}>From:</span>
-              <input 
-                type="date" 
-                value={draftFromDate} 
-                onChange={e => setDraftFromDate(e.target.value)} 
-                style={{
-                  background: V('bg-input'),
-                  color: V('text-primary'),
-                  border: `1px solid ${V('border')}`,
-                  borderRadius: V('radius-sm'),
-                  padding: '4px 8px',
-                  fontSize: 11,
-                  width: '120px',
-                  outline: 'none'
-                }}
-              />
+              <input type="date" value={draftFromDate} onChange={e => setDraftFromDate(e.target.value)} style={{ ...selStyle, width:'120px' }} />
             </div>
             <div style={{ display:'flex', alignItems:'center', gap:4 }}>
               <span style={{ fontSize:11, color:V('text-muted') }}>To:</span>
-              <input 
-                type="date" 
-                value={draftToDate} 
-                onChange={e => setDraftToDate(e.target.value)} 
-                style={{
-                  background: V('bg-input'),
-                  color: V('text-primary'),
-                  border: `1px solid ${V('border')}`,
-                  borderRadius: V('radius-sm'),
-                  padding: '4px 8px',
-                  fontSize: 11,
-                  width: '120px',
-                  outline: 'none'
-                }}
-              />
+              <input type="date" value={draftToDate} onChange={e => setDraftToDate(e.target.value)} style={{ ...selStyle, width:'120px' }} />
             </div>
 
             <StyledButton type="submit" variant="primary" style={{ padding:'4px 14px', fontSize:11, fontWeight:700, display:'flex', alignItems:'center', gap:4 }}>
@@ -1828,14 +1776,15 @@ function SignalJournalPanel({ entries, onRefresh }) {
             </StyledButton>
 
             <StyledButton type="button" onClick={handleDownloadCSV} variant="default" style={{ padding:'4px 12px', fontSize:11 }}>Download CSV</StyledButton>
-            <StyledButton type="button" onClick={onRefresh} variant="default" style={{ padding:'4px 12px', fontSize:11 }}>↺ Refresh</StyledButton>
+            <StyledButton type="button" onClick={() => onRefresh && onRefresh()} variant="default" style={{ padding:'4px 12px', fontSize:11 }}>↺ Refresh</StyledButton>
             <StyledButton type="button" onClick={async () => {
-              if (!window.confirm('Clear all signal journal entries? This cannot be undone.')) return
+              if (!window.confirm('Clear the signal log?\n\nClosed entries are removed (this cannot be undone). Open entries are kept — Live Trading uses them for strategy positions and exit alerts.')) return
               await fetch('/api/signal_journal', { method:'DELETE' })
-              onRefresh()
+              onRefresh && onRefresh()
             }} variant="danger" style={{ padding:'4px 12px', fontSize:11 }}><Trash2 size={11}/> Clear Logs</StyledButton>
           </div>
         </form>
+        {dateError && <div style={{ color:V('red'), fontSize:12, marginBottom:8 }}>{dateError}</div>}
 
         {filteredEntries.length === 0 ? (
           <div style={{ color:V('text-muted'), textAlign:'center', padding:40, fontSize:13 }}>
@@ -1845,16 +1794,17 @@ function SignalJournalPanel({ entries, onRefresh }) {
           <div style={{ overflowX:'auto' }}>
             <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
               <thead>
-                <tr>{['Date','Strategy','Instrument','Dir','Entry','SL','T1','T2','Regime','Score','Exit','P&L pts','P&L ₹','Reason','Status'].map(h=>(
+                <tr>{['Date','Strategy','Instrument','Dir','Entry','SL','T1','T2','Regime','Score','Exit','P&L pts','P&L ₹*','Reason','Status'].map(h=>(
                   <th key={h} style={{ padding:'8px 10px', textAlign:'left', color:V('text-muted'), borderBottom:`1px solid ${V('border')}`, whiteSpace:'nowrap', fontWeight:600 }}>{h}</th>
                 ))}</tr>
               </thead>
-              <tbody>{filteredEntries.map((e, i) => (
-                <tr key={i} style={{ borderBottom:`1px solid ${V('border-light')}`, background: i%2===0 ? 'transparent' : V('bg-tertiary') }}>
+              <tbody>{filteredEntries.map((e, i) => {
+                const noResult = e.status === 'DAY_END' || e.status === 'VOID'
+                return (
+                <tr key={i} title={e.void_reason || (e.status === 'DAY_END' ? 'Still open at the next morning; closed at 09:15 with no exit price — not counted' : undefined)}
+                    style={{ borderBottom:`1px solid ${V('border-light')}`, background: i%2===0 ? 'transparent' : V('bg-tertiary'), opacity: noResult ? 0.55 : 1 }}>
                   <td style={{ padding:'6px 8px', color:V('text-muted'), whiteSpace:'nowrap', fontSize:10 }}>{toISTDateTime(e.entry_time)}</td>
-                  <td style={{ padding:'6px 8px', color:V('text-primary'), fontWeight:500 }}>
-                    {LIVE_STRATEGY_LABELS[e.strategy] || (e.strategy === 'multi_agent' ? 'Multi-Agent Optimized' : e.strategy === 'regime_trend_range' ? 'Regime T/R Optimized' : e.strategy)}
-                  </td>
+                  <td style={{ padding:'6px 8px', color:V('text-primary'), fontWeight:500 }}>{_sjStrategyLabel(e.strategy)}</td>
                   <td style={{ padding:'6px 8px', color:V('text-primary'), fontWeight:500 }}>{e.instrument}</td>
                   <td style={{ padding:'6px 8px', color:e.direction==='LONG'?V('green'):V('red'), fontWeight:700 }}>{e.direction}</td>
                   <td style={{ padding:'6px 8px', fontFamily:"'JetBrains Mono', monospace", color:V('text-primary') }}>{fmt(e.entry_price)}</td>
@@ -1864,17 +1814,20 @@ function SignalJournalPanel({ entries, onRefresh }) {
                   <td style={{ padding:'6px 8px', fontSize:10, color: e.regime?.startsWith('TRENDING_UP')?V('green'):e.regime?.startsWith('TRENDING_DOWN')?V('red'):V('text-muted') }}>{e.regime ? e.regime.replace('TRENDING_','T_') : '—'}</td>
                   <td style={{ padding:'6px 8px', color:V('accent'), fontSize:10 }}>{e.weighted_score!=null?(e.weighted_score*100).toFixed(0)+'%':e.ml_prob!=null?(e.ml_prob*100).toFixed(0)+'%':'—'}</td>
                   <td style={{ padding:'6px 8px', color:V('text-muted'), fontSize:10 }}>{e.exit_time ? toISTDateTime(e.exit_time) : '—'}</td>
-                  <td style={{ padding:'6px 8px', fontFamily:"'JetBrains Mono', monospace", fontWeight:700, color:clr(e.pnl_pts) }}>
-                    {e.pnl_pts != null ? (e.pnl_pts >= 0 ? `+${e.pnl_pts}` : e.pnl_pts) : '—'}
+                  <td style={{ padding:'6px 8px', fontFamily:"'JetBrains Mono', monospace", fontWeight:700, color: noResult ? V('text-muted') : clr(e.pnl_pts) }}>
+                    {noResult || e.pnl_pts == null ? '—' : (e.pnl_pts >= 0 ? `+${e.pnl_pts}` : e.pnl_pts)}
                   </td>
-                  <td style={{ padding:'6px 8px', fontFamily:"'JetBrains Mono', monospace", fontWeight:700, color:clr(e.pnl_inr) }}>
-                    {e.pnl_inr != null ? fmtPnl(e.pnl_inr) : '—'}
+                  <td style={{ padding:'6px 8px', fontFamily:"'JetBrains Mono', monospace", fontWeight:700, color: noResult ? V('text-muted') : clr(e.pnl_inr) }}>
+                    {noResult || e.pnl_inr == null ? '—' : fmtPnl(e.pnl_inr)}
                   </td>
-                  <td style={{ padding:'6px 8px', color:V('text-muted'), fontSize:10 }}>{e.exit_reason || '—'}</td>
-                  <td style={{ padding:'6px 8px', color:statusColor(e.status), fontWeight:600, fontSize:10 }}>{statusLabel(e.status)}</td>
+                  <td style={{ padding:'6px 8px', color:V('text-muted'), fontSize:10 }}>{e.status === 'VOID' ? (e.void_reason || 'Void') : (e.exit_reason || '—')}</td>
+                  <td style={{ padding:'6px 8px', color:statusColor(e.status), fontWeight:600, fontSize:10, whiteSpace:'nowrap' }}>{statusLabel(e.status)}</td>
                 </tr>
-              ))}</tbody>
+              )})}</tbody>
             </table>
+            <div style={{ fontSize:10, color:V('text-muted'), marginTop:8 }}>
+              * Theoretical: index points × lot size — what the index move was worth, not the option's P&L. Day-end closes and void rows are shown faded and not counted.
+            </div>
           </div>
         )}
       </Card>
@@ -3809,7 +3762,7 @@ function IpoAnalysisView({ ipoNo, onBack }) {
 }
 
 // ── Trading Journal Panel ───────────────────────────────────────────────────
-function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, onToDateChange }) {
+function JournalPanel({ journal, info = {}, onRefresh, fromDate, toDate, onFromDateChange, onToDateChange }) {
   const m = window.innerWidth < 768
   const [selectedTrade, setSelectedTrade] = useState(null)
   const [draftFrom, setDraftFrom] = useState(fromDate || '')
@@ -3828,8 +3781,14 @@ function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, 
     }
   }, [fromDate, toDate])
 
+  const [dateError, setDateError] = useState('')
   const handleSubmitDates = (e) => {
     if (e) e.preventDefault()
+    if (draftFrom && draftTo && draftFrom > draftTo) {
+      setDateError('The From date is after the To date.')
+      return
+    }
+    setDateError('')
     setAppliedFrom(draftFrom)
     setAppliedTo(draftTo)
     if (onFromDateChange) onFromDateChange(draftFrom)
@@ -3839,20 +3798,14 @@ function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, 
 
 
 
-  const filteredJournal = journal.filter(t => {
-    const ed = extractISODate(t)
-    if (ed && ed.length === 10) {
-      if (appliedFrom && ed < appliedFrom) return false
-      if (appliedTo && ed > appliedTo) return false
-    }
-    return true
-  })
+  const filteredJournal = journal
 
 
   const closedTrades = filteredJournal.filter(t => t.status === 'CLOSED')
   const totalTrades = closedTrades.length
   const wins = closedTrades.filter(t => t.pnl > 0).length
   const losses = totalTrades - wins
+  const expired = filteredJournal.filter(t => t.status === 'EXPIRED').length
   const winRate = totalTrades > 0 ? (wins / totalTrades) * 100 : 0.0
   const grossProfit = closedTrades.filter(t => t.pnl > 0).reduce((acc, t) => acc + t.pnl, 0.0)
   const grossLoss = Math.abs(closedTrades.filter(t => t.pnl <= 0).reduce((acc, t) => acc + t.pnl, 0.0))
@@ -3862,10 +3815,10 @@ function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, 
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
       <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:8 }}>
-        <MetricBox label="Journal Trades" value={totalTrades} sub={`Wins: ${wins} | Losses: ${losses}`} />
+        <MetricBox label="Journal Trades" value={totalTrades} sub={`Wins: ${wins} | Losses: ${losses}${expired ? ` | ${expired} expired (not counted)` : ''}`} />
         <MetricBox label="Win Rate" value={`${winRate.toFixed(1)}%`} color={winRate >= 50 ? V('green') : V('yellow')} />
         <MetricBox label="Profit Factor" value={profitFactor.toFixed(2)} color={profitFactor >= 1.0 ? V('green') : V('red')} />
-        <MetricBox label="Net PnL" value={fmtPnl(netPnl)} color={clr(netPnl)} />
+        <MetricBox label="Gross P&L" value={fmtPnl(netPnl)} color={clr(netPnl)} sub="before charges" />
       </div>
 
       <Card>
@@ -3921,19 +3874,21 @@ function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, 
           </div>
         </form>
 
+        {(dateError || info.error) && (
+          <div style={{ color:V('red'), fontSize:12, marginBottom:8 }}>{dateError || info.error}</div>
+        )}
         {filteredJournal.length === 0 ? (
           <div style={{ color:V('text-muted'), textAlign:'center', padding:40, fontSize:13 }}>
-            No broker-executed trades found on Dhan for the selected date range.<br/>
-            <span style={{ fontSize:11, color:V('text-muted'), marginTop:4, display:'inline-block' }}>
-              Ensure your Dhan account is connected under configuration.
-            </span>
+            {info.status === 'disconnected' ? 'Dhan is not connected, so broker trades cannot be loaded.'
+              : (!info.status && !info.error) ? 'Loading trades from Dhan… (the first load reads ~4 months of history and can take ~10 s)'
+              : 'No broker-executed trades found on Dhan for the selected date range.'}
           </div>
         ) : (
           <div style={{ overflowX:'auto' }}>
             <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
               <thead>
                 <tr style={{ borderBottom:`1px solid ${V('border')}` }}>
-                  {['Date/Time', 'Status', 'Type', 'Instrument', 'Symbol/Strike', 'Entry px', 'Exit px', 'PnL', 'Exit Reason', 'Model Logic'].map(h => (
+                  {['Entry', 'Status', 'Type', 'Instrument', 'Symbol/Strike', 'Entry px', 'Exit', 'Gross P&L', 'Exit Reason', 'Model Logic'].map(h => (
                     <th key={h} style={{ padding:'8px 10px', textAlign:'left', color:V('text-muted'), fontWeight:600 }}>{h}</th>
                   ))}
                 </tr>
@@ -3964,8 +3919,12 @@ function JournalPanel({ journal, onRefresh, fromDate, toDate, onFromDateChange, 
                         {t.option_strike && <div style={{ fontSize:10, color:V('purple') }}>{strikeStr}</div>}
                       </td>
                       <td style={{ padding:'8px 10px', fontFamily:"'JetBrains Mono', monospace", color:V('text-primary') }}>₹{fmt(t.entry_price)}</td>
-                      <td style={{ padding:'8px 10px', fontFamily:"'JetBrains Mono', monospace", color:V('text-primary') }}>{t.exit_price != null ? `₹${fmt(t.exit_price)}` : '—'}</td>
-                      <td style={{ padding:'8px 10px', fontFamily:"'JetBrains Mono', monospace", color: clr(pnlVal), fontWeight:700 }}>
+                      <td style={{ padding:'8px 10px', color:V('text-primary'), whiteSpace:'nowrap' }}>
+                        <div style={{ fontFamily:"'JetBrains Mono', monospace" }}>{t.exit_price != null ? `₹${fmt(t.exit_price)}` : '—'}</div>
+                        {t.exit_date && <div style={{ fontSize:10, color:V('text-muted') }}>{t.exit_date}{t.exit_time ? ` ${t.exit_time}` : ''}</div>}
+                      </td>
+                      <td style={{ padding:'8px 10px', fontFamily:"'JetBrains Mono', monospace", color: clr(pnlVal), fontWeight:700 }}
+                          title={t.status === 'EXPIRED' ? 'Held to expiry: settled by the exchange, which is not in Dhan trade history -- P&L unknown here' : undefined}>
                         {t.status === 'CLOSED' ? fmtPnl(pnlVal) : '—'}
                       </td>
                       <td style={{ padding:'8px 10px', color:V('text-muted') }}>{t.exit_reason || '—'}</td>
@@ -5998,16 +5957,24 @@ function PerformancePanel({ theme }) {
         <SystemHealthCard />
       </div>
 
+      <div style={{ fontSize:12, color:V('text-muted') }}>
+        {s.source === 'local'
+          ? "Dhan isn't connected — showing the app's own trade journal instead of broker trades."
+          : `Real Dhan trades closed in the last ${s.period_days || 30} days · all instruments${s.instruments?.length ? ` (${s.instruments.join(', ')})` : ''} · gross P&L, before charges · dated by exit.`}
+      </div>
+
       <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:8 }}>
         <MetricBox label="Total Trades" value={s.total_trades} sub={`W:${s.wins} | L:${s.losses}`} />
         <MetricBox label="Win Rate" value={`${s.win_rate}%`} color={s.win_rate >= 50 ? V('green') : V('yellow')} />
         <MetricBox label="Profit Factor" value={s.profit_factor} color={s.profit_factor >= 1.0 ? V('green') : V('red')} />
-        <MetricBox label="Net PnL" value={fmtPnl(s.net_pnl)} color={clr(s.net_pnl)} />
+        <MetricBox label="Gross P&L" value={fmtPnl(s.net_pnl)} color={clr(s.net_pnl)} sub="before charges" />
       </div>
       <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:8 }}>
         <MetricBox label="Avg Win" value={fmtPnl(s.avg_win)} color={V('green')} />
         <MetricBox label="Avg Loss" value={fmtPnl(s.avg_loss)} color={V('red')} />
-        <MetricBox label="Sharpe Ratio" value={s.sharpe_ratio} color={s.sharpe_ratio >= 1 ? V('green') : s.sharpe_ratio >= 0 ? V('yellow') : V('red')} />
+        {s.total_trades >= 20
+          ? <MetricBox label="Sharpe Ratio" value={s.sharpe_ratio} color={s.sharpe_ratio >= 1 ? V('green') : s.sharpe_ratio >= 0 ? V('yellow') : V('red')} />
+          : <MetricBox label="Sharpe Ratio" value="—" color={V('text-muted')} sub={`needs 20+ trades (${s.total_trades} so far)`} />}
         <MetricBox label="Max Drawdown" value={fmtPnl(-s.max_drawdown)} color={V('red')} sub={`${s.max_drawdown_pct}% of capital`} />
       </div>
       <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:8 }}>
@@ -8655,6 +8622,7 @@ export default function App() {
   const [showConnect, setShowConnect] = useState(false)
   const [refreshChart,setRefreshChart]= useState(0)
   const [journal,     setJournal]     = useState([])
+  const [journalInfo, setJournalInfo] = useState({})   // {status, error} from /api/journal
   const [activeTradeSignal, setActiveTradeSignal] = useState(null)
   const [appRunning,    setAppRunning]    = useState(true)
   const [capitalState, setCapitalState] = useState(null)
@@ -8696,6 +8664,9 @@ export default function App() {
     const res = await API.get(`/api/journal?from_date=${fDate}&to_date=${tDate}`).catch(()=>null)
     if (res && res.journal) {
       setJournal(res.journal)
+      setJournalInfo({ status: res.status, error: res.error })
+    } else {
+      setJournalInfo({ error: 'Could not load broker trades from the server.' })
     }
   }, [journalFromDate, journalToDate])
 
@@ -8942,32 +8913,6 @@ export default function App() {
     }
   }, [tab, fetchJournal])
 
-  const mergedSignalEntries = React.useMemo(() => {
-    const list = []
-    const seen = new Set();
-    
-    (sigJournal || []).forEach(e => {
-      const k = `${e.entry_time || e.time}_${e.direction || e.signal}_${e.strategy}`
-      seen.add(k)
-      list.push(e)
-    });
-    
-    (sigHistory || []).forEach(e => {
-      const k = `${e.time || e.entry_time}_${e.signal || e.direction}_${e.strategy}`
-      if (!seen.has(k)) {
-        seen.add(k)
-        list.push({
-          ...e,
-          instrument: e.instrument || instrument,
-          entry_time: e.time || e.entry_time,
-          direction: e.signal || e.direction,
-          status: e.status || (e.signal?.includes('EXIT') ? 'CLOSED' : 'OPEN')
-        })
-      }
-    });
-    
-    return list
-  }, [sigJournal, sigHistory, instrument])
 
   // Options context fetch for Live Trading
 
@@ -9437,12 +9382,9 @@ export default function App() {
 
           {tab === 'sig_journal' && (
             <ErrorBoundary>
-              <SignalJournalPanel entries={mergedSignalEntries} onRefresh={async (filters) => {
+              <SignalJournalPanel entries={sigJournal || []} onRefresh={async () => {
                 const r = await API.get('/api/signal_journal').catch(()=>null)
                 if (r && r.entries) setSigJournal(r.entries)
-                const targetInst = filters?.instrument && filters.instrument !== 'ALL' ? filters.instrument : instrument
-                const h = await API.get(`/api/signal_history?instrument=${targetInst}`).catch(()=>null)
-                if (h && h.signals) setSigHistory(h.signals)
               }} />
             </ErrorBoundary>
           )}
@@ -9462,7 +9404,7 @@ export default function App() {
 
           {tab === 'journal' && (
             <JournalPanel 
-              journal={journal} 
+              journal={journal} info={journalInfo} 
               onRefresh={fetchJournal} 
               fromDate={journalFromDate}
                          toDate={journalToDate}

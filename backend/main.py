@@ -1722,175 +1722,9 @@ async def get_cas_heatmap_endpoint():
 
 @app.delete("/api/signal_journal")
 async def clear_signal_journal_endpoint():
-    signal_journal_manager.clear_journal()
-    logger.info("Signal journal cleared by user request")
-    return {"success": True}
-
-
-def reconstruct_dhan_trades(trades: list) -> list:
-    """
-    Reconstruct open/closed trades from raw Dhan executions using a FIFO/matching algorithm.
-    Correctly maps PUT buying as SHORT market exposure and CALL buying as LONG market exposure.
-    """
-    import re
-
-    def get_time(t):
-        for key in ["createTime", "exchangeTime", "updateTime"]:
-            val = t.get(key)
-            if val and val != "NA":
-                return val
-        return ""
-
-    trades_sorted = sorted(trades, key=get_time)
-
-    from collections import defaultdict
-    by_symbol = defaultdict(list)
-    for t in trades_sorted:
-        sym = t.get("customSymbol") or t.get("tradingSymbol")
-        if sym:
-            by_symbol[sym].append(t)
-
-    reconstructed = []
-
-    def guess_instrument(symbol: str) -> str:
-        s = symbol.upper()
-        if "BANKNIFTY" in s:
-            return "BANKNIFTY"
-        if "FINNIFTY" in s:
-            return "FINNIFTY"
-        if "MIDCPNIFTY" in s:
-            return "MIDCPNIFTY"
-        if "CRUDEOIL" in s:
-            return "CRUDEOIL"
-        if "SENSEX" in s:
-            return "SENSEX"
-        if "NIFTY" in s:
-            return "NIFTY"
-        return "INDEX"
-
-    def parse_contract(symbol: str, tx_type: str):
-        sym_u = symbol.upper()
-        is_put = "PUT" in sym_u or " PE" in sym_u
-        is_call = "CALL" in sym_u or " CE" in sym_u
-
-        opt_type = "PUT" if is_put else ("CALL" if is_call else None)
-        m = re.search(r'\b(\d{4,6})\b', symbol)
-        opt_strike = m.group(1) if m else None
-
-        if is_put:
-            direction = "SHORT" if tx_type == "BUY" else "LONG"
-        elif is_call:
-            direction = "LONG" if tx_type == "BUY" else "SHORT"
-        else:
-            direction = "LONG" if tx_type == "BUY" else "SHORT"
-
-        return direction, opt_type, opt_strike
-
-    for symbol, sym_trades in by_symbol.items():
-        active = None
-
-        for t_exec in sym_trades:
-            qty = int(t_exec.get("tradedQuantity", 0) or t_exec.get("quantity", 0) or 0)
-            if qty <= 0:
-                continue
-            price = float(t_exec.get("tradedPrice", 0.0) or t_exec.get("price", 0.0) or 0.0)
-            tx_type = (t_exec.get("transactionType") or t_exec.get("type") or "").upper()
-            if not tx_type:
-                continue
-
-            time_str = get_time(t_exec)
-            parts = time_str.split("T") if "T" in time_str else time_str.split(" ")
-            date_part = parts[0] if len(parts) > 0 else ""
-            time_part = parts[1] if len(parts) > 1 else ""
-
-            etid = t_exec.get("exchangeTradeId") or t_exec.get("tradeId")
-            trade_id = etid if etid and etid != "0" else f"DHAN_{t_exec.get('orderId')}_{tx_type}"
-
-            direction, opt_type, opt_strike = parse_contract(symbol, tx_type)
-
-            if active is None:
-                active = {
-                    "trade_id": trade_id,
-                    "status": "OPEN",
-                    "instrument": guess_instrument(symbol),
-                    "symbol": symbol,
-                    "direction": direction,
-                    "open_tx_type": tx_type,
-                    "option_type": opt_type,
-                    "option_strike": opt_strike,
-                    "qty": qty,
-                    "entry_date": date_part,
-                    "entry_time": time_part,
-                    "entry_price": price,
-                    "exit_price": None,
-                    "exit_time": None,
-                    "exit_reason": None,
-                    "pnl": None,
-                    "reasons": []
-                }
-            else:
-                # Active position exists. Check if this execution closes or adds to the position.
-                if active["open_tx_type"] == tx_type:
-                    # Same order type: scale up position
-                    total_qty = active["qty"] + qty
-                    active["entry_price"] = round(((active["entry_price"] * active["qty"]) + (price * qty)) / total_qty, 2)
-                    active["qty"] = total_qty
-                else:
-                    # Opposite order type: close or reduce position
-                    closed_qty = min(qty, active["qty"])
-                    if active["open_tx_type"] == "BUY":
-                        pnl = round((price - active["entry_price"]) * closed_qty, 2)
-                    else:
-                        pnl = round((active["entry_price"] - price) * closed_qty, 2)
-
-                    if qty >= active["qty"]:
-                        active["status"] = "CLOSED"
-                        active["exit_price"] = price
-                        active["exit_time"] = time_part
-                        active["pnl"] = pnl
-                        active["exit_reason"] = "DHAN_CLOSED"
-                        reconstructed.append(active)
-
-                        rem_qty = qty - closed_qty
-                        if rem_qty > 0:
-                            # Flipped position
-                            active = {
-                                "trade_id": trade_id,
-                                "status": "OPEN",
-                                "instrument": guess_instrument(symbol),
-                                "symbol": symbol,
-                                "direction": direction,
-                                "open_tx_type": tx_type,
-                                "option_type": opt_type,
-                                "option_strike": opt_strike,
-                                "qty": rem_qty,
-                                "entry_date": date_part,
-                                "entry_time": time_part,
-                                "entry_price": price,
-                                "exit_price": None,
-                                "exit_time": None,
-                                "exit_reason": None,
-                                "pnl": None,
-                                "reasons": []
-                            }
-                        else:
-                            active = None
-                    else:
-                        closed_part = active.copy()
-                        closed_part["qty"] = closed_qty
-                        closed_part["status"] = "CLOSED"
-                        closed_part["exit_price"] = price
-                        closed_part["exit_time"] = time_part
-                        closed_part["pnl"] = pnl
-                        closed_part["exit_reason"] = "DHAN_PARTIAL_CLOSE"
-                        reconstructed.append(closed_part)
-                        active["qty"] -= closed_qty
-
-        if active is not None:
-            reconstructed.append(active)
-
-    return reconstructed
-
+    kept = signal_journal_manager.clear_journal()
+    logger.info(f"Signal journal cleared by user request ({kept} open entries kept)")
+    return {"success": True, "kept_open": kept}
 
 
 def align_with_strategy_journal(reconstructed_trades: list) -> list:
@@ -1954,81 +1788,41 @@ def align_with_strategy_journal(reconstructed_trades: list) -> list:
 
 @app.get("/api/journal")
 async def get_journal(from_date: Optional[str] = None, to_date: Optional[str] = None):
-    """Fetch actual broker-executed trades from Dhan API. Fallbacks to empty if disconnected."""
+    """Real trades from Dhan's trade history (dhan_trades.py), enriched with the strategy's
+    reasons. Trades overlapping the range are returned, incl. ones opened before it."""
     try:
         if not broker.is_connected():
             return {
                 "journal": [],
                 "status": "disconnected",
-                "error": "Connect to Dhan broker to view actual broker execution logs."
+                "error": "Dhan is not connected -- connect it to see broker trades."
             }
-            
+
         from datetime import timedelta
-        
-        # Calculate defaults: today + last 7 days
+        import dhan_trades
+
+        # Default range: last 7 days
         now_ist = datetime.now(_IST)
         if not from_date:
             from_date = (now_ist - timedelta(days=7)).strftime("%Y-%m-%d")
         if not to_date:
             to_date = now_ist.strftime("%Y-%m-%d")
-            
-        # Fetch trades from history
-        logger.info(f"get_journal: from_date={from_date}, to_date={to_date}")
-        hist_trades = broker.get_trade_history(from_date, to_date) if hasattr(broker, "get_trade_history") else []
-        logger.info(f"get_journal: hist_trades count = {len(hist_trades)}")
-        
-        # Fetch trades from today's book
-        today_trades = broker.get_trade_book() if hasattr(broker, "get_trade_book") else []
-        logger.info(f"get_journal: today_trades count = {len(today_trades)}")
-        
-        # Combine and deduplicate
-        all_execs = {}
-        for idx, t in enumerate(hist_trades + today_trades):
-            etid = t.get("exchangeTradeId") or t.get("tradeId")
-            tx_type = t.get("transactionType") or t.get("type") or ""
-            px = t.get("tradedPrice") or t.get("price") or 0.0
-            order_id = t.get("orderId") or ""
-            if etid and etid != "0":
-                trade_key = etid
-            else:
-                trade_key = f"{order_id}_{tx_type}_{px}_{idx}"
-            all_execs[trade_key] = t
-                
-        # Reconstruct closed/open trades
-        reconstructed = reconstruct_dhan_trades(list(all_execs.values()))
-        logger.info(f"get_journal: reconstructed count = {len(reconstructed)}")
-        
-        # Enrich with strategy journal reasons
-        enriched = align_with_strategy_journal(reconstructed)
-        
+        if from_date > to_date:
+            return {"journal": [], "status": "connected", "from_date": from_date, "to_date": to_date,
+                    "error": "The From date is after the To date."}
 
-        # Sort oldest first (chronological)
-        def sort_key(t):
-            d = t.get("entry_date", "")
-            tm = t.get("entry_time", "")
-            return f"{d} {tm}"
-
-        enriched_sorted = sorted(enriched, key=sort_key)
-
-        # Filter by requested date range
-        filtered_journal = []
-        for t in enriched_sorted:
-            ed = t.get("entry_date") or ""
-            if not ed and t.get("entry_time"):
-                ed = str(t.get("entry_time")).split("T")[0].split(" ")[0]
-            if from_date and ed and ed.strip() < from_date.strip():
-                continue
-            if to_date and ed and ed.strip() > to_date.strip():
-                continue
-            filtered_journal.append(t)
+        # Off the event loop: the Dhan call is a blocking HTTP request.
+        trades = await asyncio.to_thread(dhan_trades.fetch_trades, from_date, to_date)
+        enriched = align_with_strategy_journal(trades)
+        enriched.sort(key=lambda t: f"{t.get('entry_date', '')} {t.get('entry_time', '')}")  # oldest first
 
         return {
-            "journal": filtered_journal,
+            "journal": enriched,
             "status": "connected",
             "from_date": from_date,
             "to_date": to_date
         }
-        
+
     except Exception as e:
         logger.error(f"Error loading broker journal: {e}")
         return {"journal": [], "error": str(e)}
@@ -2359,7 +2153,19 @@ async def startup_event():
 
     # Mark app as running for watchdog crash detection
     try:
-        save_app_state("RUNNING", "Started normally")
+        # Keep the watchdog's "Started by watchdog" note when it launched this process (it
+        # writes it just before starting the app); overwriting it made the Performance page's
+        # System Health card show "Watchdog: Off" while the watchdog was running.
+        _details = "Started normally"
+        try:
+            from watchdog import check_last_state
+            _prev = check_last_state()
+            _prev_age = (datetime.now(_IST) - datetime.fromisoformat(_prev.get("time", ""))).total_seconds()
+            if str(_prev.get("details", "")).startswith("Started by watchdog") and _prev_age < 300:
+                _details = _prev["details"]
+        except Exception:
+            pass
+        save_app_state("RUNNING", _details)
         write_heartbeat()
     except Exception:
         pass
@@ -2654,7 +2460,7 @@ def _check_virtual_exits(ltp: float, cfg, frames=None, latest_candle_ts: str = N
                     "exit_reason": exit_reason,
                     "pnl_pts":     pnl_pts,
                     "pnl_inr":     pnl_inr,
-                    "status":      "WIN" if pnl_pts > 0 else "LOSS",
+                    "status":      "WIN" if pnl_pts > 0 else ("LOSS" if pnl_pts < 0 else "FLAT"),
                 })
                 journal_modified = True
 

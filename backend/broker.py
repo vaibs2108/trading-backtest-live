@@ -1848,16 +1848,20 @@ def get_trade_history(from_date: str, to_date: str) -> list:
     if not _connected or _dhan_client is None:
         return []
     try:
-        # Fetch first page. If more pagination is needed, we loop up to 5 pages.
+        # Dhan returns 20 executions per page, newest first. This used to stop after the
+        # first page whenever a page held fewer than 100, so only the newest 20 executions
+        # were ever seen. Read pages until a short/empty one (capped at 60 pages = 1,200).
+        # Own rate-limit category: never delays order / price / position calls.
         all_trades = []
-        for page in range(5):
-            res = _dhan_client.get_trade_history(from_date=from_date, to_date=to_date, page_number=page)
+        for page in range(60):
+            res = dhan_api_call("trade_history", _dhan_client.get_trade_history,
+                                from_date=from_date, to_date=to_date, page_number=page)
             if isinstance(res, dict) and res.get("status") == "success" and "data" in res:
                 data = res["data"]
                 if not data or not isinstance(data, list):
                     break
                 all_trades.extend(data)
-                if len(data) < 100: # assuming max page size is 100
+                if len(data) < 20:
                     break
             else:
                 break

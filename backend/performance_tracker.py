@@ -106,180 +106,34 @@ def get_dhan_closed_positions(target_instrument: str) -> list:
         return []
 
 
-def get_dhan_reconstructed_trades(target_instrument: str, days: int = 30) -> list:
-    """
-    Fetch raw trades from Dhan (both today's book and history) and reconstruct them into closed/open trades.
-    Filters by the target_instrument.
-    """
-    import broker
-    from datetime import datetime, timedelta
-    import pytz
-    
-    if not broker.is_connected():
-        return []
-        
+PERIOD_DAYS = 30   # Performance covers trades CLOSED in the last 30 days, all instruments
+
+
+def get_dhan_reconstructed_trades(days: int = PERIOD_DAYS) -> list:
+    """Real Dhan trades (dhan_trades.py) closed in the last `days` days, all instruments."""
+    import dhan_trades
+    from datetime import timedelta
     try:
-        _IST = pytz.timezone("Asia/Kolkata")
         now_ist = datetime.now(_IST)
         from_date = (now_ist - timedelta(days=days)).strftime("%Y-%m-%d")
         to_date = now_ist.strftime("%Y-%m-%d")
-        
-        hist_trades = broker.get_trade_history(from_date, to_date) if hasattr(broker, "get_trade_history") else []
-        today_trades = broker.get_trade_book() if hasattr(broker, "get_trade_book") else []
-        
-        # Combine and deduplicate
-        all_execs = {}
-        for idx, t in enumerate(hist_trades + today_trades):
-            etid = t.get("exchangeTradeId") or t.get("tradeId")
-            tx_type = t.get("transactionType") or t.get("type") or ""
-            px = t.get("tradedPrice") or t.get("price") or 0.0
-            order_id = t.get("orderId") or ""
-            if etid and etid != "0":
-                trade_key = etid
-            else:
-                trade_key = f"{order_id}_{tx_type}_{px}_{idx}"
-            all_execs[trade_key] = t
-            
-        # Reconstruct closed/open trades
-        raw_list = list(all_execs.values())
-        
-        def get_time(t):
-            for key in ["createTime", "exchangeTime", "updateTime"]:
-                val = t.get(key)
-                if val and val != "NA":
-                    return val
-            return ""
-            
-        trades_sorted = sorted(raw_list, key=get_time)
-        
-        from collections import defaultdict
-        by_symbol = defaultdict(list)
-        for t in trades_sorted:
-            sym = t.get("customSymbol") or t.get("tradingSymbol")
-            if sym:
-                by_symbol[sym].append(t)
-                
-        reconstructed = []
-        
-        # Helper to guess instrument from symbol
-        def guess_instrument(symbol: str) -> str:
-            s = symbol.upper()
-            if "BANKNIFTY" in s:
-                return "BANKNIFTY"
-            if "FINNIFTY" in s:
-                return "FINNIFTY"
-            if "MIDCPNIFTY" in s:
-                return "MIDCPNIFTY"
-            if "CRUDEOIL" in s:
-                return "CRUDEOIL"
-            if "NIFTY" in s:
-                return "NIFTY"
-            return "INDEX"
-            
-        for symbol, sym_trades in by_symbol.items():
-            active = None
-            for t_exec in sym_trades:
-                qty = int(t_exec.get("tradedQuantity", 0) or t_exec.get("quantity", 0) or 0)
-                if qty <= 0:
-                    continue
-                price = float(t_exec.get("tradedPrice", 0.0) or t_exec.get("price", 0.0) or 0.0)
-                tx_type = (t_exec.get("transactionType") or t_exec.get("type") or "").upper()
-                if not tx_type:
-                    continue
-                    
-                time_str = get_time(t_exec)
-                if "T" in time_str:
-                    parts = time_str.split("T")
-                else:
-                    parts = time_str.split(" ")
-                date_part = parts[0] if len(parts) > 0 else ""
-                time_part = parts[1] if len(parts) > 1 else ""
-                
-                etid = t_exec.get("exchangeTradeId") or t_exec.get("tradeId")
-                if etid and etid != "0":
-                    trade_id = etid
-                else:
-                    trade_id = f"DHAN_{t_exec.get('orderId')}_{tx_type}"
-                    
-                direction = "LONG" if tx_type == "BUY" else "SHORT"
-                
-                if active is None:
-                    active = {
-                        "trade_id": trade_id,
-                        "status": "OPEN",
-                        "instrument": guess_instrument(symbol),
-                        "symbol": symbol,
-                        "direction": direction,
-                        "qty": qty,
-                        "entry_date": date_part,
-                        "entry_time": time_part,
-                        "entry_price": price,
-                        "exit_price": None,
-                        "exit_time": None,
-                        "exit_reason": None,
-                        "pnl": None
-                    }
-                else:
-                    if active["direction"] == direction:
-                        total_qty = active["qty"] + qty
-                        active["entry_price"] = round(((active["entry_price"] * active["qty"]) + (price * qty)) / total_qty, 2)
-                        active["qty"] = total_qty
-                    else:
-                        if qty >= active["qty"]:
-                            closed_qty = active["qty"]
-                            pnl = round((price - active["entry_price"]) * closed_qty, 2) if active["direction"] == "LONG" else round((active["entry_price"] - price) * closed_qty, 2)
-                            active["status"] = "CLOSED"
-                            active["exit_price"] = price
-                            active["exit_time"] = time_part
-                            active["pnl"] = pnl
-                            active["exit_reason"] = "DHAN_CLOSED"
-                            reconstructed.append(active)
-                            
-                            rem_qty = qty - closed_qty
-                            if rem_qty > 0:
-                                active = {
-                                    "trade_id": trade_id,
-                                    "status": "OPEN",
-                                    "instrument": guess_instrument(symbol),
-                                    "symbol": symbol,
-                                    "direction": direction,
-                                    "qty": rem_qty,
-                                    "entry_date": date_part,
-                                    "entry_time": time_part,
-                                    "entry_price": price,
-                                    "exit_price": None,
-                                    "exit_time": None,
-                                    "exit_reason": None,
-                                    "pnl": None
-                                }
-                            else:
-                                active = None
-                        else:
-                            pnl = round((price - active["entry_price"]) * qty, 2) if active["direction"] == "LONG" else round((active["entry_price"] - price) * qty, 2)
-                            closed_part = active.copy()
-                            closed_part["qty"] = qty
-                            closed_part["status"] = "CLOSED"
-                            closed_part["exit_price"] = price
-                            closed_part["exit_time"] = time_part
-                            closed_part["pnl"] = pnl
-                            closed_part["exit_reason"] = "DHAN_PARTIAL_CLOSE"
-                            reconstructed.append(closed_part)
-                            active["qty"] -= qty
-                            
-            if active is not None:
-                reconstructed.append(active)
-                
-        # Filter by target_instrument
-        inst_upper = target_instrument.upper()
-        filtered = [
-            t for t in reconstructed
-            if inst_upper in t.get("symbol", "").upper() or inst_upper in t.get("instrument", "").upper()
-        ]
-        return filtered
-        
+        trades = dhan_trades.fetch_trades(from_date, to_date)
+        return [t for t in trades if t.get("exit_date") and t["exit_date"] >= from_date]
     except Exception as e:
-        logger.error(f"Error getting reconstructed Dhan trades for performance: {e}")
+        logger.error(f"Error getting Dhan trades for performance: {e}")
         return []
+
+
+def _exit_ts(t: dict) -> str:
+    """Full exit timestamp for ordering ('YYYY-MM-DD HH:MM:SS'); exit_time alone is only the
+    time of day, which put trades from different days in the wrong order."""
+    if t.get("exit_date"):
+        return f"{t['exit_date']} {t.get('exit_time') or ''}"
+    return str(t.get("exit_time") or t.get("entry_timestamp") or "").replace("T", " ")
+
+
+def _exit_date(t: dict) -> str:
+    return t.get("exit_date") or _exit_ts(t)[:10] or t.get("entry_date", "unknown")
 
 
 def compute_metrics(starting_capital: float = 50000.0) -> dict:
@@ -290,7 +144,6 @@ def compute_metrics(starting_capital: float = 50000.0) -> dict:
     from journal_manager import load_journal
     from capital_tracker import get_capital_tracker
     import broker
-    from config import get_settings
 
     ct = get_capital_tracker()
     starting_capital = ct.starting_capital
@@ -305,26 +158,25 @@ def compute_metrics(starting_capital: float = 50000.0) -> dict:
         except Exception:
             pass
 
-    cfg = get_settings()
-    target_instrument = cfg.instrument
-
+    # All instruments (it used to show only the instrument selected on Live Trading).
     if broker_connected:
-        # Load actual trades from Dhan (today's book + history)
-        dhan_trades = get_dhan_reconstructed_trades(target_instrument, days=30)
+        # Real trades from Dhan, closed in the last PERIOD_DAYS days
+        dhan_trades = get_dhan_reconstructed_trades()
         closed = [t for t in dhan_trades if t.get("status") == "CLOSED"]
+        source = "dhan"
     else:
         journal = load_journal()
-        local_closed = [
-            e for e in journal 
-            if e.get("status") == "CLOSED" 
+        closed = [
+            e for e in journal
+            if e.get("status") == "CLOSED"
             and e.get("pnl") is not None
-            and e.get("instrument") == target_instrument
         ]
-        closed = local_closed
+        source = "local"
 
     if not closed:
         summary = _empty_summary(starting_capital)
         summary["current_equity"] = round(actual_current_equity, 2)
+        summary.update(source=source, period_days=PERIOD_DAYS, instruments=[])
         return {
             "summary": summary,
             "equity_curve": [],
@@ -333,8 +185,8 @@ def compute_metrics(starting_capital: float = 50000.0) -> dict:
             "trade_count": 0,
         }
 
-    # Sort by exit time
-    closed.sort(key=lambda e: e.get("exit_time") or e.get("entry_timestamp", ""))
+    # Sort by full exit timestamp (date + time)
+    closed.sort(key=_exit_ts)
 
     # -- Equity curve (cumulative per trade) --
     equity_curve = []
@@ -377,7 +229,7 @@ def compute_metrics(starting_capital: float = 50000.0) -> dict:
         equity_curve.append({
             "trade_num": len(equity_curve) + 1,
             "time": t.get("exit_time") or t.get("entry_timestamp", ""),
-            "date": t.get("entry_date", ""),
+            "date": _exit_date(t),
             "pnl": round(pnl, 2),
             "cumulative_pnl": round(cumulative, 2),
             "equity": round(equity, 2),
@@ -430,12 +282,15 @@ def compute_metrics(starting_capital: float = 50000.0) -> dict:
         "max_consec_losses": max_consec_l,
         "starting_capital": starting_capital,
         "current_equity": round(actual_current_equity, 2),
+        "source": source,
+        "period_days": PERIOD_DAYS,
+        "instruments": sorted({t.get("instrument") for t in closed if t.get("instrument")}),
     }
 
-    # -- Daily breakdown --
+    # -- Daily breakdown (by exit date: the day the P&L was realised) --
     daily = {}
     for t in closed:
-        d = t.get("entry_date", "unknown")
+        d = _exit_date(t)
         if d not in daily:
             daily[d] = {"date": d, "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0}
         daily[d]["trades"] += 1
