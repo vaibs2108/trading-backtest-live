@@ -207,6 +207,9 @@ class Settings(BaseSettings):
     # (15 expiry days, 20 Aug - 1 Oct) showed it sees spike zones (~3x chance) but buying its
     # alerts lost money (-9.6% per trade vs ~0% for random options). Alerts stay on the CAS page.
     cas_mode_c_telegram: bool = False
+    # PAPER forward test (2026-10-04, your request): "14:45 expiry squeeze" on NIFTY / BANKNIFTY / SENSEX,
+    # rules frozen as reviewed (cas_paper_squeeze.py). Telegram + CAS page only, never an order.
+    cas_paper_squeeze_enabled: bool = True
     cas_index_opening_range_minutes: float = 20.0   # Mode C: stays fully idle this long after the 09:15 open
     cas_index_min_accumulated_volume: float = 500.0  # Mode C: floor on the zero-baseline-OI path only -- a first estimate, not benchmarked, tune from real data
 

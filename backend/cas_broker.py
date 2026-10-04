@@ -143,6 +143,32 @@ def traded_today(today_str: str) -> Optional[bool]:
         return None
 
 
+def index_minute_closes(security_id: int, day: str) -> Optional[dict]:
+    """1-minute closes of an index for `day` as {"HH:MM": close} (bar start time, IST), or None if
+    the call failed. Historical-data API, not the option-chain budget. Used by the paper squeeze."""
+    if not _connected or _dhan_client is None:
+        return None
+    try:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        nxt = (_dt.strptime(day, "%Y-%m-%d") + _td(days=1)).strftime("%Y-%m-%d")
+        res = _dhan_client.intraday_minute_data(security_id=str(security_id), exchange_segment="IDX_I",
+                                                instrument_type="INDEX", from_date=day, to_date=nxt, interval=1)
+        if not isinstance(res, dict) or res.get("status") != "success":
+            return None
+        data = res.get("data") or {}
+        ts, cl = data.get("timestamp") or [], data.get("close") or []
+        ist = _tz(_td(hours=5, minutes=30))
+        out = {}
+        for t, c in zip(ts, cl):
+            d = _dt.fromtimestamp(t, ist)
+            if d.date().isoformat() == day:
+                out[d.strftime("%H:%M")] = c
+        return out
+    except Exception as e:
+        logger.debug(f"CAS scanner: index minute data failed for {security_id}: {e}")
+        return None
+
+
 # Last failure reason per call, exposed so _sweep_once can aggregate WHY
 # fetches failed into its summary instead of just a bare count -- found the
 # hard way (2026-08-26) that "status != success" and exceptions were both

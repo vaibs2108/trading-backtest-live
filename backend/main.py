@@ -1750,6 +1750,14 @@ async def get_cas_status_endpoint():
     }
 
 
+@app.get("/api/cas_paper")
+async def get_cas_paper_endpoint():
+    """CAS Mode C PAPER strategy (14:45 expiry squeeze): every evaluation + running stats."""
+    import cas_paper_squeeze
+    cfg = get_settings()
+    return {"enabled": bool(getattr(cfg, "cas_paper_squeeze_enabled", False)), **cas_paper_squeeze.get_state()}
+
+
 @app.get("/api/cas_heatmap")
 async def get_cas_heatmap_endpoint():
     """CAS scanner Mode B: per-underlying heatmap over the full F&O universe,

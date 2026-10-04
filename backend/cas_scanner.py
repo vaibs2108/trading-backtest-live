@@ -1345,6 +1345,13 @@ def _index_run():
     while _running:
         try:
             cfg = get_settings()
+            # PAPER "14:45 expiry squeeze" -- independent of Mode C's own alerts/Telegram switches
+            if cfg.cas_scanner_enabled and getattr(cfg, "cas_paper_squeeze_enabled", False) and _market_open(_now_ist()):
+                try:
+                    import cas_paper_squeeze
+                    cas_paper_squeeze.tick(_send_telegram, _broadcast)
+                except Exception as e:
+                    logger.error(f"CAS paper squeeze error: {e}", exc_info=True)
             if cfg.cas_scanner_enabled and cfg.cas_mode_c_enabled:
                 now_wall = _time.time()
                 if now_wall - last_index_sweep >= cfg.cas_index_sweep_seconds:

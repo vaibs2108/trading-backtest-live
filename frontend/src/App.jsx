@@ -1901,6 +1901,68 @@ function CasStatusBar({ st }) {
   )
 }
 
+// PAPER strategy (Mode C): "14:45 expiry squeeze" -- forward test, never places orders (cas_paper_squeeze.py)
+function CasPaperSection() {
+  const [d, setD] = useState(null)
+  useEffect(() => {
+    const load = () => API.get('/api/cas_paper').then(setD).catch(() => {})
+    load()
+    const id = setInterval(load, 15000)
+    return () => clearInterval(id)
+  }, [])
+  if (!d) return null
+  const s = d.stats || {}
+  const th = { textAlign:'left', padding:'6px 8px', color:V('text-muted'), fontSize:11, borderBottom:`1px solid ${V('border')}`, whiteSpace:'nowrap' }
+  const td = { padding:'6px 8px', fontSize:12, borderBottom:`1px solid ${V('border-light')}`, whiteSpace:'nowrap' }
+  const statusColor = r => r.status === 'OPEN' ? V('yellow') : r.status === 'NO_TRADE' ? V('text-muted') : (r.return_pct > 0 ? V('green') : V('red'))
+  const reasonLabel = { STOP:'stop hit', TRAIL:'trailing stop', STAGNANT:'15:15, under +8%', TIME:'15:25 exit' }
+  return (
+    <Card>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:8 }}>
+        <div style={{ color:V('text-primary'), fontWeight:700, fontSize:15 }}>Paper strategy — 14:45 expiry squeeze</div>
+        <Badge label={d.enabled ? 'PAPER · no orders' : 'OFF'} color={d.enabled ? V('accent') : V('text-muted')} />
+      </div>
+      <div style={{ color:V('text-muted'), fontSize:12, margin:'6px 0 12px', lineHeight:1.5 }}>
+        NIFTY · BANKNIFTY · SENSEX, on each index's expiry day. At 14:45, if the day's trend and the last 15 minutes agree,
+        buy the 1-strike in-the-money option at 14:46 (skip under ₹8). No stop until +20% (then entry +7.5%); from +35% trail 15% below the peak;
+        exit 15:15 if still under +8%, otherwise by 15:25. Paper P&L after 3% slippage each side, 1 lot.
+        Backtest: Jan 2025–Oct 2026 +6.9%/trade, but unseen Jun–Dec 2024 −0.9% — this is a forward test, not a proven edge.
+      </div>
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(5, minmax(0,1fr))', gap:8, marginBottom:12 }}>
+        <MetricBox label="Paper trades" value={s.trades ?? 0} />
+        <MetricBox label="Win rate" value={s.trades ? `${Math.round(s.wins / s.trades * 100)}%` : '—'} sub={s.trades ? `${s.wins}W / ${s.trades - s.wins}L` : undefined} />
+        <MetricBox label="Avg return" value={s.avg_return_pct != null ? `${s.avg_return_pct > 0 ? '+' : ''}${s.avg_return_pct}%` : '—'} color={clr(s.avg_return_pct)} sub="per trade, after slippage" />
+        <MetricBox label="Paper P&L" value={fmtPnl(s.rupees || 0)} color={clr(s.rupees)} sub="1 lot each" />
+        <MetricBox label="No-trade days" value={s.no_trade_days ?? 0} sub="signal didn't agree" />
+      </div>
+      {(d.trades || []).length === 0 ? (
+        <div style={{ color:V('text-muted'), fontSize:12, textAlign:'center', padding:16 }}>
+          Nothing yet — it runs at 14:46 on each index's expiry day (Telegram alerts on entry, break-even lock and exit).
+        </div>
+      ) : (
+        <div style={{ overflowX:'auto' }}>
+          <table style={{ width:'100%', borderCollapse:'collapse' }}>
+            <thead><tr>{['Date','Index','Result','Contract','Entry','Stop / peak','Exit','Return','₹ (1 lot)'].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
+            <tbody>{d.trades.map((r, i) => (
+              <tr key={i}>
+                <td style={td}>{r.date}</td>
+                <td style={td}>{r.index}</td>
+                <td style={{ ...td, color: statusColor(r), fontWeight:600 }}>{r.status === 'NO_TRADE' ? 'No trade' : r.status === 'OPEN' ? 'Open' : (r.return_pct > 0 ? 'Win' : 'Loss')}</td>
+                <td style={td}>{r.status === 'NO_TRADE' ? <span style={{ color:V('text-muted') }}>{r.reason}</span> : `${r.strike} ${r.side} (1 ITM, lot ${r.lot})`}</td>
+                <td style={td}>{r.entry_price != null ? `${r.entry_time?.slice(0,5)} @ ₹${r.entry_price}` : '—'}</td>
+                <td style={td}>{r.status === 'OPEN' ? `${r.stop ? `₹${Number(r.stop).toFixed(1)}` : 'none yet'} / ₹${r.peak}` : (r.peak ? `peak ₹${r.peak}` : '—')}</td>
+                <td style={td}>{r.exit_price != null ? `${r.exit_time?.slice(0,5)} @ ₹${r.exit_price} (${reasonLabel[r.exit_reason] || r.exit_reason})` : '—'}</td>
+                <td style={{ ...td, color: clr(r.return_pct), fontWeight:600 }}>{r.return_pct != null ? `${r.return_pct > 0 ? '+' : ''}${r.return_pct}%` : '—'}</td>
+                <td style={{ ...td, color: clr(r.rupees) }}>{r.rupees != null ? fmtPnl(r.rupees) : '—'}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  )
+}
+
 function CasAlertsPage({ alertsA, alertsB, alertsC, atRisk, undercurrent, heatmap }) {
   const [subTab, setSubTab] = useState('alerts')
   const m = window.innerWidth < 768
@@ -1922,6 +1984,7 @@ function CasAlertsPage({ alertsA, alertsB, alertsC, atRisk, undercurrent, heatma
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
       <CasStatusBar st={casStatus} />
+      <CasPaperSection />
       <div style={{ display:'flex', gap:8 }}>
         <div style={pillStyle(subTab === 'alerts')} onClick={() => setSubTab('alerts')}>Alerts</div>
         <div style={pillStyle(subTab === 'heatmap')} onClick={() => setSubTab('heatmap')}>Heatmap</div>
