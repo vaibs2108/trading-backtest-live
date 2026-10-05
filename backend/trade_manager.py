@@ -184,14 +184,21 @@ class TradeManager:
             # 2026-08-25: a real T2 exit reported +Rs.8.5L on a position
             # whose own option premium hadn't moved between entry and exit).
             _use_t1_split = pos.t1_hit and pos.trade_mode != "OPTIONS"
-            if pos.direction == "LONG":
+            if pos.trade_mode == "OPTIONS":
+                # Options are always BOUGHT (CE for LONG, PE for SHORT): premium up = profit for
+                # both. Found live 2026-10-05: a SHORT (bought 55100 PE, 902.75 -> 843.90) was
+                # booked +Rs 1,755 instead of -Rs 1,765.50 because SHORT used (entry - exit).
+                t1p = 0
+                rp  = (exit_price - pos.entry_price) * pos.qty
+            elif pos.direction == "LONG":
                 t1p = (pos.target1 - pos.entry_price) * int(pos.qty*0.5) if _use_t1_split else 0
                 rp  = (exit_price - pos.entry_price) * (pos.qty - int(pos.qty*0.5) if _use_t1_split else pos.qty)
             else:
                 t1p = (pos.entry_price - pos.target1) * int(pos.qty*0.5) if _use_t1_split else 0
                 rp  = (pos.entry_price - exit_price) * (pos.qty - int(pos.qty*0.5) if _use_t1_split else pos.qty)
-            cost = (pos.entry_price + exit_price) * pos.qty * 0.0002
-            pnl  = t1p + rp - cost
+            # GROSS P&L only (your rule): the hidden 0.02% "cost" deduction was removed 2026-10-05
+            # (it made -2,292 show as -2,306 and +1,765.5 as +1,755).
+            pnl  = t1p + rp
 
         trade_rec = {
             "time":        pos.entry_time,
@@ -221,7 +228,8 @@ class TradeManager:
         if self.position is None:
             return
         pos = self.position
-        if pos.direction == "LONG":
+        if pos.trade_mode == "OPTIONS" or pos.direction == "LONG":
+            # bought option (CE or PE) or long index/futures: price up = profit
             pos.current_pnl = (current_price - pos.entry_price) * pos.qty
         else:
             pos.current_pnl = (pos.entry_price - current_price) * pos.qty

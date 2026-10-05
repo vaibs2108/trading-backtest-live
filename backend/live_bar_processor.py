@@ -341,16 +341,25 @@ class BacktestDiffProcessor:
             self.last_processed_ts = last_bar.get("timestamp")
 
         # ── First call: snapshot state, suppress signals ──
-        # Track _prev_open_key for diff detection but do NOT set
-        # self.position — we only show positions from actual new signals,
-        # never from inherited backtest state (avoids phantom positions).
+        # 2026-10-05 (your rule: a carry-forward position is one continuous trade, as the chart
+        # shows it): the strategy's open trade is its CURRENT position from the first call --
+        # no entry signal is emitted for it. The old check `not t.get("exit_time")` never matched
+        # (an open trade's exit_time is "-", see the note in the diff loop below), so init always
+        # logged open_key=no, the tile said HOLD after every restart, and the position appeared
+        # silently on the 2nd evaluation (or never, after hours).
         if not self._initialised:
             self._initialised = True
             self._prev_trade_keys = {(t["direction"], t["entry_time"]) for t in bt_trades}
             self._prev_open_key = None
             for t in reversed(bt_trades):
-                if t.get("exit_reason") == "OPEN" and not t.get("exit_time"):
+                if t.get("exit_reason") == "OPEN":
                     self._prev_open_key = (t["direction"], t["entry_time"])
+                    self.position = t["direction"]
+                    self.entry_price = t.get("entry_price", 0)
+                    self.sl = t.get("sl", 0)
+                    self.target1 = t.get("target1", 0)
+                    self.target2 = t.get("target2", 0)
+                    self.trade_source = t.get("source", "REGIME")
                     break
             logger.info(
                 f"[{self.strategy_id}] Initialised from backtest: "

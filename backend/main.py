@@ -596,8 +596,9 @@ def _get_active_entries(cfg, tm) -> dict:
             "rr_t1": _active_trade_signal.get("rr_t1", 0.0) if _active_trade_signal else 0.0,
             "entry_quality": _active_trade_signal.get("entry_quality", 0.0) if _active_trade_signal else 0.0,
         }
-    else:
-        active_entries.pop(cfg.strategy, None)
+    # else: keep the strategy's own OPEN journal entry. It used to be dropped whenever the app's
+    # position slot held something else -- 2026-10-05 your manual DHAN_SYNC 54500 CE made Option B's
+    # tile say HOLD while Option B was LONG since 13:45 (chart correct, tile wrong).
 
     return active_entries
 
