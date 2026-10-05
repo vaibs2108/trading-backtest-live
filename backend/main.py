@@ -2248,7 +2248,8 @@ async def startup_event():
                     (datetime.now(_IST) - timedelta(days=5)).strftime("%Y-%m-%d"),
                     (datetime.now(_IST) + timedelta(days=1)).strftime("%Y-%m-%d"))
                 _seed_time.sleep(1)
-                _feed.seed_candles(_hist_5m, _hist_1m)
+                _feed.seed_candles(_drop_unready_bars(_hist_5m, 5, cfg.instrument),
+                                   _drop_unready_bars(_hist_1m, 1, cfg.instrument))
             except Exception as _seed_err:
                 logger.warning(f"Could not seed live feed candles: {_seed_err}")
             _feed.start(cfg.dhan_client_code, cfg.dhan_access_token)
@@ -2671,7 +2672,8 @@ async def _ensure_live_feed(cfg, now_ist):
             broker.get_historical_data, cfg.instrument, "1",
             (now_ist - timedelta(days=5)).strftime("%Y-%m-%d"),
             (now_ist + timedelta(days=1)).strftime("%Y-%m-%d"))
-        _feed.seed_candles(_hist_5m, _hist_1m)
+        _feed.seed_candles(_drop_unready_bars(_hist_5m, 5, cfg.instrument, now_ist),
+                           _drop_unready_bars(_hist_1m, 1, cfg.instrument, now_ist))
         _feed.start(cfg.dhan_client_code, cfg.dhan_access_token)
         add_activity_log(f"Live market feed restarted for {cfg.instrument}")
     except Exception as _fs_err:
@@ -5572,6 +5574,46 @@ def _market_traded_today(instrument: str, now_ist, frames: dict) -> bool:
         last = last.tz_convert("Asia/Kolkata").tz_localize(None)
     return last.date() == now_ist.date()
 
+_after_hours_noted: dict = {}   # instrument -> date the after-hours bar drop was last logged
+
+
+def _drop_unready_bars(df, tf_minutes: int, instrument: str, now_ist=None, forming: bool = True):
+    """LIVE frames only (backtests use _fetch_frames_range): remove bars a strategy must not see.
+
+    1. The still-FORMING bar. Dhan's REST intraday includes the current, unfinished candle.
+       Found live 2026-10-05: with the live feed dead, the 5m frame came from REST and four
+       strategies "entered" on a 7-second-old 12:35 candle, then again on each next forming
+       candle (12:20, 12:25, 12:35, 12:40) -- duplicate entries, an exit on a 1-min-old bar.
+    2. AFTER-HOURS bars (not MCX). The same evening Dhan's REST returns a flat, volume-0 bar
+       stamped after the close (2026-10-05: 5m 18:45, 1m 18:49); seeded into the live feed it
+       would sit between today's 15:25 and tomorrow's 09:15.
+    """
+    if df is None or len(df) == 0 or "timestamp" not in df:
+        return df
+    try:
+        now_ist = now_ist or datetime.now(_IST)
+        now_naive = now_ist.replace(tzinfo=None)
+        ts = pd.to_datetime(df["timestamp"])
+        if getattr(ts.dt, "tz", None) is not None:
+            ts = ts.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+        keep = ((ts + pd.Timedelta(minutes=tf_minutes)) <= now_naive) if forming else pd.Series(True, index=ts.index)
+        is_mcx = INSTRUMENT_META.get(instrument, {}).get("exchange_index") == "MCX"
+        if not is_mcx:
+            hm = ts.dt.hour * 60 + ts.dt.minute
+            in_session = (hm >= 9 * 60 + 15) & (hm < 15 * 60 + 30)
+            if (~in_session).any() and _after_hours_noted.get(instrument) != now_naive.date():
+                _after_hours_noted[instrument] = now_naive.date()
+                logger.info(f"Dropping {int((~in_session).sum())} after-hours {tf_minutes}m bar(s) for {instrument} "
+                            f"(e.g. {ts[~in_session].iloc[-1]}) from live frames")
+            keep &= in_session
+        if bool(keep.all()):
+            return df
+        return df[keep.values].reset_index(drop=True)
+    except Exception as e:
+        logger.debug(f"_drop_unready_bars failed ({e}) -- frame left as is")
+        return df
+
+
 def _fetch_5m_rest_with_freshness_retry(instrument: str, from_d: str, today: str, now_ist) -> Optional[pd.DataFrame]:
     """Fetch 5m candles via the historical REST API and, if the result is
     already >7 minutes stale (matching the live-feed path's freshness guard
@@ -5636,6 +5678,7 @@ def _fetch_all_frames(instrument: str) -> dict:
         try:
             _from5 = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
             _df5 = broker.get_historical_data(instrument, "5", _from5, today)
+            _df5 = _drop_unready_bars(_df5, 5, instrument, now_ist)
             if _df5 is not None and len(_df5) >= 30:
                 _rest_5m_cache[instrument] = _df5
             _time_mod.sleep(0.3)
@@ -5682,7 +5725,10 @@ def _fetch_all_frames(instrument: str) -> dict:
             try:
                 _last5_ts = pd.to_datetime(frames["5"]["timestamp"].max())
                 _now_naive = datetime.now(_IST).replace(tzinfo=None)
-                _age_min = (_now_naive - _last5_ts).total_seconds() / 60.0
+                # Measured from the bar's END: the frame now holds completed bars only
+                # (_drop_unready_bars), so a healthy frame's last bar ended 0-5 min ago.
+                # Same 7-min trigger as before, when the forming bar's START was measured.
+                _age_min = (_now_naive - (_last5_ts + pd.Timedelta(minutes=5))).total_seconds() / 60.0
                 # At most one forced refresh a minute: with no trading (holiday /
                 # pre-open) the frame stays "stale" all day and this fired every
                 # loop cycle (~15s), each one a REST call plus a warning line.
@@ -5693,7 +5739,8 @@ def _fetch_all_frames(instrument: str) -> dict:
                         f"5m frame stale ({_age_min:.1f} min old) despite live feed — "
                         f"forcing REST refresh")
                     _from5f = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
-                    _df5f = broker.get_historical_data(instrument, "5", _from5f, today)
+                    _df5f = _drop_unready_bars(broker.get_historical_data(instrument, "5", _from5f, today),
+                                               5, instrument, now_ist)
                     if _df5f is not None and len(_df5f) >= 30:
                         _rest_5m_cache[instrument] = _df5f
                         _last_rest_ts = _df5f["timestamp"].max()
@@ -5730,6 +5777,14 @@ def _fetch_all_frames(instrument: str) -> dict:
             if df is not None and len(df) >= 30:
                 frames[tf_key] = df
             _time_mod.sleep(0.3)
+
+    for _tf_key, _tf_min in (("5", 5), ("1", 1)):
+        if frames.get(_tf_key) is not None:
+            frames[_tf_key] = _drop_unready_bars(frames[_tf_key], _tf_min, instrument, now_ist)
+    # 15m / 60m: only the after-hours bar goes; their forming bar is left as the strategies had it.
+    for _tf_key, _tf_min in (("15", 15), ("60", 60)):
+        if frames.get(_tf_key) is not None:
+            frames[_tf_key] = _drop_unready_bars(frames[_tf_key], _tf_min, instrument, now_ist, forming=False)
 
     return frames
 
