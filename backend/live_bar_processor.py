@@ -372,6 +372,40 @@ class BacktestDiffProcessor:
         current_keys = set()
         current_open_key = None
 
+        # ── Vanished open trade (rolling-window instability) ──
+        # Found live 2026-09-01 and again 2026-10-05 (CUSUM15 SHORT 12:00 -> LONG 12:20, no exit):
+        # as the trailing window slides, the re-evaluation can stop reproducing the trade we were
+        # holding -- not closed, just ABSENT -- and the diff below only emits an exit for a trade
+        # it can still see. Decide here, before the entry loop:
+        #   * still open in the SAME direction under a different entry bar -> it's the same
+        #     position whose entry bar moved (05 Oct 12:20 -> 12:25): no new entry is emitted;
+        #   * flat now, or open the other way -> emit an explicit exit (WINDOW_ROLLOFF) at the
+        #     last close first, so the position, journal and Telegram are closed properly.
+        _new_open = None
+        for _t in bt_trades:
+            if _t.get("exit_reason") == "OPEN":
+                _new_open = (_t["direction"], _t["entry_time"])
+        _moved_entry_key = None
+        if self._prev_open_key and self._prev_open_key not in {(x["direction"], x["entry_time"]) for x in bt_trades}:
+            _pdir, _pentry = self._prev_open_key
+            if _new_open and _new_open[0] == _pdir:
+                _moved_entry_key = _new_open
+                logger.warning(f"[{self.strategy_id}] Open {_pdir} from {_pentry} vanished from the re-evaluation; "
+                               f"same direction is open from {_new_open[1]} -- treated as the SAME position "
+                               f"(entry bar moved), no new entry emitted")
+            else:
+                _ts = _to_ist_iso(self.last_processed_ts) if self.last_processed_ts is not None else ""
+                _px = float(self._last_close or 0.0)
+                _ep = float(self.entry_price or 0.0)
+                _pts = (_px - _ep) if _pdir == "LONG" else (_ep - _px)
+                signals_out.append(self._exit_from_trade({
+                    "direction": _pdir, "entry_time": _pentry, "entry_price": _ep,
+                    "exit_time": _ts, "exit_price": _px, "exit_reason": "WINDOW_ROLLOFF",
+                    "pnl_pts": _pts if _ep else 0.0, "pnl": (_pts * qty) if _ep else 0.0, "sl": self.sl,
+                }, qty))
+                logger.warning(f"[{self.strategy_id}] Open {_pdir} from {_pentry} vanished from the re-evaluation "
+                               f"with no exit -- emitting WINDOW_ROLLOFF exit @ {_px}")
+
         for t in bt_trades:
             key = (t["direction"], t["entry_time"])
             current_keys.add(key)
@@ -404,7 +438,9 @@ class BacktestDiffProcessor:
             # real news (see STALE_ENTRY_MAX_AGE_MIN above). current_keys
             # already includes it either way, so it's folded into known
             # state and never reconsidered again regardless.
-            if key not in self._prev_trade_keys:
+            if key not in self._prev_trade_keys and key == _moved_entry_key:
+                pass   # same position as the vanished one (see above) -- not a new entry
+            elif key not in self._prev_trade_keys:
                 _age = _bar_age_minutes(t["entry_time"])
                 if _age is not None and _age > STALE_ENTRY_MAX_AGE_MIN:
                     logger.info(
