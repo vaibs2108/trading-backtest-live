@@ -7,7 +7,7 @@ import numpy as np
 import os
 import requests
 import time as _time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from typing import Optional, Tuple
 from config import get_settings, INSTRUMENT_META
 from dhanhq import dhanhq, DhanContext
@@ -384,6 +384,36 @@ def _sorted_by_nearest_future_expiry(match: pd.DataFrame) -> pd.DataFrame:
     return future.sort_values(by='SEM_EXPIRY_DATE')
 
 
+_ltp_note_at: dict = {}   # (instrument, kind) -> datetime of last log line, to keep the log readable
+
+
+def _ltp_note(instrument: str, kind: str, msg: str, now, level=logging.INFO):
+    last = _ltp_note_at.get((instrument, kind))
+    if last is None or (now - last).total_seconds() >= 60:
+        _ltp_note_at[(instrument, kind)] = now
+        logger.log(level, msg)
+
+
+def _live_feed_price(instrument: str, now) -> Optional[float]:
+    """Last REAL trade price from the live websocket feed, if the feed is on this instrument
+    and has had a current tick in the last 60 s (last_tick_time is only set for current
+    trades, never for a re-sent snapshot)."""
+    try:
+        from live_feed import get_live_feed
+        f = get_live_feed()
+        if (f._instrument or "").upper() != instrument.upper() or not f.last_price or not f.last_tick_time:
+            return None
+        if (now - f.last_tick_time).total_seconds() > 60:
+            return None
+        return float(f.last_price)
+    except Exception:
+        return None
+
+
+def _in_market_hours(now) -> bool:
+    return now.weekday() < 5 and dt_time(9, 15) <= now.time() < dt_time(15, 30)
+
+
 def get_ltp(instrument: str) -> Optional[float]:
     global _ltp_cache, _ltp_cache_time
     import pytz
@@ -415,6 +445,23 @@ def get_ltp(instrument: str) -> Optional[float]:
             _ltp_cache[instrument] = val
             _ltp_cache_time[instrument] = now
             return val
+
+        # REST quote empty/failed -> the live websocket feed's last real trade (same instrument).
+        feed_val = _live_feed_price(instrument, now)
+        if feed_val:
+            _ltp_cache[instrument] = feed_val
+            _ltp_cache_time[instrument] = now
+            _ltp_note(instrument, "feed", f"LTP for {instrument} from live feed: {feed_val} (REST quote unavailable)", now)
+            return feed_val
+
+        # Found live 2026-10-05: during market hours the daily-close fallback below handed out
+        # the PREVIOUS day's close as the live price (54,450.75 vs a real ~55,100), which fired a
+        # false "MANUAL EXIT NEEDED" and a false SL_HIT. In market hours: no price, never a stale one
+        # (every caller already treats None as "skip this check").
+        if _in_market_hours(now):
+            _ltp_note(instrument, "none", f"LTP for {instrument} unavailable (REST quote failed, no fresh live-feed "
+                                          f"tick) -- returning None, not the daily close", now, logging.WARNING)
+            return None
 
         # Fallback for indices on weekends/holidays when ticker/live data is empty
         if instrument.upper() in ["NIFTY", "BANKNIFTY", "INDIA VIX"]:
