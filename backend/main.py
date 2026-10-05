@@ -710,6 +710,7 @@ async def get_status():
         "active_entries": _get_active_entries(cfg, tm),
         "capital_state": get_capital_tracker().get_state(),
         "data_health":  _data_health_state,
+        "live_feed":    get_live_feed().get_status(),
         "app_running":  _app_running,
         "max_daily_loss": cfg.max_daily_loss,
         "max_daily_profit": cfg.max_daily_profit,
@@ -2210,6 +2211,18 @@ async def startup_event():
         cas_scanner.start()
     except Exception as _cas_err:
         logger.warning(f"Could not start CAS scanner: {_cas_err}")
+
+    # Live feed watchdog alerts (found live 2026-10-05: feed silent from 11:36 with no alert)
+    try:
+        import live_feed as _lf_mod
+
+        def _feed_telegram(message: str):
+            _tg = get_settings()   # current settings, not the ones from startup
+            _send_telegram_alert_wrapper(message, _tg.telegram_bot_token, _tg.telegram_chat_id)
+
+        _lf_mod.set_alert_hook(_feed_telegram)
+    except Exception as _lf_err:
+        logger.warning(f"Could not set live feed alert hook: {_lf_err}")
 
     # Start live market feed for near-instant signal processing
     if broker.is_connected():

@@ -34,6 +34,33 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 
 _LTT_MAX_AGE_SEC = 180
 
+# Feed watchdog (found live 2026-10-05: the websocket went silent at 11:36:40 after a Dhan
+# "RemoteDisconnected", get_data() never returned, and the feed reported connected=True with no
+# tick for the rest of the day). No tick for this long in session hours -> force a reconnect.
+_SILENT_RECONNECT_SEC = 60
+_WATCHDOG_EVERY_SEC = 10
+
+_alert_hook: Optional[Callable[[str], None]] = None
+
+
+def set_alert_hook(fn: Optional[Callable[[str], None]]):
+    """main.py passes its Telegram sender here (same pattern as cas_scanner.set_broadcast_hooks)."""
+    global _alert_hook
+    _alert_hook = fn
+
+
+def _session_bounds(exchange_seg: Optional[str], now_ist: datetime):
+    """(open, close) of today's session for the feed's segment, or None on a weekend."""
+    if now_ist.weekday() >= 5:
+        return None
+    d = now_ist.date()
+    if (exchange_seg or "").upper().startswith("MCX"):
+        o, c = (9, 0), (23, 30)
+    else:
+        o, c = (9, 15), (15, 30)
+    return (datetime(d.year, d.month, d.day, *o, tzinfo=_IST),
+            datetime(d.year, d.month, d.day, *c, tzinfo=_IST))
+
 
 def _ltt_is_current(ltt: str, now_ist: datetime) -> bool:
     """True if a "HH:MM:SS" last-trade-time belongs to a trade happening now.
@@ -194,6 +221,16 @@ class LiveFeedManager:
         # Callbacks for candle completion
         self._on_5m_close: Optional[Callable] = None
 
+        # Watchdog: each (re)connect runs in its own thread tagged with a generation number;
+        # a thread whose generation is no longer current exits as soon as it gets control back.
+        self._gen = 0
+        self._creds: Optional[tuple] = None
+        self._started_at: Optional[datetime] = None
+        self._watchdog: Optional[threading.Thread] = None
+        self._last_forced: Optional[datetime] = None
+        self._forced_reconnects = 0
+        self._silent_alerted = False
+
     def _reset_trade_day(self):
         # Real (current) trades seen today -- see traded_today()
         self._trade_day = None
@@ -237,13 +274,19 @@ class LiveFeedManager:
             return
 
         self._running = True
+        self._creds = (client_id, access_token)
+        self._started_at = datetime.now(_IST)
+        self._gen += 1
         self._thread = threading.Thread(
             target=self._run_feed,
-            args=(client_id, access_token),
+            args=(client_id, access_token, self._gen),
             daemon=True,
             name="LiveFeed"
         )
         self._thread.start()
+        if self._watchdog is None or not self._watchdog.is_alive():
+            self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True, name="LiveFeedWatchdog")
+            self._watchdog.start()
         logger.info(f"LiveFeed started for {self._instrument} (security_id={self._security_id})")
 
     def stop(self):
@@ -274,9 +317,9 @@ class LiveFeedManager:
         self._feed = None
         logger.info("LiveFeed stopped")
 
-    def _run_feed(self, client_id: str, access_token: str):
+    def _run_feed(self, client_id: str, access_token: str, gen: int = 0):
         """Background thread: connect to MarketFeed and process ticks."""
-        while self._running:
+        while self._running and gen == self._gen:
             try:
                 from dhanhq import DhanContext, MarketFeed
 
@@ -298,18 +341,28 @@ class LiveFeedManager:
                 ]
 
                 logger.info(f"LiveFeed connecting: {instruments}")
-                self._feed = MarketFeed(dhan_context, instruments, "v2")
-                self._feed.run_forever()
+                feed = MarketFeed(dhan_context, instruments, "v2")
+                if gen != self._gen:
+                    return
+                self._feed = feed
+                feed.run_forever()
 
                 # Tick processing loop
-                while self._running:
+                while self._running and gen == self._gen:
                     try:
-                        data = self._feed.get_data()
+                        data = feed.get_data()
+                        if gen != self._gen:
+                            break                 # replaced by the watchdog while we were blocked
                         if data:
                             self._process_tick(data)
                     except Exception as tick_err:
-                        if "closed" in str(tick_err).lower():
-                            logger.warning("LiveFeed WebSocket closed, reconnecting...")
+                        _dead = False
+                        try:
+                            _dead = feed._is_ws_closed()
+                        except Exception:
+                            pass
+                        if _dead or "closed" in str(tick_err).lower():
+                            logger.warning(f"LiveFeed WebSocket closed ({tick_err}), reconnecting...")
                             break
                         logger.debug(f"Tick processing error: {tick_err}")
                     # Time-based rollover: close candles at the boundary even if
@@ -331,9 +384,87 @@ class LiveFeedManager:
             except Exception as e:
                 logger.error(f"LiveFeed connection error: {e}")
 
+            if gen != self._gen:
+                logger.info(f"LiveFeed: connection #{gen} retired (replaced by the watchdog)")
+                return
             if self._running:
                 logger.info("LiveFeed reconnecting in 5s...")
                 time.sleep(5)
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Watchdog: no tick for _SILENT_RECONNECT_SEC in session hours -> fresh connection
+    # ──────────────────────────────────────────────────────────────────
+    def silent_seconds(self, now_ist: Optional[datetime] = None) -> Optional[float]:
+        """Seconds without a current tick during today's session (None outside session hours)."""
+        now_ist = now_ist or datetime.now(_IST)
+        b = _session_bounds(self._exchange_seg, now_ist)
+        if b is None or not (b[0] <= now_ist < b[1]):
+            return None
+        ref = max(x for x in (self.last_tick_time, self._started_at, b[0]) if x is not None)
+        return max(0.0, (now_ist - ref).total_seconds())
+
+    def _alert(self, msg: str):
+        hook = _alert_hook
+        if hook is None:
+            return
+        try:
+            hook(msg)
+        except Exception as e:
+            logger.warning(f"LiveFeed alert failed: {e}")
+
+    def _restart_connection(self):
+        """Abandon the current (stuck) connection and start a fresh one in a new thread."""
+        old = self._feed
+        self._gen += 1
+        gen = self._gen
+        self._feed = None
+        try:   # unblock the old thread's recv() if its loop is still alive; never wait on it
+            if old is not None and getattr(old, "ws", None) is not None and getattr(old, "loop", None) is not None:
+                asyncio.run_coroutine_threadsafe(old.ws.close(), old.loop)
+        except Exception as e:
+            logger.debug(f"LiveFeed: closing the stuck socket failed: {e}")
+        client_id, access_token = self._creds
+        self._thread = threading.Thread(target=self._run_feed, args=(client_id, access_token, gen),
+                                        daemon=True, name=f"LiveFeed-{gen}")
+        self._thread.start()
+
+    def _watchdog_tick(self, now_ist: datetime):
+        if not self._running or not self._creds:
+            return
+        silent = self.silent_seconds(now_ist)
+        if silent is None or silent < _SILENT_RECONNECT_SEC:
+            if silent is not None and self._silent_alerted:
+                self._silent_alerted = False
+                logger.info(f"LiveFeed: ticks flowing again for {self._instrument}")
+                self._alert(f"\u2705 LIVE FEED BACK \u00b7 {self._instrument}\nTicks are flowing again "
+                            f"({now_ist:%H:%M:%S} IST).")
+            return
+        # Retry every minute on a trading day; every 10 min when nothing has traded today
+        # (holiday / exchange shut), where a silent feed is expected.
+        _retry = _SILENT_RECONNECT_SEC if self.traded_today(now_ist) else 600
+        if self._last_forced and (now_ist - self._last_forced).total_seconds() < _retry:
+            return
+        self._last_forced = now_ist
+        self._forced_reconnects += 1
+        last = self.last_tick_time.strftime("%H:%M:%S") if self.last_tick_time else "none today"
+        logger.warning(f"LiveFeed: no tick for {silent:.0f}s in session hours (last tick {last}) -- "
+                       f"forcing reconnect #{self._forced_reconnects}")
+        self._restart_connection()
+        # Telegram only once per outage, and only on a day the feed has seen real trading
+        # (a holiday has no ticks at all -- reconnecting is harmless, alerting is noise).
+        if not self._silent_alerted and self.traded_today(now_ist):
+            self._silent_alerted = True
+            self._alert(f"\u26a0\ufe0f LIVE FEED SILENT \u00b7 {self._instrument}\nNo tick since {last} IST "
+                        f"({silent / 60:.0f} min). Reconnecting automatically.\n"
+                        f"Until it's back: signals come only from the 15 s polls.")
+
+    def _watchdog_loop(self):
+        while True:
+            time.sleep(_WATCHDOG_EVERY_SEC)
+            try:
+                self._watchdog_tick(datetime.now(_IST))
+            except Exception as e:
+                logger.warning(f"LiveFeed watchdog error: {e}")
 
     def _process_tick(self, data: dict):
         """Process a single tick from MarketFeed."""
@@ -573,6 +704,8 @@ class LiveFeedManager:
             "last_price": self.last_price,
             "last_tick_time": self.last_tick_time.isoformat() if self.last_tick_time else None,
             "tick_count": self._tick_count,
+            "silent_seconds": (round(s) if (s := self.silent_seconds()) is not None else None),
+            "forced_reconnects": self._forced_reconnects,
             "candles_5m": len(self.candle_5m.candles),
             "candles_1m": len(self.candle_1m.candles),
         }
