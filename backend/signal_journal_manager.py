@@ -100,9 +100,10 @@ def open_entry(sig: dict, instrument: str, lot_size: int):
         "strategy":       str(sig.get("strategy", "")),
         "lot_size":       int(lot_size),
         "reasons":        list(sig.get("reasons", [])),
-        # Set only when the app JOINED a position the strategy was already holding
-        "strategy_entry_price": sig.get("strategy_entry_price"),
-        "strategy_entry_time":  sig.get("strategy_entry_time"),
+        # Set only when the app JOINED a carry-forward position the strategy was already holding
+        # (entry_time / entry_price above stay the strategy's own)
+        "app_join_time":  sig.get("app_join_time"),
+        "app_join_price": sig.get("app_join_price"),
         # Exit fields — filled when the strategy fires an exit signal
         "exit_time":      None,
         "exit_price":     None,
@@ -195,6 +196,15 @@ def auto_close_stale_entries():
     Prevents stale "OPEN: 1" counts in the signal log that block the UI
     from showing today's trades cleanly.
     """
+    # CARRY_FORWARD (05 Oct 2026, your rule): a strategy position held overnight is ONE trade that
+    # continues into the next session -- its entry stays OPEN until the strategy's own exit. Only
+    # INTRADAY mode closes previous days' entries here.
+    try:
+        from config import get_settings
+        if str(getattr(get_settings(), "position_hold_mode", "CARRY_FORWARD")).upper() == "CARRY_FORWARD":
+            return
+    except Exception:
+        pass
     entries = _load()
     today = datetime.now(_IST).date()
     changed = False

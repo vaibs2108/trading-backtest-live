@@ -6056,10 +6056,10 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
         try:
             lot_size = broker.get_lot_size(cfg.instrument)
             _jsig = sig
-            # Found live 2026-10-05: joining a position the strategy has held since an earlier
-            # bar (Option B, LONG since 01 Oct 14:35) journaled the strategy's OLD entry
-            # (54,411.85) although the app joined at ~54,900 -> +250 pts booked instead of ~-240.
-            # The journal records the app's own join price; the strategy's entry is kept beside it.
+            # Found live 2026-10-05: the app joined Option B's carry-forward LONG (held by the
+            # strategy since 01 Oct 14:35) and journaled it as a NEW 05 Oct 10:00 entry. The Signals
+            # Log tracks the STRATEGY's trade, so a join keeps the strategy's own entry bar and price
+            # (one continuous carry-forward trade); where the app joined is kept as a note.
             _pet = sig.get("position_entry_time") or ""
             try:
                 _join = bool(_pet) and (pd.Timestamp(str(sig.get("time", ""))) - pd.Timestamp(_pet)).total_seconds() > 600
@@ -6067,13 +6067,14 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
                 _join = False
             if _join:
                 _join_px = broker.get_ltp(cfg.instrument) or float(sig.get("close", 0) or 0)
-                if _join_px > 0:
-                    _jsig = {**sig, "entry": round(float(_join_px), 2),
-                             "strategy_entry_price": sig.get("entry"), "strategy_entry_time": _pet,
-                             "reasons": list(sig.get("reasons", [])) + [
-                                 f"Joined running {direction} at {_join_px:,.2f} (strategy entered {_pet} @ {sig.get('entry')})"]}
-                    logger.info(f"Signal journal: JOIN {direction} at {_join_px:,.2f} -- strategy entry was "
-                                f"{sig.get('entry')} on {_pet}")
+                _jsig = {**sig, "time": _pet,
+                         "app_join_time": datetime.now(_IST).isoformat(),
+                         "app_join_price": round(float(_join_px), 2) if _join_px else None,
+                         "reasons": list(sig.get("reasons", [])) + [
+                             f"Carry-forward: strategy {direction} since {_pet} @ {sig.get('entry')}; "
+                             f"app joined {datetime.now(_IST):%d %b %H:%M}" + (f" at {_join_px:,.2f}" if _join_px else "")]}
+                logger.info(f"Signal journal: JOIN carry-forward {direction} (strategy entry {sig.get('entry')} "
+                            f"on {_pet}); app joined at {_join_px}")
             signal_journal_manager.open_entry(_jsig, cfg.instrument, lot_size)
         except Exception as _sj_err:
             logger.error(f"Signal journal open failed: {_sj_err}")
