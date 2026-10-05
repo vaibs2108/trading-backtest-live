@@ -477,6 +477,9 @@ class BacktestDiffProcessor:
             "strategy": self.strategy_id,
             "time": _to_ist_iso(self.last_processed_ts) if self.last_processed_ts else "",
             "entry": round(self.entry_price, 2) if self.position != "NONE" else 0.0,
+            # bar the strategy's open trade was entered on ("time" above is the latest bar)
+            "position_entry_time": (_to_ist_iso(self._prev_open_key[1])
+                                    if self.position != "NONE" and self._prev_open_key else ""),
             "sl": round(self.sl, 2),
             "target1": round(self.target1, 2),
             "target2": round(self.target2, 2),

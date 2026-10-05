@@ -6055,7 +6055,26 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
         # Log to signal journal (tracks strategy P&L independently of Dhan trades)
         try:
             lot_size = broker.get_lot_size(cfg.instrument)
-            signal_journal_manager.open_entry(sig, cfg.instrument, lot_size)
+            _jsig = sig
+            # Found live 2026-10-05: joining a position the strategy has held since an earlier
+            # bar (Option B, LONG since 01 Oct 14:35) journaled the strategy's OLD entry
+            # (54,411.85) although the app joined at ~54,900 -> +250 pts booked instead of ~-240.
+            # The journal records the app's own join price; the strategy's entry is kept beside it.
+            _pet = sig.get("position_entry_time") or ""
+            try:
+                _join = bool(_pet) and (pd.Timestamp(str(sig.get("time", ""))) - pd.Timestamp(_pet)).total_seconds() > 600
+            except Exception:
+                _join = False
+            if _join:
+                _join_px = broker.get_ltp(cfg.instrument) or float(sig.get("close", 0) or 0)
+                if _join_px > 0:
+                    _jsig = {**sig, "entry": round(float(_join_px), 2),
+                             "strategy_entry_price": sig.get("entry"), "strategy_entry_time": _pet,
+                             "reasons": list(sig.get("reasons", [])) + [
+                                 f"Joined running {direction} at {_join_px:,.2f} (strategy entered {_pet} @ {sig.get('entry')})"]}
+                    logger.info(f"Signal journal: JOIN {direction} at {_join_px:,.2f} -- strategy entry was "
+                                f"{sig.get('entry')} on {_pet}")
+            signal_journal_manager.open_entry(_jsig, cfg.instrument, lot_size)
         except Exception as _sj_err:
             logger.error(f"Signal journal open failed: {_sj_err}")
 

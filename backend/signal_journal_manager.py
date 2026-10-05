@@ -100,6 +100,9 @@ def open_entry(sig: dict, instrument: str, lot_size: int):
         "strategy":       str(sig.get("strategy", "")),
         "lot_size":       int(lot_size),
         "reasons":        list(sig.get("reasons", [])),
+        # Set only when the app JOINED a position the strategy was already holding
+        "strategy_entry_price": sig.get("strategy_entry_price"),
+        "strategy_entry_time":  sig.get("strategy_entry_time"),
         # Exit fields — filled when the strategy fires an exit signal
         "exit_time":      None,
         "exit_price":     None,
