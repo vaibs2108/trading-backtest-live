@@ -164,6 +164,27 @@ def _keyed(raw: list) -> dict:
     return out
 
 
+def _book_as_history(t: dict) -> dict:
+    """A trade-book row in trade-history shape: history names an option 'BANKNIFTY 29 SEP 57100 PUT'
+    (customSymbol), the book only 'BANKNIFTY-Oct2026-54500-CE' -- without this a position bought on
+    an earlier day and sold today would not pair."""
+    t = dict(t)
+    ts = str(t.get("tradingSymbol", "")).upper()
+    opt = str(t.get("drvOptionType", "")).upper()
+    if opt not in ("CALL", "PUT"):   # the book sends "NA" (05 Oct) -- take it from the symbol
+        opt = "CALL" if ts.endswith("-CE") else "PUT" if ts.endswith("-PE") else ""
+    if not t.get("customSymbol") and opt:
+        try:
+            und = ts.split("-")[0]
+            exp = datetime.strptime(str(t["drvExpiryDate"])[:10], "%Y-%m-%d")
+            k = float(t.get("drvStrikePrice") or 0)
+            ks = str(int(k)) if k == int(k) else str(k)
+            t["customSymbol"] = f"{und} {exp:%d} {exp:%b}".upper() + f" {ks} {opt}"
+        except Exception:
+            pass
+    return t
+
+
 def _executions_since(fetch_from: str) -> list:
     """All executions from fetch_from up to today (cached as described above)."""
     import broker
@@ -182,6 +203,9 @@ def _executions_since(fetch_from: str) -> list:
             logger.info(f"{len(raw)} executions {start}..{old_to} (older part, kept for the day)")
         if time.time() - _recent["at"] >= CACHE_SECONDS or _recent["since"] != recent_from:
             raw = broker.get_trade_history(recent_from, today) or []
+            # Dhan's trade HISTORY has no same-day executions (05 Oct: today's 3 fills on the
+            # 54500 CE were missing from the Broker Journal); today's come from the trade BOOK.
+            raw += [_book_as_history(x) for x in (broker.get_trade_book() or [])]
             _recent.update(**{"at": time.time(), "since": recent_from, "execs": _keyed(raw)})
         merged = dict(_old["execs"]) if fetch_from <= old_to else {}
         merged.update(_recent["execs"])

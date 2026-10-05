@@ -451,6 +451,44 @@ def _safe_pnl_exit_price(pos, index_ltp: float) -> float:
 _exit_signal_logged_for_position: str = ""  # order_id for which we already logged an exit signal this position lifetime
 _exit_telegram_sent_for_position: str = ""  # order_id for which we already sent an exit alert this position lifetime
 _strat_alerts_sent: dict = {}  # (strategy, signal, signal time) -> when its strategy-signal Telegram alert went out
+
+# Your rule (05 Oct): auto-trade JOINS a carry-forward position the strategy is already running.
+# Guard: one strategy trade is entered at most ONCE. If the app later leaves it on its own (T2,
+# manual exit, square-off) while the strategy still holds it, the next candle must not join the
+# same trade again. Persisted, so a restart doesn't forget. Key: (strategy, direction, entry bar).
+_TRADED_KEYS_PATH = Path(__file__).parent / "data" / "traded_strategy_trades.json"
+_traded_strategy_trades: list = []
+_last_skipped_traded_key = ""
+
+
+def _strategy_trade_key(strategy: str, direction: str, entry_ts) -> str:
+    return f"{strategy}|{direction}|{str(entry_ts or '').replace('T', ' ')[:16]}"
+
+
+def _load_traded_keys():
+    global _traded_strategy_trades
+    try:
+        if _TRADED_KEYS_PATH.exists():
+            _traded_strategy_trades = list(json.loads(_TRADED_KEYS_PATH.read_text(encoding="utf-8")))
+    except Exception as e:
+        logger.warning(f"Could not read {_TRADED_KEYS_PATH.name}: {e}")
+
+
+def _was_traded(key: str) -> bool:
+    if not _traded_strategy_trades:
+        _load_traded_keys()
+    return key in _traded_strategy_trades
+
+
+def _mark_traded(key: str):
+    if key in _traded_strategy_trades:
+        return
+    _traded_strategy_trades.append(key)
+    del _traded_strategy_trades[:-300]
+    try:
+        _TRADED_KEYS_PATH.write_text(json.dumps(_traded_strategy_trades, indent=0), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Could not save {_TRADED_KEYS_PATH.name}: {e}")
 _manual_exit_alert_last_sent: dict = {}  # order_id -> datetime of last "MANUAL EXIT NEEDED" reminder (DHAN_SYNC + auto_trade=OFF), capped to one reminder per hour
 
 
@@ -2997,7 +3035,7 @@ async def _signal_polling_loop():
             _check_data_staleness(frames, cfg)
 
             if frames:
-                global _last_signal, _last_telegram_signal_key, _pending_telegram_signal
+                global _last_signal, _last_telegram_signal_key, _pending_telegram_signal, _last_skipped_traded_key
                 global _active_trade_signal, _recently_closed_symbols, _exit_signal_logged_for_position, _exit_telegram_sent_for_position
                 global _last_loss_direction, _last_loss_time
                 global _manual_exit_alert_last_sent
@@ -3016,7 +3054,7 @@ async def _signal_polling_loop():
 
                 pos_str = tm.position.direction if (tm.position and tm.position.instrument == cfg.instrument) else "NONE"
 
-                def send_strat_telegram_alert(strat_id, sig_dict, detected_at=None):
+                def send_strat_telegram_alert(strat_id, sig_dict, detected_at=None, not_entered: str = ""):
                     try:
                         _sig_dir = sig_dict.get("signal", "")
                         # Minute precision: the processor and legacy paths format the same
@@ -3040,7 +3078,8 @@ async def _signal_polling_loop():
                         _lat = int((_det - _bar_close).total_seconds())
                         _sig_msg = (
                             f"{_sig_emoji} {strat_id.upper()} \u2014 {_sig_dir}\n"
-                            f"{cfg.instrument} @ {ltp}\n"
+                            + (f"\u26a0\ufe0f NOT ENTERED \u2014 {not_entered}\n" if not_entered else "")
+                            + f"{cfg.instrument} @ {ltp}\n"
                             f"Signal at {_det.strftime('%H:%M:%S')} IST \u2014 {_lat}s after the "
                             f"{_bar_close.strftime('%H:%M')} candle close\n"
                         )
@@ -3233,8 +3272,12 @@ async def _signal_polling_loop():
                                         _trace(_tid, "TELEGRAM", f"skipped, age={_entry_sig_age:.1f}m")
                                         logger.info(f"[{_strat_id}] Telegram entry alert skipped — signal {_entry_sig_age:.1f} mins old")
                                     else:
-                                        _trace(_tid, "TELEGRAM", f"skipped, position slot occupied by {tm.position.symbol}")
-                                        logger.info(f"[{_strat_id}] Telegram entry alert skipped — position slot occupied by {tm.position.symbol}, this entry will not be attempted")
+                                        # Your rule (05 Oct): the alert still goes out, marked "not entered".
+                                        _trace(_tid, "TELEGRAM", f"sending NOT ENTERED, position slot occupied by {tm.position.symbol}")
+                                        logger.info(f"[{_strat_id}] Entry not attempted — position slot occupied by {tm.position.symbol}; alert sent marked NOT ENTERED")
+                                        asyncio.get_event_loop().run_in_executor(
+                                            None, send_strat_telegram_alert, _strat_id, sig_dict, datetime.now(_IST),
+                                            f"position slot held by {tm.position.symbol}")
 
                                 # Instant order execution for active strategy (1-2s latency matching backtest)
                                 if _strat_id == cfg.strategy and _entry_slot_free:
@@ -3667,6 +3710,14 @@ async def _signal_polling_loop():
                                 _pending_telegram_signal = sig
                                 logger.info(f"Signal buffered for confirmation: {sig_direction} at {sig_ts}")
 
+                        if should_enter:
+                            _tkey = _strategy_trade_key(cfg.strategy, sig_direction, sig.get("position_entry_time") or sig_ts)
+                            if _was_traded(_tkey):
+                                should_enter = False
+                                if _tkey != _last_skipped_traded_key:
+                                    _last_skipped_traded_key = _tkey
+                                    logger.info(f"Not re-joining {_tkey}: the app already entered this strategy trade "
+                                                f"(and has since left it)")
                         if should_enter:
                             _tid = _trace_id(cfg.strategy, sig_direction, sig_ts)
                             _trace(_tid, "DETECTED", f"path=legacy strategy={cfg.strategy} dir={sig_direction} sig_time={sig_ts}")
@@ -6181,6 +6232,13 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
 
         # Log entry signal to chart history
         _add_signal_to_history(sig)
+
+        # Remember this strategy trade as entered (item 3 guard: never join the same trade twice)
+        try:
+            _mark_traded(_strategy_trade_key(getattr(cfg, "strategy", ""), direction,
+                                             sig.get("position_entry_time") or sig.get("time")))
+        except Exception as _mk_err:
+            logger.debug(f"traded-key save failed: {_mk_err}")
 
         # Log to signal journal (tracks strategy P&L independently of Dhan trades)
         try:
