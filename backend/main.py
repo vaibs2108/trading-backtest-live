@@ -2579,6 +2579,13 @@ def _check_virtual_exits(ltp: float, cfg, frames=None, latest_candle_ts: str = N
 
                 # Close the journal entry in the local list so the state update is written to disk correctly
                 exit_price = ltp
+                # The Signals Log tracks the STRATEGY's trade, so a stop / target is booked at its own
+                # level, as the strategy's exit (and the backtest) does -- found 2026-10-05 09:40: the
+                # same SL exit read 55,007.55 (strategy) vs 55,001.85 (the LTP that crossed it). Only a
+                # real jump past the level (a gap, > 0.05%) is booked at the price actually seen.
+                _lvl = sl if exit_reason.startswith(("SL_HIT", "TRAIL")) else (t2 if exit_reason == "T2_HIT" else 0)
+                if _lvl and abs(ltp - _lvl) / _lvl <= 0.0005:
+                    exit_price = round(float(_lvl), 2)
                 if direction == "LONG":
                     pnl_pts = round(exit_price - entry_price, 2)
                 else:
@@ -5183,6 +5190,17 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                 entry_price = float(row.get('buyAvg', 0.0) or row.get('costPrice', 0.0) or 0.0)
                 if entry_price == 0.0:
                     entry_price = float(row.get('sellAvg', 0.0) or 0.0)
+                # A re-entry after a same-day close: price the OPEN lot by its own fill(s), not
+                # Dhan's average of every buy today (see _dhan_round_trips_today).
+                if int(float(row.get('daySellQty') or 0)) > 0:
+                    _open = [t for t in (_dhan_round_trips_today(symbol, row) or []) if t.get("status") == "OPEN"]
+                    _oq = sum(int(t["qty"]) for t in _open)
+                    if _open and _oq == qty:
+                        _fifo = round(sum(t["entry_price"] * t["qty"] for t in _open) / _oq, 2)
+                        if abs(_fifo - entry_price) > 0.005:
+                            logger.info(f"DHAN_SYNC {symbol}: entry {_fifo} from today's fills "
+                                        f"(Dhan day-average {entry_price})")
+                        entry_price = _fifo
 
                 is_option = any(term in symbol.upper() for term in ('-CE', '-PE', ' CALL', ' PUT'))
                 trade_mode = "OPTIONS" if is_option else "INDEX"
@@ -5254,11 +5272,23 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                 if not dhan_open:
                     # Sync close — Dhan confirms position is gone, close locally
                     realized_pnl = 0.0
+                    matched_row = None
                     if df is not None and not df.empty:
                         matched_rows = df[df['tradingSymbol'] == pos.symbol].to_dict(orient="records")
                         if matched_rows:
                             matched_row = matched_rows[0]
                             realized_pnl = float(matched_row.get('realizedProfit', 0.0) or matched_row.get('realisedProfit', 0.0) or 0.0)
+                    # This round trip's own fills (Dhan's realizedProfit is the day's total for the
+                    # contract, and the LTP at detection isn't the fill -- 10:04 booked 1,234.0, the
+                    # sell was 1,233.65). Fallback: the old figures.
+                    _trip_exit = None
+                    _closed = [t for t in (_dhan_round_trips_today(pos.symbol, matched_row) or [])
+                               if t.get("status") == "CLOSED"]
+                    if _closed:
+                        _same = [t for t in _closed if pos.entry_price and abs(t["entry_price"] - pos.entry_price) <= 0.005 * pos.entry_price]
+                        _trip = (_same or _closed)[-1]
+                        _trip_exit = float(_trip["exit_price"])
+                        realized_pnl = round((_trip_exit - pos.entry_price) * pos.qty, 2) if pos.entry_price else float(_trip["pnl"])
 
                     # Save index LTP first (for journal/display), then override with option premium for PnL
                     index_exit_ltp = broker.get_ltp(pos.instrument) or pos.index_entry_price or pos.entry_price
@@ -5270,6 +5300,8 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                                 exit_ltp = fetched  # option premium used for PnL calc
                         except Exception:
                             pass
+                    if _trip_exit:
+                        exit_ltp = _trip_exit   # the real sell fill
 
                     global _active_trade_signal, _exit_signal_logged_for_position, _exit_telegram_sent_for_position
                     _recently_closed_symbols[pos.symbol] = datetime.now(_IST)
@@ -5523,7 +5555,10 @@ def _market_state(instrument: str) -> dict:
     Thu 01 Oct 15:30 on a holiday/weekend/evening). Cached: 60s open, 5 min closed."""
     now = datetime.now(_IST)
     cached = _market_state_cache.get(instrument)
-    if cached and now.timestamp() - cached[0] < (60 if cached[1]["open"] else 300):
+    # 60 s while open OR inside session hours: right after a restart the feed hasn't seen a minute of
+    # trading yet, and the "closed" answer used to stick for 5 min (2026-10-05: 10:35->10:40, 11:04->11:09).
+    _ttl = 60 if (cached and (cached[1]["open"] or _in_market_hours(instrument, now))) else 300
+    if cached and now.timestamp() - cached[0] < _ttl:
         return cached[1]
     frames = _cached_frames if _cached_frames_instrument == instrument else None
     is_open = _in_market_hours(instrument, now) and _market_traded_today(instrument, now, frames)
@@ -5538,6 +5573,9 @@ def _market_state(instrument: str) -> dict:
             df = broker.get_historical_data(
                 instrument, "1", (now - timedelta(days=7)).strftime("%Y-%m-%d"),
                 (now + timedelta(days=1)).strftime("%Y-%m-%d"))
+            # Dhan's REST returns bars stamped after the close (2026-10-05: 15:38 at 15:31, 18:49 in
+            # the evening) -> the banner showed a time that hadn't happened yet. In-session bars only.
+            df = _drop_unready_bars(df, 1, instrument, now)
             if df is not None and len(df):
                 last = pd.to_datetime(df["timestamp"].max())
                 if getattr(last, "tzinfo", None) is not None:
@@ -5576,6 +5614,29 @@ def _market_traded_today(instrument: str, now_ist, frames: dict) -> bool:
     return last.date() == now_ist.date()
 
 _after_hours_noted: dict = {}   # instrument -> date the after-hours bar drop was last logged
+
+
+def _dhan_round_trips_today(symbol: str, row=None):
+    """Today's FIFO round trips for one contract from Dhan's trade book, or None when the
+    position has carried-forward quantity (older fills aren't in today's book) or the book
+    is unavailable. Found 2026-10-05 on your 54500 CE (bought 1,335.75, sold 1,233.65,
+    bought again 1,219.00):
+      * Dhan's position row gives buyAvg 1,277.375 (both buys averaged) -> the re-entry was
+        imported ~Rs 58/unit too high;
+      * its realizedProfit is the DAY's cumulative figure for the contract -> closing the
+        second lot would have booked the first round's -3,063 again."""
+    try:
+        if row is not None and any(int(float(row.get(k) or 0)) for k in ("carryForwardBuyQty", "carryForwardSellQty")):
+            return None
+        book = [t for t in broker.get_trade_book()
+                if (t.get("customSymbol") or t.get("tradingSymbol")) == symbol]
+        if not book:
+            return None
+        import dhan_trades
+        return dhan_trades.reconstruct(book)
+    except Exception as e:
+        logger.debug(f"Dhan round trips for {symbol} unavailable: {e}")
+        return None
 
 
 def _drop_unready_bars(df, tf_minutes: int, instrument: str, now_ist=None, forming: bool = True):

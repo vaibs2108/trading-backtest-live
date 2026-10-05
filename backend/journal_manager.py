@@ -168,7 +168,10 @@ def close_journal_entry(
         save_journal(entries)
         logger.info(f"Journaled exit: {symbol} closed at {exit_price} | PnL: Rs.{pnl} | Reason: {exit_reason}")
     else:
-        logger.warning(f"Could not find open journal entry for {symbol} (ID: {order_id}) to close.")
+        # Manual (DHAN_SYNC) trades are never added to this journal -- the Broker Journal page reads
+        # Dhan's own trade book (dhan_trades), where they do appear -- so "not found" is expected.
+        _log = logger.debug if str(order_id).startswith("DHAN_SYNC") else logger.warning
+        _log(f"Could not find open journal entry for {symbol} (ID: {order_id}) to close.")
         
     return updated_entry
 

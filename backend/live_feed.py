@@ -385,7 +385,7 @@ class LiveFeedManager:
                 logger.error(f"LiveFeed connection error: {e}")
 
             if gen != self._gen:
-                logger.info(f"LiveFeed: connection #{gen} retired (replaced by the watchdog)")
+                logger.info(f"LiveFeed: connection #{gen} retired (replaced by a newer connection)")
                 return
             if self._running:
                 logger.info("LiveFeed reconnecting in 5s...")

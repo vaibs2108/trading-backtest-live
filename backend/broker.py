@@ -1927,6 +1927,20 @@ def get_order_list() -> list:
         return []
 
 
+def get_trade_book() -> list:
+    """Today's executions (Dhan trade book), always fresh -- used to price a manual (DHAN_SYNC)
+    position by its own fills instead of Dhan's day-average / day-cumulative figures."""
+    if not _connected or _dhan_client is None:
+        return []
+    try:
+        res = dhan_api_call("trade_history", _dhan_client.get_trade_book)
+        if isinstance(res, dict) and res.get("status") == "success" and isinstance(res.get("data"), list):
+            return res["data"]
+    except Exception as e:
+        logger.warning(f"Error fetching today's trade book from Dhan: {e}")
+    return []
+
+
 def get_trade_history(from_date: str, to_date: str) -> list:
     """
     Fetch trade history for a given date range (YYYY-MM-DD) from Dhan API.
