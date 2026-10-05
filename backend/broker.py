@@ -278,6 +278,20 @@ def get_tsl():
 
 # ── Live Data Retrieval ───────────────────────────────────────────────────────
 
+_ltp_fail_log: dict = {}   # failure kind -> [last time logged, failures since]
+
+
+def _note_ltp_failure(kind: str, detail: str):
+    """Why a quote failed, at most one line a minute per kind (found 2026-10-05: REST LTP failed
+    for 25 min straight and on and off all day with nothing in the log to say why)."""
+    now = _time.time()
+    rec = _ltp_fail_log.setdefault(kind, [0.0, 0])
+    rec[1] += 1
+    if now - rec[0] >= 60:
+        logger.warning(f"LTP quote failed [{kind}] ({rec[1]}x since last note): {detail}")
+        rec[0], rec[1] = now, 0
+
+
 def _get_ltp_data(symbols) -> dict:
     """
     Internal helper to fetch the LTP of a list of symbols from Dhan.
@@ -348,11 +362,17 @@ def _get_ltp_data(symbols) -> dict:
         res = dhan_api_call("market_data", _dhan_client.ticker_data, instruments)
         ltps = {}
         if isinstance(res, dict) and res.get("status") == "success":
-            inner = res.get("data", {}).get("data", {})
+            inner = (res.get("data") or {}).get("data") or {}
             for segment, sec_dict in inner.items():
                 for sec_id, quotes in sec_dict.items():
                     if sec_id in symbol_map:
                         ltps[symbol_map[sec_id]] = float(quotes.get("last_price", 0.0))
+            missing = [s for s in symbol_map.values() if not ltps.get(s)]
+            if missing:
+                _note_ltp_failure("no-quote", f"status=success but no/zero quote for {missing}; "
+                                              f"segments returned: {list(inner.keys())}")
+        else:
+            _note_ltp_failure("response", f"{type(res).__name__}: {str(res)[:300]}")
         return ltps
     except Exception as e:
         logger.error(f"Error fetching ticker LTP data: {e}")
