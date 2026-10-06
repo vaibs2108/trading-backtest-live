@@ -1306,6 +1306,9 @@ def build_undercurrent_digest(undercurrent: list, top_n: int = 10) -> str:
 def _maybe_send_undercurrent_digest(cfg):
     global _last_digest_sent, _index_alerts_since_digest
     now = _now_ist()
+    # 2026-10-06: a sweep that started ~15:12 finished at 15:31 and still sent its digest.
+    if not _market_open(now):
+        return
     if _last_digest_sent and (now - _last_digest_sent).total_seconds() < cfg.cas_digest_interval_minutes * 60:
         return
     with _state_lock:

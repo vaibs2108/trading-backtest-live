@@ -136,6 +136,64 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Secrets never reach a log or the console ──────────────────────────────────
+# Found 2026-10-06: when a Telegram send failed, the error line printed the full bot token
+# (".../bot<token>/sendMessage"), and the dhanhq order-update feed print()s the trading token
+# on every connect (dhanhq/orderupdate.py:56 -- on a server stdout lands in the system journal).
+# One filter on every handler + a wrapper around stdout/stderr masks them wherever they come from.
+import re as _re_secrets
+_SECRET_PATTERNS = [
+    (_re_secrets.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}"), "bot<redacted>"),
+    (_re_secrets.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "<redacted-token>"),
+    (_re_secrets.compile(r"(['\"](?:Token|access_token|access-token|accessToken)['\"]\s*:\s*['\"])[^'\"]{12,}(['\"])"),
+     r"\1<redacted>\2"),
+]
+
+
+def _redact_secrets(text: str) -> str:
+    for _rx, _rep in _SECRET_PATTERNS:
+        text = _rx.sub(_rep, text)
+    return text
+
+
+class _RedactSecretsFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            _msg = record.getMessage()
+            _red = _redact_secrets(_msg)
+            if _red != _msg:
+                record.msg, record.args = _red, None
+            if record.exc_info and not record.exc_text:
+                record.exc_text = _redact_secrets(logging.Formatter().formatException(record.exc_info))
+            elif record.exc_text:
+                record.exc_text = _redact_secrets(record.exc_text)
+        except Exception:
+            pass
+        return True
+
+
+class _RedactingStream:
+    """Wraps stdout/stderr so print() from any library can't leak a token."""
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, s):
+        try:
+            return self._stream.write(_redact_secrets(s) if isinstance(s, str) else s)
+        except Exception:
+            return self._stream.write(s)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+for _h in (console_handler, file_handler):
+    _h.addFilter(_RedactSecretsFilter())
+if not isinstance(sys.stdout, _RedactingStream):
+    sys.stdout = _RedactingStream(sys.stdout)
+if not isinstance(sys.stderr, _RedactingStream):
+    sys.stderr = _RedactingStream(sys.stderr)
+
 # Signal-latency log: one short line per candle-close cycle / order, in its own
 # file. Rotates at midnight and keeps 7 days, then old days are deleted.
 latency_logger = logging.getLogger("latency")
@@ -777,6 +835,13 @@ async def _reconnect_dhan_slot(slot: str) -> list:
                 await asyncio.to_thread(_old.join, 5)
             _feed.start(cfg.dhan_client_code, cfg.dhan_access_token)
             notes.append("live price feed restarted")
+        elif _in_market_hours(cfg.instrument, datetime.now(_IST)):
+            # Found 2026-10-06: started at 08:49 with expired tokens -> no feed; the 08:49:50 refresh
+            # reconnected Dhan but left the feed off until the 09:15 watchdog. Start it right away.
+            global _feed_restart_last_attempt
+            _feed_restart_last_attempt = 0.0
+            await _ensure_live_feed(cfg, datetime.now(_IST))
+            notes.append("live price feed started")
         # Order-update feed (speed-up for fill confirmation only)
         try:
             import order_update_feed
