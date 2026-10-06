@@ -21,6 +21,7 @@ _dhan_api_lock = threading.Lock()
 _last_call_by_category = {
     "historical": 0.0,
     "market_data": 0.0,
+    "quote": 0.0,
     "user_data": 0.0,
     "order": 0.0,
     "default": 0.0,
@@ -28,7 +29,10 @@ _last_call_by_category = {
 
 _category_min_spacing = {
     "historical": 1.05,   # 1.05s spacing for intraday & daily historical queries (Dhan HQ limit: 1 req/sec)
-    "market_data": 0.25,  # 250ms spacing for quotes/ticker/option-chain (Dhan HQ limit: 5 req/sec)
+    "market_data": 0.25,  # 250ms spacing for option-chain / expiry list
+    # Quotes (ticker_data / LTP): measured 2026-10-06 09:07 -- 5 quotes 0.3 s apart -> ok, FAIL, FAIL,
+    # FAIL, ok; 1.1 s apart -> all ok. At 0.25 s the app got ~20 empty failures a minute.
+    "quote": 1.05,
     "user_data": 1.00,    # 1.00s spacing for balance/positions (Dhan HQ limit: 1 req/sec)
     "order": 0.10,        # 100ms spacing for orders (Dhan HQ limit: 10 req/sec)
     "default": 0.50,
@@ -359,7 +363,7 @@ def _get_ltp_data(symbols) -> dict:
                 symbol_map[str(sec_id)] = symbol
 
     try:
-        res = dhan_api_call("market_data", _dhan_client.ticker_data, instruments)
+        res = dhan_api_call("quote", _dhan_client.ticker_data, instruments)
         ltps = {}
         if isinstance(res, dict) and res.get("status") == "success":
             inner = (res.get("data") or {}).get("data") or {}
@@ -537,7 +541,7 @@ def get_option_ltp(symbol: str) -> float:
     if symbol in _option_ltp_cache and symbol in _option_ltp_cache_time:
         if now - _option_ltp_cache_time[symbol] < 2.0:
             return _option_ltp_cache[symbol]
-    max_attempts = 4
+    max_attempts = 2   # was 4: quotes are now spaced 1.05 s (the real limit), so retries queue properly
     for attempt in range(max_attempts):
         try:
             ltps = _get_ltp_data([symbol])

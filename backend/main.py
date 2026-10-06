@@ -3190,16 +3190,25 @@ async def _signal_polling_loop():
                 # below (broadcast/telegram/order execution) stays sequential,
                 # in the same active-strategy-first order as before — only the
                 # heavy evaluation itself is parallelized.
-                _eval_results = await asyncio.gather(
-                    *[asyncio.to_thread(_processor.process_frames, frames, cfg, _qty)
-                      for _strat_id, _processor in _proc_list],
-                    return_exceptions=True,
-                )
-                _t_eval = datetime.now(_IST)
+                # All evaluations start at once, but each result is handled as soon as it is
+                # ready, in list order (active strategy first). Found live 2026-10-06: a single
+                # gather made the active strategy's signal (Option B: 0.16 s to evaluate) wait for
+                # the four 300-bar strategies (~5-8 s each, ~22 s together under the GIL) --
+                # candle-close evaluations took 14-34 s before any signal was acted on.
+                _eval_tasks = [asyncio.ensure_future(asyncio.to_thread(_processor.process_frames, frames, cfg, _qty))
+                               for _strat_id, _processor in _proc_list]
+                _t_eval = None
+                _t_active = None
                 _lat_signals = []
 
-                for (_strat_id, _processor), new_signals in zip(_proc_list, _eval_results):
+                for (_strat_id, _processor), _eval_task in zip(_proc_list, _eval_tasks):
                     try:
+                        try:
+                            new_signals = await _eval_task
+                        except BaseException as _ev_err:
+                            new_signals = _ev_err
+                        if _strat_id == cfg.strategy:
+                            _t_active = datetime.now(_IST)
                         if isinstance(new_signals, BaseException):
                             raise new_signals
 
@@ -3488,7 +3497,8 @@ async def _signal_polling_loop():
                         latency_logger.info(
                             f"{cfg.instrument} candle={_bar_close.strftime('%H:%M')} "
                             f"trigger={'candle' if _by_candle else 'poll'} start=+{_s(now)}s "
-                            f"frames=+{_s(_t_frames)}s sync=+{_s(_t_sync)}s eval=+{_s(_t_eval)}s "
+                            f"frames=+{_s(_t_frames)}s sync=+{_s(_t_sync)}s "
+                            f"active=+{_s(_t_active) if _t_active else '-'}s eval=+{_s(_t_eval or _t_done)}s "
                             f"done=+{_s(_t_done)}s signals={','.join(_lat_signals) or '-'}"
                         )
                     except Exception as _lat_err:
