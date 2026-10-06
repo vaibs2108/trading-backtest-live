@@ -808,6 +808,7 @@ async def get_status():
         "capital_state": get_capital_tracker().get_state(),
         "data_health":  _data_health_state,
         "live_feed":    get_live_feed().get_status(),
+        "manual_positions": __import__("manual_positions").get_all(),
         "app_running":  _app_running,
         "max_daily_loss": cfg.max_daily_loss,
         "max_daily_profit": cfg.max_daily_profit,
@@ -2325,6 +2326,8 @@ async def startup_event():
             _send_telegram_alert_wrapper(message, _tg.telegram_bot_token, _tg.telegram_chat_id)
 
         _lf_mod.set_alert_hook(_feed_telegram)
+        import manual_positions as _mp_mod
+        _mp_mod.set_notify(_feed_telegram)
     except Exception as _lf_err:
         logger.warning(f"Could not set live feed alert hook: {_lf_err}")
 
@@ -2366,10 +2369,22 @@ async def startup_event():
     if cfg.auto_trade and broker.is_connected():
         logger.info("Auto-trade ON: syncing position from broker...")
         try:
-            broker_pos = broker.sync_position_from_broker(cfg.instrument)
+            # Only a contract the app itself bought (auto track) is restored here; your manual
+            # Dhan positions go to the manual track via _sync_dhan_positions.
+            import trade_manager as _tm_mod
+            broker_pos = None
+            for _own_sym in sorted(_tm_mod.auto_owned_symbols()):
+                _bp = broker.sync_position_from_broker(cfg.instrument, tracked_symbol=_own_sym)
+                if _bp and _bp.get("has_position"):
+                    broker_pos = _bp
+                    break
             if broker_pos and broker_pos.get("has_position"):
                 tm = get_trade_manager()
                 tm.sync_from_broker(broker_pos, cfg.instrument)
+                if tm.position is not None and tm.position.symbol == broker_pos["symbol"]:
+                    tm.position.order_id = "AUTO_RESTORED_" + broker_pos["symbol"]
+                    tm.position.strategy = cfg.strategy
+                    tm.save_position_state()
                 logger.info(f"Restored position from broker: {broker_pos['direction']} {broker_pos['symbol']}")
                 add_activity_log(f"Restored position from broker: {broker_pos['direction']} {broker_pos['symbol']}")
             else:
@@ -3111,6 +3126,19 @@ async def _signal_polling_loop():
 
                 # Check for SL/Target hits on virtual journal entries
                 _check_virtual_exits(ltp, cfg, frames, latest_ts)
+                # Manual track: index-level stop / target reminders (alerts only, never an order)
+                try:
+                    import manual_positions as _mp_mod
+                    _mp_all = _mp_mod.get_all()
+                    if _mp_all:
+                        _mp_ltps = {cfg.instrument: ltp} if ltp else {}
+                        for _mp_inst in {m.get("instrument") for m in _mp_all if m.get("instrument")} - set(_mp_ltps):
+                            _v = await asyncio.to_thread(broker.get_ltp, _mp_inst)
+                            if _v:
+                                _mp_ltps[_mp_inst] = _v
+                        _mp_mod.check_levels(_mp_ltps)
+                except Exception as _mp_err:
+                    logger.debug(f"Manual-track check failed: {_mp_err}")
 
                 # Skip new signal generation if data is stale (but still monitor open positions)
                 if _data_health_state["is_stale"] and not (tm.position and tm.position.instrument == cfg.instrument):
@@ -3370,11 +3398,9 @@ async def _signal_polling_loop():
                                                 ok, reason = False, ct_reason
                                         if ok and broker.is_connected():
                                             try:
-                                                bp = await asyncio.to_thread(broker.sync_position_from_broker, cfg.instrument)
-                                                if bp and bp.get("has_position"):
-                                                    ok, reason = False, f"Broker already has open position: {bp.get('symbol')}"
-                                                elif bp and bp.get("fetch_failed"):
-                                                    ok, reason = False, "Broker positions unavailable (network/API) -- entry blocked"
+                                                _blk = await asyncio.to_thread(_auto_entry_broker_block, cfg)
+                                                if _blk:
+                                                    ok, reason = False, _blk
                                             except Exception:
                                                 pass
                                     if ok:
@@ -3394,6 +3420,8 @@ async def _signal_polling_loop():
                                             tm.reset_order_failures()
                                             await ws_manager.broadcast({"type": "trade_opened", "data": result})
                                             logger.info(f"Instant trade executed: {_live_sig.signal} {cfg.instrument}")
+                                        elif result.get("skipped"):
+                                            _notify_entry_skipped(cfg, _strat_id, _live_sig.signal, result.get("error", ""))
                                         else:
                                             fail_count = tm.record_order_failure()
                                             logger.error(f"Trade execution failed: {result.get('error')}")
@@ -3831,14 +3859,9 @@ async def _signal_polling_loop():
                                 # Prevents duplicate entries if local state got out of sync
                                 if ok and broker.is_connected():
                                     try:
-                                        bp = await asyncio.to_thread(broker.sync_position_from_broker, cfg.instrument)
-                                        if bp and bp.get("has_position"):
-                                            ok = False
-                                            reason = f"Broker already has open position: {bp.get('symbol')} qty={bp.get('qty')}"
-                                            logger.warning(f"Entry blocked — {reason}")
-                                        elif bp and bp.get("fetch_failed"):
-                                            ok = False
-                                            reason = "Broker positions unavailable (network/API) -- entry blocked"
+                                        _blk = await asyncio.to_thread(_auto_entry_broker_block, cfg)
+                                        if _blk:
+                                            ok, reason = False, _blk
                                             logger.warning(f"Entry blocked — {reason}")
                                     except Exception:
                                         pass  # don't block entry if check fails
@@ -3861,6 +3884,8 @@ async def _signal_polling_loop():
                                     await ws_manager.broadcast({"type": "trade_opened", "data": result})
                                     trade_type_label = "Live" if cfg.auto_trade else "Paper"
                                     logger.info(f"{trade_type_label} trade executed: {sig_direction} {cfg.instrument}")
+                                elif result.get("skipped"):
+                                    _notify_entry_skipped(cfg, cfg.strategy, sig_direction, result.get("error", ""))
                                 else:
                                     fail_count = tm.record_order_failure()
                                     logger.error(f"Trade execution failed: {result.get('error')}")
@@ -5267,6 +5292,34 @@ def send_telegram_exit_alert(pos, exit_price: float, reason: str, pnl: float, in
         logger.error(f"Telegram exit alert failed: {e}", exc_info=True)
 
 
+def _auto_entry_broker_block(cfg) -> Optional[str]:
+    """Why a REAL auto entry must not go ahead, or None. Only the app's OWN contracts count
+    (a still-open auto position the app lost track of); your manual positions never block it
+    (2026-10-06: two tracks). Unknown broker state blocks (network / API failure)."""
+    import trade_manager as _tm_mod
+    broker.get_positions()
+    if not broker.positions_fetch_ok():
+        return "Broker positions unavailable (network/API) -- entry blocked"
+    for _own_sym in sorted(_tm_mod.auto_owned_symbols()):
+        _bp = broker.sync_position_from_broker(cfg.instrument, tracked_symbol=_own_sym)
+        if _bp.get("fetch_failed"):
+            return "Broker positions unavailable (network/API) -- entry blocked"
+        if _bp.get("has_position"):
+            return f"Broker already has the app's own open position: {_own_sym} qty={_bp.get('qty')}"
+    return None
+
+
+def _notify_entry_skipped(cfg, strat_id: str, direction: str, why: str):
+    """Funds-check skip: Telegram 'NOT ENTERED', not counted as an order failure (kill switch)."""
+    logger.warning(f"[{strat_id}] {direction} NOT ENTERED -- {why}")
+    try:
+        _send_telegram_alert_wrapper(
+            f"\u26a0\ufe0f NOT ENTERED \u00b7 {strat_id.upper()} {direction}\n{why}",
+            cfg.telegram_bot_token, cfg.telegram_chat_id)
+    except Exception as _ns_err:
+        logger.debug(f"NOT ENTERED alert failed: {_ns_err}")
+
+
 def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
     """
     Synchronize the TradeManager's active position with the broker's actual positions.
@@ -5295,107 +5348,96 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                 df[net_qty_col] = pd.to_numeric(df[net_qty_col], errors='coerce').fillna(0)
                 open_rows = df[df[net_qty_col] != 0].to_dict(orient="records")
 
-        # 1. No position tracked locally, but Dhan has an open position -> Import it
-        if tm.position is None:
-            # Filter open rows to only those matching cfg.instrument
-            matching_rows = []
-            for row in open_rows:
-                sym = row.get('tradingSymbol', '')
-                inst = cfg.instrument
-                for possible_inst in ("BANKNIFTY", "NIFTY", "SENSEX", "CRUDEOIL"):
-                    if possible_inst in sym.upper():
-                        inst = possible_inst
-                        break
-                if inst == cfg.instrument:
-                    matching_rows.append(row)
+        # Two tracks (2026-10-06 decision): auto-trade = TradeManager.position (orders the app placed);
+        # every other open Dhan position = the MANUAL track (manual_positions.py), never touched by
+        # auto-trade and never closing / blocking it.
+        import manual_positions
+        import trade_manager as _tm_mod
+        # A manual position still sitting in the auto slot (stored before this change) moves over.
+        if tm.position is not None and str(tm.position.order_id).startswith(("DHAN_SYNC_", "BROKER_SYNC_")):
+            _lp = tm.position
+            manual_positions.upsert({
+                "symbol": _lp.symbol, "instrument": _lp.instrument, "direction": _lp.direction,
+                "qty": _lp.qty, "entry_price": _lp.entry_price, "sl": _lp.sl, "target1": _lp.target1,
+                "target2": _lp.target2, "trade_mode": _lp.trade_mode, "index_entry_price": _lp.index_entry_price,
+                "entry_time": _lp.entry_time, "exchange": _lp.exchange,
+            })
+            tm.position = None
+            tm.save_position_state()
+            logger.info(f"Moved manual position {_lp.symbol} from the auto slot to the manual track")
+        _auto_syms = _tm_mod.auto_owned_symbols()
+        if tm.position is not None and _tm_mod.is_live_auto_order(tm.position.order_id):
+            _auto_syms.add(tm.position.symbol)
 
-            if matching_rows:
-                row = matching_rows[0]
-                symbol = row['tradingSymbol']
-
-                # Skip re-import if this symbol was closed locally within the last 5 minutes
-                # (prevents re-import loop while Dhan still shows the position as open)
-                global _recently_closed_symbols
-                if symbol in _recently_closed_symbols:
-                    age_secs = (datetime.now(_IST) - _recently_closed_symbols[symbol]).total_seconds()
-                    if age_secs < 30:
-                        return
-                    else:
-                        del _recently_closed_symbols[symbol]
-
-                net_qty = int(row[net_qty_col])
-                qty = abs(net_qty)
-                entry_price = float(row.get('buyAvg', 0.0) or row.get('costPrice', 0.0) or 0.0)
-                if entry_price == 0.0:
-                    entry_price = float(row.get('sellAvg', 0.0) or 0.0)
-                # A re-entry after a same-day close: price the OPEN lot by its own fill(s), not
-                # Dhan's average of every buy today (see _dhan_round_trips_today).
-                if int(float(row.get('daySellQty') or 0)) > 0:
-                    _open = [t for t in (_dhan_round_trips_today(symbol, row) or []) if t.get("status") == "OPEN"]
-                    _oq = sum(int(t["qty"]) for t in _open)
-                    if _open and _oq == qty:
-                        _fifo = round(sum(t["entry_price"] * t["qty"] for t in _open) / _oq, 2)
-                        if abs(_fifo - entry_price) > 0.005:
-                            logger.info(f"DHAN_SYNC {symbol}: entry {_fifo} from today's fills "
-                                        f"(Dhan day-average {entry_price})")
-                        entry_price = _fifo
-
-                is_option = any(term in symbol.upper() for term in ('-CE', '-PE', ' CALL', ' PUT'))
-                trade_mode = "OPTIONS" if is_option else "INDEX"
-
-                # For options: determine market direction from CE/PE, not raw net_qty sign
-                # (buying PE = bearish SHORT on underlying, even though net_qty is positive)
-                if is_option:
-                    direction = "LONG" if ('-CE' in symbol.upper() or 'CALL' in symbol.upper()) else "SHORT"
-                else:
-                    direction = "LONG" if net_qty > 0 else "SHORT"
-
-                # Resolve instrument
-                instrument = cfg.instrument
-                for inst in ("BANKNIFTY", "NIFTY", "SENSEX", "CRUDEOIL"):
-                    if inst in symbol.upper():
-                        instrument = inst
-                        break
-
-                # Compute SL/T1/T2 from index LTP + ATR at import time
-                index_ltp = broker.get_ltp(instrument) or entry_price
+        # 1. MANUAL track: every open Dhan position the app didn't buy itself
+        _manual_open = set()
+        _known_manual = {mp["symbol"]: mp for mp in manual_positions.get_all()}
+        for row in open_rows:
+            symbol = row.get('tradingSymbol', '')
+            if not symbol or symbol in _auto_syms:
+                continue
+            _manual_open.add(symbol)
+            net_qty = int(row[net_qty_col])
+            qty = abs(net_qty)
+            if symbol in _known_manual and int(_known_manual[symbol].get("qty") or 0) == qty:
+                continue          # already tracked, unchanged
+            entry_price = float(row.get('buyAvg', 0.0) or row.get('costPrice', 0.0) or 0.0)
+            if entry_price == 0.0:
+                entry_price = float(row.get('sellAvg', 0.0) or 0.0)
+            # A re-entry after a same-day close: price the OPEN lot by its own fill(s), not
+            # Dhan's average of every buy today (see _dhan_round_trips_today).
+            if int(float(row.get('daySellQty') or 0)) > 0:
+                _open = [t for t in (_dhan_round_trips_today(symbol, row) or []) if t.get("status") == "OPEN"]
+                _oq = sum(int(t["qty"]) for t in _open)
+                if _open and _oq == qty:
+                    entry_price = round(sum(t["entry_price"] * t["qty"] for t in _open) / _oq, 2)
+            is_option = any(term in symbol.upper() for term in ('-CE', '-PE', ' CALL', ' PUT'))
+            if is_option:
+                direction = "LONG" if ('-CE' in symbol.upper() or 'CALL' in symbol.upper()) else "SHORT"
+            else:
+                direction = "LONG" if net_qty > 0 else "SHORT"
+            instrument = ""
+            for inst in ("BANKNIFTY", "NIFTY", "SENSEX", "CRUDEOIL"):
+                if inst in symbol.upper():
+                    instrument = inst
+                    break
+            sl_price = t1_price = t2_price = 0.0
+            index_ltp = broker.get_ltp(instrument) if instrument else None
+            if index_ltp:
                 atr = _last_signal.get("atr_5m", index_ltp * 0.003) if _last_signal else index_ltp * 0.003
-                sl_mult  = cfg.atr_sl_mult
-                t1_mult  = cfg.atr_t1_mult
-                t2_mult  = cfg.atr_t2_mult
-                if direction == "LONG":
-                    sl_price  = round(index_ltp - atr * sl_mult, 2)
-                    t1_price  = round(index_ltp + atr * t1_mult, 2)
-                    t2_price  = round(index_ltp + atr * t2_mult, 2)
-                else:
-                    sl_price  = round(index_ltp + atr * sl_mult, 2)
-                    t1_price  = round(index_ltp - atr * t1_mult, 2)
-                    t2_price  = round(index_ltp - atr * t2_mult, 2)
-
-                pos = ActivePosition(
-                    instrument        = instrument,
-                    symbol            = symbol,
-                    exchange          = row.get('exchangeSegment', 'NSE_FNO'),
-                    direction         = direction,
-                    entry_price       = entry_price,
-                    sl                = sl_price,
-                    target1           = t1_price,
-                    target2           = t2_price,
-                    qty               = qty,
-                    order_id          = "DHAN_SYNC_" + symbol,
-                    entry_time        = datetime.now(_IST).isoformat(),
-                    trade_mode        = trade_mode,
-                    index_entry_price = index_ltp,
-                    highest_since_entry = index_ltp,
-                    lowest_since_entry = index_ltp,
-                    entry_atr         = atr,
-                    strategy          = "broker_sync",
-                )
-                tm.open_position(pos)
-                logger.info(f"Imported open position from Dhan: {direction} {symbol} qty={qty} SL={sl_price} T1={t1_price} T2={t2_price}")
+                _sgn = 1 if direction == "LONG" else -1
+                sl_price = round(index_ltp - _sgn * atr * cfg.atr_sl_mult, 2)
+                t1_price = round(index_ltp + _sgn * atr * cfg.atr_t1_mult, 2)
+                t2_price = round(index_ltp + _sgn * atr * cfg.atr_t2_mult, 2)
+            if symbol in _known_manual:      # qty changed: keep levels, refresh qty / entry
+                sl_price = _known_manual[symbol].get("sl", sl_price)
+                t1_price = _known_manual[symbol].get("target1", t1_price)
+                t2_price = _known_manual[symbol].get("target2", t2_price)
+            manual_positions.upsert({
+                "symbol": symbol, "instrument": instrument, "direction": direction, "qty": qty,
+                "entry_price": entry_price, "sl": sl_price, "target1": t1_price, "target2": t2_price,
+                "trade_mode": "OPTIONS" if is_option else "INDEX", "index_entry_price": index_ltp,
+                "entry_time": datetime.now(_IST).isoformat(), "exchange": row.get('exchangeSegment', 'NSE_FNO'),
+            })
+        # Manual positions no longer open on Dhan were closed there: record the real exit fill.
+        for _sym, _mp in _known_manual.items():
+            if _sym in _manual_open:
+                continue
+            _exit_px, _pnl = None, None
+            try:
+                _closed = [t for t in (_dhan_round_trips_today(_sym, None) or []) if t.get("status") == "CLOSED"]
+                if _closed:
+                    _ep = float(_mp.get("entry_price") or 0)
+                    _same = [t for t in _closed if _ep and abs(t["entry_price"] - _ep) <= 0.005 * _ep]
+                    _trip = (_same or _closed)[-1]
+                    _exit_px = float(_trip["exit_price"])
+                    _pnl = round((_exit_px - _ep) * int(_mp.get("qty") or 0), 2) if _ep else float(_trip["pnl"])
+            except Exception as _mx:
+                logger.debug(f"manual close fill lookup failed for {_sym}: {_mx}")
+            manual_positions.close(_sym, _exit_px, _pnl)
                 
-        # 2. Position is tracked locally, but it's a live position and Dhan has no open position -> Close it
-        elif tm.position:
+        # 2. AUTO track: a live auto position no longer open on Dhan -> close it locally
+        if tm.position:
             pos = tm.position
             # Only sync live/Dhan positions (exclude paper trades)
             if not pos.order_id.startswith("PAPER_"):

@@ -1262,6 +1262,17 @@ def place_entry_order(
     else:
         ltp = get_ltp(instrument) or 0.0
 
+    # Funds check before every auto order (2026-10-06 decision: manual and auto trades share the
+    # balance). Options are bought outright, so the need is premium x qty (+2% buffer). Unknown
+    # premium or balance -> skip too: never send an order that can't be paid for.
+    if trade_mode == "OPTIONS":
+        _need = round(ltp * qty * 1.02, 2) if ltp else 0.0
+        _avail = get_balance()
+        if not ltp or not _avail or _avail < _need:
+            _why = (f"insufficient funds: need ~Rs {_need:,.0f} for {qty} x {symbol} @ {ltp}, available Rs {_avail:,.0f}"
+                    if ltp and _avail else f"funds check impossible (premium {ltp or 'unknown'}, balance {_avail or 'unknown'})")
+            logger.warning(f"Live entry skipped -- {_why}")
+            return {"success": False, "skipped": True, "error": _why, "symbol": symbol}
     logger.info(f"Placing live entry {direction} {trade_mode}: {symbol} qty={qty} (txn={transaction})")
 
     try:

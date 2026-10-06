@@ -14,6 +14,33 @@ logger = logging.getLogger(__name__)
 
 _DAY_STATS_PATH = Path(__file__).parent / "data" / "day_stats.json"
 _ACTIVE_POSITION_PATH = Path(__file__).parent / "data" / "active_position.json"
+# Contracts the app itself bought LIVE (auto-trade). Separates the auto track from your manual Dhan
+# positions (2026-10-06 decision: both run in parallel); kept on disk so a restart still knows.
+_AUTO_OWNED_PATH = Path(__file__).parent / "data" / "auto_owned_symbols.json"
+
+
+def auto_owned_symbols() -> set:
+    try:
+        if _AUTO_OWNED_PATH.exists():
+            return set(json.loads(_AUTO_OWNED_PATH.read_text(encoding="utf-8")))
+    except Exception as e:
+        logger.warning(f"Could not read {_AUTO_OWNED_PATH.name}: {e}")
+    return set()
+
+
+def _set_auto_owned(symbol: str, owned: bool):
+    s = auto_owned_symbols()
+    if (symbol in s) == owned:
+        return
+    (s.add if owned else s.discard)(symbol)
+    try:
+        _AUTO_OWNED_PATH.write_text(json.dumps(sorted(s)), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Could not save {_AUTO_OWNED_PATH.name}: {e}")
+
+
+def is_live_auto_order(order_id: str) -> bool:
+    return bool(order_id) and not str(order_id).startswith(("PAPER_", "DHAN_SYNC_", "BROKER_SYNC_"))
 
 
 @dataclass
@@ -163,6 +190,8 @@ class TradeManager:
 
     def open_position(self, pos: ActivePosition):
         self.position = pos
+        if is_live_auto_order(pos.order_id):
+            _set_auto_owned(pos.symbol, True)
         logger.info(f"Position opened: {pos.direction} {pos.symbol} @ {pos.entry_price}")
         self.save_position_state()
 
@@ -220,6 +249,7 @@ class TradeManager:
         self._save_day_stats()
 
         logger.info(f"Position closed: {pos.direction} {pos.symbol} @ {exit_price} | PnL: Rs.{pnl:,.0f} | Reason: {reason}")
+        _set_auto_owned(pos.symbol, False)
         self.position = None
         self.save_position_state()
         return trade_rec
