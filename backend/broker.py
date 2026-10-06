@@ -1610,6 +1610,8 @@ def sync_position_from_broker(instrument: str, tracked_symbol: str = None) -> di
     """
     try:
         pos_df = get_positions()
+        if not _positions_fetch_ok:
+            return {"fetch_failed": True}   # UNKNOWN -- callers must not read this as "no position"
         if pos_df is None or pos_df.empty:
             return {}
 
@@ -1691,8 +1693,19 @@ def _extract_exchange(row) -> str:
     return ""
 
 
+_positions_fetch_ok = True   # did the LAST positions request actually get an answer from Dhan?
+
+
+def positions_fetch_ok() -> bool:
+    """False when the last positions request failed (network / Dhan error). Found live
+    2026-10-06 12:45 and 12:52: during a network drop get_positions() returned an EMPTY list,
+    which the position sync read as "closed on Dhan" -- the user's real 54500 CE was dropped
+    from tracking twice and the free slot let a strategy join on top of it."""
+    return _positions_fetch_ok
+
+
 def get_positions() -> pd.DataFrame:
-    global _positions_cache, _positions_cache_time
+    global _positions_cache, _positions_cache_time, _positions_fetch_ok
     import pytz
     now = datetime.now(pytz.timezone("Asia/Kolkata"))
     if _positions_cache is not None and _positions_cache_time is not None:
@@ -1702,13 +1715,17 @@ def get_positions() -> pd.DataFrame:
         return pd.DataFrame()
     try:
         res = dhan_api_call("user_data", _dhan_client.get_positions)
-        if isinstance(res, dict) and "data" in res and res["data"]:
-            df = pd.DataFrame(res["data"])
+        if isinstance(res, dict) and res.get("status") == "success":
+            _positions_fetch_ok = True
+            df = pd.DataFrame(res["data"]) if res.get("data") else pd.DataFrame()
             _positions_cache = df
             _positions_cache_time = now
             return df
+        _positions_fetch_ok = False
+        logger.warning(f"get_positions: no valid answer from Dhan ({str(res)[:200]}) -- positions UNKNOWN")
         return pd.DataFrame()
     except Exception as e:
+        _positions_fetch_ok = False
         logger.error(f"get_positions error: {e}")
         return pd.DataFrame()
 

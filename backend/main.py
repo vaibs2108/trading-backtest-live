@@ -3308,6 +3308,8 @@ async def _signal_polling_loop():
                                                 bp = await asyncio.to_thread(broker.sync_position_from_broker, cfg.instrument)
                                                 if bp and bp.get("has_position"):
                                                     ok, reason = False, f"Broker already has open position: {bp.get('symbol')}"
+                                                elif bp and bp.get("fetch_failed"):
+                                                    ok, reason = False, "Broker positions unavailable (network/API) -- entry blocked"
                                             except Exception:
                                                 pass
                                     if ok:
@@ -3769,6 +3771,10 @@ async def _signal_polling_loop():
                                             ok = False
                                             reason = f"Broker already has open position: {bp.get('symbol')} qty={bp.get('qty')}"
                                             logger.warning(f"Entry blocked — {reason}")
+                                        elif bp and bp.get("fetch_failed"):
+                                            ok = False
+                                            reason = "Broker positions unavailable (network/API) -- entry blocked"
+                                            logger.warning(f"Entry blocked — {reason}")
                                     except Exception:
                                         pass  # don't block entry if check fails
                             if ok:
@@ -3830,7 +3836,9 @@ async def _signal_polling_loop():
                                     pos.instrument,
                                     tracked_symbol=pos.symbol  # exact match — avoids false close from user's other positions
                                 )
-                                if not bp or not bp.get("has_position"):
+                                if bp and bp.get("fetch_failed"):
+                                    logger.warning(f"Broker position check failed for {pos.symbol} -- position kept (not assumed closed)")
+                                elif not bp or not bp.get("has_position"):
                                     logger.warning(f"Active position {pos.symbol} was closed at broker. Closing locally.")
                                     exit_triggered = True
                                     exit_reason = "BROKER_SL_HIT"
@@ -5205,7 +5213,11 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
 
     try:
         df = broker.get_positions()
-        
+        if not broker.positions_fetch_ok():
+            # Unknown is not "flat": never import or close anything on a failed fetch.
+            logger.warning("Position sync skipped: Dhan positions could not be fetched (network / API)")
+            return
+
         # Find open positions in Dhan (netQty != 0)
         open_rows = []
         if df is not None and not df.empty:
