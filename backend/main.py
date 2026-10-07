@@ -712,13 +712,10 @@ async def get_status():
     if broker.is_connected():
         try:
             bal = await asyncio.to_thread(broker.get_balance)
-            if bal > 0 and cfg.auto_trade:
-                ct = get_capital_tracker()
-                ct.current_equity = bal
-                if ct.current_equity > ct.peak_equity:
-                    ct.peak_equity = ct.current_equity
-                ct._check_breach()
-                ct._save()
+            # Capital protection no longer reads Dhan's cash (2026-10-07, your choice A): with two
+            # tracks, cash tied up in YOUR manual position looked like a 51.8% auto-trade
+            # "drawdown" and blocked every auto entry. The tracker now moves only on auto-trade's
+            # own realised P&L (record_trade_pnl); cash availability is the funds check per order.
         except Exception as e:
             logger.warning(f"Failed to sync broker balance in status: {e}")
             
@@ -4336,14 +4333,8 @@ async def get_capital_state():
     if broker.is_connected():
         try:
             dhan_bal = await asyncio.to_thread(broker.get_balance)
-            if dhan_bal > 0 and cfg.auto_trade:
-                equity = dhan_bal
-                # Update capital tracker in-memory and on-disk
-                ct.current_equity = equity
-                if ct.current_equity > ct.peak_equity:
-                    ct.peak_equity = ct.current_equity
-                ct._check_breach()
-                ct._save()
+            # Not written into the tracker any more (see get_status): equity = starting capital +
+            # auto-trade realised P&L. Dhan's cash is shown separately.
         except Exception as _bal_err:
             logger.warning(f"Failed to fetch real-time balance for capital protection: {_bal_err}")
 
