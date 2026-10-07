@@ -64,6 +64,7 @@ class Settings(BaseSettings):
                                            # path automatically on any fetch
                                            # error).
     confirm_signals: bool = False        # whether to require 2 consecutive polls before entry
+    auto_trade_join_running: bool = False  # False (07 Oct): wait for the strategy's next NEW signal, never join a running trade
     auto_square_off_minutes: int = 10    # minutes before market close to auto square-off
     auto_kill_switch: bool = False       # auto-disable after consecutive failures
     auto_kill_switch_max_failures: int = 3  # failures before kill switch triggers

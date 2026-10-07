@@ -670,8 +670,144 @@ class OptionBRamRFLiveProcessor(BacktestDiffProcessor):
     the same day: SL/target fix, 1000-bar window via _WIDE_WINDOW_BARS
     above, target2 informational-only via main.py's _INFO_ONLY_TARGET2).
     No trailing SL (not in main.py's _TRAIL_PARAMS) -- its own RAM/RF/
-    no-progress signals are the only exit path, by design."""
+    no-progress signals are the only exit path, by design.
+
+    W12 (07 Oct): the kernel enters at the NEXT bar's open and exits Ram trades through a limit
+    at the UT bar's close. The plain diff only sees both after the fill bar has completed -- a
+    bar late (today: SHORT seen 13:05 instead of 13:00; exit seen 14:30 after a +243-pt bar).
+    Over 5 years that lag cost ~17,300 of 62,200 pts and nearly doubled the drawdown. So:
+      * at each candle close the kernel also runs with a provisional next bar at the current
+        price; a Ram entry / reversal on that bar is decided by the bar that just closed, so it
+        is acted on now (other events on the provisional bar are ignored);
+      * the Ram limit still armed after the last close is published as pending_limit_exit;
+        main.py exits when the index touches it (forming bar high/low or last price), unless Range
+        Filter (as of the last close) points the same way -- then it keeps holding, as in the kernel."""
     strategy_id = "custom_option_b_ram_rf"
+    LIMIT_PEN = 0.0      # exit on a touch, exactly like the kernel's limit fill
+
+    def __init__(self):
+        super().__init__()
+        self.pending_limit_exit: Optional[dict] = None
+        self._prov_for_ts = None
+
+    def reset(self):
+        super().reset()
+        self.pending_limit_exit = None
+        self._prov_for_ts = None
+
+    def _eval_5m(self, frames: dict):
+        window = _WIDE_WINDOW_BARS.get(self.strategy_id, DEFAULT_WINDOW_BARS)
+        df = frames["5"]
+        return df.tail(window).copy() if len(df) > window else df.copy()
+
+    def _update_limit_state(self, b5):
+        """Ram's armed limit after the last completed bar (same tracks as the kernel)."""
+        import strategies.custom.custom_ram_rf_box as rk
+        b = b5.copy()
+        b["timestamp"] = pd.to_datetime(b["timestamp"])
+        t = b.timestamp.dt.time
+        b = b[(t >= pd.Timestamp("09:15").time()) & (t <= pd.Timestamp("15:25").time())].reset_index(drop=True)
+        self.pending_limit_exit = None
+        if len(b) < 300:
+            return
+        o, h, l, c = (b[k].values.astype(float) for k in ("open", "high", "low", "close"))
+        ram, rf = rk._ram_track(o, h, l, c), rk._rf_track(c)
+        kern = self._get_kernel()
+        bars, pts = getattr(kern, "NP_BARS", 4), getattr(kern, "NP_PTS", 10.0)
+        rk._no_progress(ram, h, l, c, bars, pts)
+        rk._no_progress(rf, h, l, c, bars, pts)
+        ram_dir = int(ram.dir_end[-1])
+        lim = getattr(ram, "lim_last", None)
+        if ram_dir == 0 or lim is None:
+            return
+        direction = "LONG" if ram_dir > 0 else "SHORT"
+        if self.position != direction:
+            return
+        self.pending_limit_exit = {
+            "direction": direction, "level": round(float(lim), 2),
+            "rf_holds": int(rf.dir_end[-1]) == ram_dir,
+            "armed_at": str(b.timestamp.iloc[-1]),
+        }
+        logger.info(f"[{self.strategy_id}] Ram limit exit armed: {direction} level {lim:.2f} "
+                    f"(exit {'held by Range Filter -- no intrabar exit' if self.pending_limit_exit['rf_holds'] else 'when the index touches it'})")
+
+    def _provisional_signals(self, frames: dict, last_ts, qty: int) -> List[LiveSignal]:
+        """Run the kernel with a provisional next bar at the current price; act now on a Ram
+        entry/reversal there (it depends only on the bar that just closed)."""
+        last_ts = pd.Timestamp(last_ts)
+        if last_ts.time() >= pd.Timestamp("15:25").time():
+            return []                      # next bar is tomorrow's open: the normal diff handles it
+        next_ts = last_ts + pd.Timedelta(minutes=5)
+        px = 0.0
+        try:
+            import broker as _bk
+            px = float(_bk.get_ltp(frames.get("_instrument", "BANKNIFTY")) or 0.0)
+        except Exception:
+            px = 0.0
+        b5 = self._eval_5m(frames)
+        if not px:
+            px = float(b5.iloc[-1]["close"])
+        row = {col: np.nan for col in b5.columns}
+        row.update({"timestamp": next_ts if not hasattr(b5["timestamp"].iloc[-1], "tzinfo") or b5["timestamp"].iloc[-1].tzinfo is None
+                    else next_ts.tz_localize(b5["timestamp"].iloc[-1].tzinfo) if next_ts.tzinfo is None else next_ts,
+                    "open": px, "high": px, "low": px, "close": px, "volume": 0})
+        prov = {k: v for k, v in frames.items() if k != "_instrument"}
+        prov["5"] = pd.concat([b5, pd.DataFrame([row])], ignore_index=True)
+        kernel = self._get_kernel()
+        if kernel is None:
+            return []
+        try:
+            res = kernel.safe_run_backtest(prov)
+        except Exception as e:
+            logger.warning(f"[{self.strategy_id}] provisional evaluation failed: {e}")
+            return []
+        trades = (res or {}).get("trades", []) if not (res or {}).get("error") else []
+        new = [t for t in trades
+               if pd.Timestamp(t["entry_time"]).tz_localize(None) == next_ts.tz_localize(None)
+               and (t["direction"], t["entry_time"]) not in self._prev_trade_keys]
+        if not new:
+            return []
+        t_new = new[-1]
+        out: List[LiveSignal] = []
+        if self._prev_open_key and self._prev_open_key[0] != t_new["direction"]:
+            old = next((t for t in trades if (t["direction"], t["entry_time"]) == self._prev_open_key), None)
+            if old is not None and old.get("exit_reason") != "OPEN":
+                out.append(self._exit_from_trade(old, qty))
+                logger.info(f"[{self.strategy_id}] EXIT (at the signal-bar close) {old['direction']} "
+                            f"reason={old.get('exit_reason')} @ {old.get('exit_price')}")
+        out.append(self._entry_from_trade(t_new))
+        logger.info(f"[{self.strategy_id}] ENTRY (at the signal-bar close, fill bar {t_new['entry_time']}) "
+                    f"{t_new['direction']} @ {t_new.get('entry_price')} SL={t_new.get('sl')}")
+        key = (t_new["direction"], t_new["entry_time"])
+        self._prev_trade_keys.add(key)
+        self._prev_open_key = key
+        self.position = t_new["direction"]
+        self.entry_price = t_new.get("entry_price", 0)
+        self.sl = t_new.get("sl", 0)
+        self.target1 = t_new.get("target1", 0)
+        self.target2 = t_new.get("target2", 0)
+        self.trade_source = t_new.get("source", "STRATEGY")
+        self._last_exit_signal = None
+        self._last_exit_reason = None
+        self.pending_limit_exit = None     # a fresh Ram position has no limit armed yet
+        return out
+
+    def process_frames(self, frames: dict, cfg, lot_size: int = 30) -> List[LiveSignal]:
+        signals = super().process_frames(frames, cfg, lot_size)
+        try:
+            if not self._initialised or self.last_processed_ts is None or self._prov_for_ts == self.last_processed_ts:
+                return signals
+            self._prov_for_ts = self.last_processed_ts
+            if any(s.signal_type == "ENTRY" for s in signals):
+                self.pending_limit_exit = None
+                return signals             # the bar itself produced an entry: nothing more this close
+            self._update_limit_state(self._eval_5m(frames))
+            prov = self._provisional_signals({**frames, "_instrument": getattr(cfg, "instrument", "BANKNIFTY")},
+                                             self.last_processed_ts, lot_size)
+            return signals + prov
+        except Exception as e:
+            logger.warning(f"[{self.strategy_id}] signal-bar-close handling failed: {e}", exc_info=True)
+            return signals
 
 
 class Cusum15LiveProcessor(BacktestDiffProcessor):

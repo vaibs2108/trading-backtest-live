@@ -597,6 +597,7 @@ class SettingsUpdate(BaseModel):
     auto_kill_switch_max_failures: Optional[int] = None
     starting_capital: Optional[float] = None
     position_hold_mode: Optional[str] = None   # "CARRY_FORWARD" | "INTRADAY"
+    auto_trade_join_running: Optional[bool] = None
     data_stale_threshold_min: Optional[int] = None
     # Regime Strategy settings
     regime_trail_mult: Optional[float] = None
@@ -3839,6 +3840,17 @@ async def _signal_polling_loop():
                                     _last_skipped_traded_key = _tkey
                                     logger.info(f"Not re-joining {_tkey}: the app already entered this strategy trade "
                                                 f"(and has since left it)")
+                            # Your decision 07 Oct: auto-trade waits for the strategy's NEXT NEW signal; a trade
+                            # the strategy was already running (from before a restart / before auto-trade was
+                            # switched on / after the app left it) is not joined. Setting: auto_trade_join_running.
+                            elif not getattr(cfg, "auto_trade_join_running", False):
+                                _pet_age = _signal_age_minutes(sig.get("position_entry_time") or sig_ts)
+                                if _pet_age is not None and _pet_age > 10.0:
+                                    should_enter = False
+                                    if _tkey != _last_skipped_traded_key:
+                                        _last_skipped_traded_key = _tkey
+                                        logger.info(f"Not joining {_tkey}: the strategy entered it {_pet_age:.0f} min ago -- "
+                                                    f"waiting for its next new signal (auto_trade_join_running=False)")
                         if should_enter:
                             _tid = _trace_id(cfg.strategy, sig_direction, sig_ts)
                             _trace(_tid, "DETECTED", f"path=legacy strategy={cfg.strategy} dir={sig_direction} sig_time={sig_ts}")
@@ -3933,6 +3945,46 @@ async def _signal_polling_loop():
                                 await _exit_position_strategy_flat(cfg, tm, _fpos)
                     except Exception as _fx_err:
                         logger.error(f"Strategy-flat exit check failed: {_fx_err}", exc_info=True)
+
+                # W12 (07 Oct): Option B's Ram exit is a LIMIT at the UT bar's close, filled in the kernel
+                # when a later bar touches it. Waiting for that bar to complete cost ~1 bar per exit
+                # (14:25 today: +243 pts against the SHORT). Exit as soon as the index touches the level
+                # (as the kernel does), unless Range Filter keeps holding.
+                try:
+                    _lpos = tm.position
+                    _lap = _active_processor(cfg) if _lpos is not None else None
+                    _lim = getattr(_lap, "pending_limit_exit", None) if _lap is not None else None
+                    if (_lim and _lpos is not None and not _lim.get("rf_holds")
+                            and _lim.get("direction") == _lpos.direction
+                            and _lpos.instrument == cfg.instrument
+                            and not str(_lpos.order_id).startswith("DHAN_SYNC_")
+                            and (not getattr(_lpos, "strategy", None) or _lpos.strategy == cfg.strategy)):
+                        _ix = await asyncio.to_thread(broker.get_ltp, cfg.instrument)
+                        _lvl, _pen = float(_lim["level"]), float(getattr(_lap, "LIMIT_PEN", 0.0))
+                        # The kernel fills when the bar's high/low touches the level, so a brief touch
+                        # between two checks counts too: use the live feed's forming 5m bar since the
+                        # level was armed, plus the latest price.
+                        _hi = _lo = _ix or 0.0
+                        try:
+                            _cur = get_live_feed().candle_5m._current
+                            if _cur and pd.Timestamp(_cur["timestamp"]).tz_localize(None) > pd.Timestamp(_lim["armed_at"]).tz_localize(None):
+                                _hi = max(_hi or _cur["high"], _cur["high"])
+                                _lo = min(_lo or _cur["low"], _cur["low"])
+                        except Exception:
+                            pass
+                        if _ix and ((_lpos.direction == "LONG" and _hi >= _lvl + _pen)
+                                    or (_lpos.direction == "SHORT" and _lo <= _lvl - _pen)):
+                            global _limit_exit_last_try
+                            if (datetime.now(_IST) - _limit_exit_last_try).total_seconds() >= 20:
+                                _limit_exit_last_try = datetime.now(_IST)
+                                if await _exit_position_strategy_flat(
+                                        cfg, tm, _lpos, reason="RAM_LIMIT_EXIT",
+                                        why=f"Option B exit level {_lvl:,.2f} touched (bar {'high' if _lpos.direction == 'LONG' else 'low'} "
+                                            f"{(_hi if _lpos.direction == 'LONG' else _lo):,.2f}, index now {_ix:,.2f}), "
+                                            f"acted on intrabar as the strategy's limit exit"):
+                                    _lap.pending_limit_exit = None
+                except Exception as _le_err:
+                    logger.error(f"Ram limit-exit check failed: {_le_err}", exc_info=True)
 
                 # Monitor open position
                 if tm.position:
@@ -5320,6 +5372,7 @@ def send_telegram_exit_alert(pos, exit_price: float, reason: str, pnl: float, in
 
 
 _flat_exit_last_try = datetime(2000, 1, 1, tzinfo=_IST)
+_limit_exit_last_try = datetime(2000, 1, 1, tzinfo=_IST)
 
 
 def _active_processor(cfg):
@@ -5336,33 +5389,33 @@ def _active_processor(cfg):
     return _f() if _f else None
 
 
-async def _exit_position_strategy_flat(cfg, tm, pos):
-    """Close the app's position because the active strategy no longer holds one (W5)."""
+async def _exit_position_strategy_flat(cfg, tm, pos, reason: str = "STRATEGY_FLAT",
+                                       why: str = "Strategy already flat (its exit happened while the app wasn't evaluating)") -> bool:
+    """Close the app's position for the active strategy outside a candle-close signal: the strategy is
+    already flat (W5), or Option B's Ram limit exit was touched intrabar (W12). True when closed."""
     global _active_trade_signal
-    reason = "STRATEGY_FLAT"
     _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", datetime.now(_IST).isoformat())
-    _trace(_tid, "DETECTED", f"path=strategy_flat strategy={cfg.strategy} closing={pos.direction} {pos.symbol}")
-    logger.warning(f"Active strategy {cfg.strategy} is flat but the app holds {pos.direction} {pos.symbol} "
-                   f"(exit missed while the app wasn't evaluating) -- closing it")
+    _trace(_tid, "DETECTED", f"path={reason.lower()} strategy={cfg.strategy} closing={pos.direction} {pos.symbol}")
+    logger.warning(f"{reason}: {why} -- closing {pos.direction} {pos.symbol}")
     if cfg.auto_trade and not str(pos.order_id).startswith("PAPER_"):
         if getattr(pos, "sl_order_id", None):
             try:
                 await asyncio.to_thread(broker.cancel_broker_sl, pos.sl_order_id)
             except Exception as _sl_c_err:
-                logger.warning(f"Could not cancel broker SL on strategy-flat exit: {_sl_c_err}")
+                logger.warning(f"Could not cancel broker SL on {reason} exit: {_sl_c_err}")
             pos.sl_order_id = None
         _ex = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
         _trace(_tid, "BROKER_RESULT", f"success={_ex.get('success')} error={_ex.get('error','')}")
         if not _ex.get("success"):
-            logger.error(f"Strategy-flat EXIT FAILED for {pos.symbol}: {_ex.get('error')} -- position kept open")
+            logger.error(f"{reason} EXIT FAILED for {pos.symbol}: {_ex.get('error')} -- position kept open")
             try:
                 _send_telegram_alert_wrapper(
-                    f"EXIT ORDER FAILED (strategy flat)\n{pos.direction} {pos.symbol}\n"
-                    f"Reason: {_ex.get('error')}\nPosition still open — will retry in 1 min; check Dhan.",
+                    f"EXIT ORDER FAILED ({reason})\n{pos.direction} {pos.symbol}\n"
+                    f"Reason: {_ex.get('error')}\nPosition still open — will retry; check Dhan.",
                     cfg.telegram_bot_token, cfg.telegram_chat_id)
             except Exception:
                 pass
-            return
+            return False
     ltp = (await asyncio.to_thread(broker.get_ltp, pos.instrument)) or 0
     _pnl_exit = _safe_pnl_exit_price(pos, ltp)
     rec = tm.close_position(_pnl_exit, reason)
@@ -5377,20 +5430,21 @@ async def _exit_position_strategy_flat(cfg, tm, pos):
             "signal": "LONG_EXIT" if pos.direction == "LONG" else "SHORT_EXIT",
             "time": datetime.now(_IST).isoformat(), "entry": ltp, "close": ltp,
             "strategy": getattr(pos, "strategy", cfg.strategy), "reason": reason,
-            "reasons": ["Strategy already flat (its exit happened while the app wasn't evaluating)"],
+            "reasons": [why],
         }
         _add_signal_to_history(exit_sig)
         signal_journal_manager.close_entry(exit_sig, cfg.instrument, reason, index_price=ltp)
     except Exception as _fl_err:
-        logger.error(f"Strategy-flat exit logging error: {_fl_err}")
+        logger.error(f"{reason} exit logging error: {_fl_err}")
     try:
         send_telegram_exit_alert(pos, ltp, reason, rec.get("pnl", 0.0), index_exit_price=ltp)
     except Exception as _tg_err:
-        logger.warning(f"Telegram strategy-flat exit alert failed: {_tg_err}")
+        logger.warning(f"Telegram {reason} exit alert failed: {_tg_err}")
     try:
         await ws_manager.broadcast({"type": "trade_closed", "data": rec})
     except Exception:
         pass
+    return True
 
 
 def _auto_entry_broker_block(cfg) -> Optional[str]:

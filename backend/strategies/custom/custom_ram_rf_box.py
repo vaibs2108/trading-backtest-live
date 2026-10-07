@@ -170,6 +170,9 @@ def _ram_track(o, h, l, c):
     if pos:                                     # still-open position at the latest bar must stay visible
         tr.dir_end[ei:] = pos
         tr.entry_px[ei] = e
+    # Live use only (never read by the backtest): the UT limit still armed after the last bar, so
+    # the live app can exit when the index touches it instead of a bar later (W12, 07 Oct).
+    tr.lim_last = lim if pos else None
     return tr
 
 
