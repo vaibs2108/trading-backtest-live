@@ -519,6 +519,13 @@ _traded_strategy_trades: list = []
 _last_skipped_traded_key = ""
 
 
+# Strategies whose real option entries get NO broker stop-loss order (your decision 07 Oct):
+# Option B's index stop (~1,500 pts) is wider than the option premium can express -- for puts
+# the premium stop came out at Rs 0.05, Dhan refused it, and the safety exit sold every entry.
+# The app's position monitor exits these at the strategy's own index stop instead.
+_NO_BROKER_SL_STRATEGIES = {"custom_option_b_ram_rf"}
+
+
 def _strategy_trade_key(strategy: str, direction: str, entry_ts) -> str:
     return f"{strategy}|{direction}|{str(entry_ts or '').replace('T', ' ')[:16]}"
 
@@ -6346,11 +6353,20 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
         )
 
 
-        if cfg.auto_trade and broker.is_connected() and not result["order_id"].startswith("PAPER_"):
+        _trade_key = _strategy_trade_key(getattr(cfg, "strategy", ""), direction,
+                                         sig.get("position_entry_time") or sig.get("time"))
+        _no_broker_sl = (cfg.trade_mode == "OPTIONS"
+                         and (pos.strategy or cfg.strategy) in _NO_BROKER_SL_STRATEGIES)
+
+        if (cfg.auto_trade and broker.is_connected() and not result["order_id"].startswith("PAPER_")
+                and _no_broker_sl):
+            logger.info(f"No broker SL for {pos.strategy} ({result['symbol']}): its index stop {result['sl']} "
+                        f"is wider than the option premium can express -- the app exits it at that stop")
+        elif cfg.auto_trade and broker.is_connected() and not result["order_id"].startswith("PAPER_"):
             sl_success = False
             sl_order_id = None
             initial_sl_trigger = 0.0
-            
+
             if cfg.trade_mode == "OPTIONS":
                 initial_sl_trigger = broker.calculate_option_sl_price(
                     direction, entry_price, index_entry_price, result["sl"], result["symbol"]
@@ -6382,12 +6398,20 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
             # AUTONOMOUS RISK ACTION: If SL placement failed after 3 attempts, market-exit immediately!
             if not sl_success:
                 logger.critical(f"AUTONOMOUS SAFETY ACTION: SL placement failed 3 times for {result['symbol']}. Market-exiting un-hedged position immediately!")
+                # Found live 2026-10-07 (DO): the safety exit returned before _mark_traded, so the
+                # carry-forward join re-entered the same strategy trade every candle -- 6 buy/sell
+                # round trips in 25 min. A safety-exited trade counts as entered: never again.
+                try:
+                    _mark_traded(_trade_key)
+                except Exception as _mk_err:
+                    logger.debug(f"traded-key save failed: {_mk_err}")
                 try:
                     _send_telegram_alert_wrapper(
                         f"\u26a0\ufe0f AUTONOMOUS SAFETY EXIT\n"
                         f"{direction} {result['symbol']}\n"
                         f"Reason: Could not place Stop-Loss order at broker after 3 retries\n"
-                        f"Action: Position closed automatically to eliminate unhedged risk!",
+                        f"Action: Position closed automatically to eliminate unhedged risk!\n"
+                        f"This strategy trade will NOT be entered again.",
                         cfg.telegram_bot_token, cfg.telegram_chat_id
                     )
                 except Exception:
@@ -6464,8 +6488,7 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
 
         # Remember this strategy trade as entered (item 3 guard: never join the same trade twice)
         try:
-            _mark_traded(_strategy_trade_key(getattr(cfg, "strategy", ""), direction,
-                                             sig.get("position_entry_time") or sig.get("time")))
+            _mark_traded(_trade_key)
         except Exception as _mk_err:
             logger.debug(f"traded-key save failed: {_mk_err}")
 
