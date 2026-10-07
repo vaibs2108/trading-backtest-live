@@ -78,8 +78,10 @@ class DayStats:
     total_trades:  int = 0
     wins:          int = 0
     losses:        int = 0
-    gross_pnl:     float = 0.0
+    gross_pnl:     float = 0.0          # LIVE auto-trade only -- drives the daily loss/profit limits
     trade_log:     list = field(default_factory=list)
+    paper_pnl:     float = 0.0          # paper trades, information only (2026-10-07)
+    paper_trades:  int = 0
 
 
 class TradeManager:
@@ -111,6 +113,8 @@ class TradeManager:
                         losses=data.get("losses", 0),
                         gross_pnl=data.get("gross_pnl", 0.0),
                         trade_log=data.get("trade_log", []),
+                        paper_pnl=data.get("paper_pnl", 0.0),
+                        paper_trades=data.get("paper_trades", 0),
                     )
                     logger.info(f"Loaded persisted DayStats: {self.day_stats.total_trades} trades, PnL: Rs.{self.day_stats.gross_pnl:,.0f}")
                 else:
@@ -239,12 +243,19 @@ class TradeManager:
             "reason":      reason,
             "entry_slippage": round(pos.entry_slippage, 2),
         }
-        self.day_stats.total_trades += 1
-        self.day_stats.gross_pnl   += pnl
-        if pnl > 0:
-            self.day_stats.wins += 1
+        # Found 2026-10-07 10:15: paper losses (-9,774) used up the REAL daily loss limit and blocked
+        # the first live auto entry. Only real auto-trade results count toward the limits now.
+        trade_rec["paper"] = str(pos.order_id).startswith("PAPER_")
+        if trade_rec["paper"]:
+            self.day_stats.paper_trades += 1
+            self.day_stats.paper_pnl += pnl
         else:
-            self.day_stats.losses += 1
+            self.day_stats.total_trades += 1
+            self.day_stats.gross_pnl   += pnl
+            if pnl > 0:
+                self.day_stats.wins += 1
+            else:
+                self.day_stats.losses += 1
         self.day_stats.trade_log.append(trade_rec)
         self._save_day_stats()
 

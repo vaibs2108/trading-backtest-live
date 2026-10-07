@@ -3149,7 +3149,10 @@ async def _signal_polling_loop():
                         _sig_dir = sig_dict.get("signal", "")
                         # Minute precision: the processor and legacy paths format the same
                         # signal time differently ("... 10:20:00" vs "...T10:20:00+05:30").
-                        _key = (strat_id, _sig_dir, str(sig_dict.get("time", ""))[:16].replace("T", " "))
+                        # Keyed on the strategy TRADE: a blocked join re-sent "LONG" every candle
+                        # (2026-10-07 10:15, 10:20, 10:25 ...); position_entry_time is that trade's bar.
+                        _key = (strat_id, _sig_dir,
+                                str(sig_dict.get("position_entry_time") or sig_dict.get("time", ""))[:16].replace("T", " "))
                         if _key in _strat_alerts_sent:
                             return  # this exact signal was already announced
                         _strat_alerts_sent[_key] = datetime.now(_IST).timestamp()
@@ -3744,6 +3747,15 @@ async def _signal_polling_loop():
 
                         _trace(_tid, "ORDER_ATTEMPT", f"path=legacy_opposite_signal auto_trade={cfg.auto_trade} closing {pos.symbol}")
                         if cfg.auto_trade and not pos.order_id.startswith("PAPER_"):
+                            # Found 2026-10-07: this exit path never cancelled the broker SL order (the
+                            # other three exit paths do) -- a pending SELL stop left behind after the
+                            # position is closed would open a naked short if it ever triggered.
+                            if getattr(pos, "sl_order_id", None):
+                                try:
+                                    await asyncio.to_thread(broker.cancel_broker_sl, pos.sl_order_id)
+                                except Exception as _sl_c_err:
+                                    logger.warning(f"Could not cancel broker SL on opposite-signal exit: {_sl_c_err}")
+                                pos.sl_order_id = None
                             _opp_exit = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
                             _trace(_tid, "BROKER_RESULT", f"success={_opp_exit.get('success')} error={_opp_exit.get('error','')}")
                             if not _opp_exit.get("success"):
@@ -3897,6 +3909,23 @@ async def _signal_polling_loop():
                 else:
                     # No entry signal (HOLD / EXIT) — clear the pending buffer
                     _pending_telegram_signal = {}
+                    # W5 (2026-10-07): the active strategy is FLAT but the app still holds its position --
+                    # its exit happened while the app wasn't evaluating (restart, PC sleep, deploy) and a
+                    # start-up never emits signals. Close it now (at most one attempt a minute).
+                    try:
+                        _ap = _active_processor(cfg)
+                        _fpos = tm.position
+                        if (_fpos is not None and _ap is not None and getattr(_ap, "_initialised", False)
+                                and getattr(_ap, "position", "") == "NONE" and sig_direction == "HOLD"
+                                and _fpos.instrument == cfg.instrument
+                                and not str(_fpos.order_id).startswith("DHAN_SYNC_")
+                                and (not getattr(_fpos, "strategy", None) or _fpos.strategy == cfg.strategy)):
+                            global _flat_exit_last_try
+                            if (datetime.now(_IST) - _flat_exit_last_try).total_seconds() >= 60:
+                                _flat_exit_last_try = datetime.now(_IST)
+                                await _exit_position_strategy_flat(cfg, tm, _fpos)
+                    except Exception as _fx_err:
+                        logger.error(f"Strategy-flat exit check failed: {_fx_err}", exc_info=True)
 
                 # Monitor open position
                 if tm.position:
@@ -5283,6 +5312,80 @@ def send_telegram_exit_alert(pos, exit_price: float, reason: str, pnl: float, in
         logger.error(f"Telegram exit alert failed: {e}", exc_info=True)
 
 
+_flat_exit_last_try = datetime(2000, 1, 1, tzinfo=_IST)
+
+
+def _active_processor(cfg):
+    """The live processor of the ACTIVE strategy (same set as the signal loop's _proc_list)."""
+    import live_bar_processor as _lbp
+    _m = {
+        "custom_alpha_combo_cusum125": _lbp.get_alpha_combo_processor,
+        "custom_time_gated_alpha_combo": _lbp.get_time_gated_alpha_combo_processor,
+        "custom_regime_v1_trend_range_final": _lbp.get_regime_v1_final_processor,
+        "custom_option_b_ram_rf": _lbp.get_option_b_processor,
+        "custom_cusum15_nodonchian_cd8": _lbp.get_cusum15_processor,
+    }
+    _f = _m.get(cfg.strategy)
+    return _f() if _f else None
+
+
+async def _exit_position_strategy_flat(cfg, tm, pos):
+    """Close the app's position because the active strategy no longer holds one (W5)."""
+    global _active_trade_signal
+    reason = "STRATEGY_FLAT"
+    _tid = _trace_id(cfg.strategy, f"{pos.direction}_EXIT", datetime.now(_IST).isoformat())
+    _trace(_tid, "DETECTED", f"path=strategy_flat strategy={cfg.strategy} closing={pos.direction} {pos.symbol}")
+    logger.warning(f"Active strategy {cfg.strategy} is flat but the app holds {pos.direction} {pos.symbol} "
+                   f"(exit missed while the app wasn't evaluating) -- closing it")
+    if cfg.auto_trade and not str(pos.order_id).startswith("PAPER_"):
+        if getattr(pos, "sl_order_id", None):
+            try:
+                await asyncio.to_thread(broker.cancel_broker_sl, pos.sl_order_id)
+            except Exception as _sl_c_err:
+                logger.warning(f"Could not cancel broker SL on strategy-flat exit: {_sl_c_err}")
+            pos.sl_order_id = None
+        _ex = await asyncio.to_thread(broker.place_exit_order, pos.symbol, pos.exchange, pos.direction, pos.qty)
+        _trace(_tid, "BROKER_RESULT", f"success={_ex.get('success')} error={_ex.get('error','')}")
+        if not _ex.get("success"):
+            logger.error(f"Strategy-flat EXIT FAILED for {pos.symbol}: {_ex.get('error')} -- position kept open")
+            try:
+                _send_telegram_alert_wrapper(
+                    f"EXIT ORDER FAILED (strategy flat)\n{pos.direction} {pos.symbol}\n"
+                    f"Reason: {_ex.get('error')}\nPosition still open — will retry in 1 min; check Dhan.",
+                    cfg.telegram_bot_token, cfg.telegram_chat_id)
+            except Exception:
+                pass
+            return
+    ltp = (await asyncio.to_thread(broker.get_ltp, pos.instrument)) or 0
+    _pnl_exit = _safe_pnl_exit_price(pos, ltp)
+    rec = tm.close_position(_pnl_exit, reason)
+    if cfg.auto_trade and not str(pos.order_id).startswith("PAPER_"):
+        try:
+            get_capital_tracker().record_trade_pnl(rec.get("pnl", 0.0))
+        except Exception as _ct_err:
+            logger.warning(f"Capital tracker update failed: {_ct_err}")
+    _active_trade_signal = {}
+    try:
+        exit_sig = {
+            "signal": "LONG_EXIT" if pos.direction == "LONG" else "SHORT_EXIT",
+            "time": datetime.now(_IST).isoformat(), "entry": ltp, "close": ltp,
+            "strategy": getattr(pos, "strategy", cfg.strategy), "reason": reason,
+            "reasons": ["Strategy already flat (its exit happened while the app wasn't evaluating)"],
+        }
+        _add_signal_to_history(exit_sig)
+        signal_journal_manager.close_entry(exit_sig, cfg.instrument, reason, index_price=ltp)
+    except Exception as _fl_err:
+        logger.error(f"Strategy-flat exit logging error: {_fl_err}")
+    try:
+        send_telegram_exit_alert(pos, ltp, reason, rec.get("pnl", 0.0), index_exit_price=ltp)
+    except Exception as _tg_err:
+        logger.warning(f"Telegram strategy-flat exit alert failed: {_tg_err}")
+    try:
+        await ws_manager.broadcast({"type": "trade_closed", "data": rec})
+    except Exception:
+        pass
+
+
 def _auto_entry_broker_block(cfg) -> Optional[str]:
     """Why a REAL auto entry must not go ahead, or None. Only the app's OWN contracts count
     (a still-open auto position the app lost track of); your manual positions never block it
@@ -6370,7 +6473,9 @@ def _execute_order(sig: dict, cfg, direction: str) -> dict:
             # (one continuous carry-forward trade); where the app joined is kept as a note.
             _pet = sig.get("position_entry_time") or ""
             try:
-                _join = bool(_pet) and (pd.Timestamp(str(sig.get("time", ""))) - pd.Timestamp(_pet)).total_seconds() > 600
+                # Any later bar is a join (2026-10-07: 10:10 entry joined at 10:20 = exactly 600 s
+                # slipped through the old "> 600 s" test and journaled a duplicate entry).
+                _join = bool(_pet) and (pd.Timestamp(str(sig.get("time", ""))) - pd.Timestamp(_pet)).total_seconds() > 0
             except Exception:
                 _join = False
             if _join:
