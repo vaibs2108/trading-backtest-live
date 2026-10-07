@@ -1,0 +1,33 @@
+# systemd service for the trading app on the DigitalOcean droplet (no Docker).
+# It runs the same `python run.py` you start by hand; run.py's watchdog keeps restarting the
+# backend inside it, and systemd restarts run.py itself if it ever exits, and starts it at boot.
+#
+# Before installing, check the TWO paths marked EDIT below against how you start the app today
+# (see deploy/SYSTEMD.md, step 1).
+
+[Unit]
+Description=AlgoTrader (Dhan options auto-trading app)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+# EDIT 1: the folder that contains run.py, .env, backend/ and frontend/
+WorkingDirectory=/opt/trading-app
+# EDIT 2: the Python you use today to run run.py (e.g. the project's virtualenv)
+ExecStart=/opt/trading-app/.venv/bin/python run.py
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=TZ=Asia/Kolkata
+# Restart run.py whenever it stops (crash, the watchdog giving up, an accidental kill), forever.
+Restart=always
+RestartSec=10
+# Stop: SIGTERM to run.py (its watchdog then stops the backend cleanly); anything left after 30 s is killed.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
