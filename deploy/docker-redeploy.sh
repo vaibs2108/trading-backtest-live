@@ -43,11 +43,15 @@ fi
 APP_UID=$(docker run --rm --entrypoint id "$NAME" -u)
 APP_GID=$(docker run --rm --entrypoint id "$NAME" -g)
 chown -R "$APP_UID:$APP_GID" "$STATE"
+# .env is MOUNTED, not passed with --env-file: a Dhan token refreshed on the Settings page is written
+# to this file, so it survives an app restart or redeploy. With --env-file the container kept the
+# token from container creation, and every restart went back to it (DH-901).
+chown "$APP_UID:$APP_GID" "$APP/.env" && chmod 600 "$APP/.env"
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --restart unless-stopped \
   --name "$NAME" \
-  --env-file "$APP/.env" \
+  -v "$APP/.env:/app/.env" \
   -p 8000:8000 \
   -v "$APP/data:/app/data" \
   -v "$STATE/data:/app/backend/data" \
