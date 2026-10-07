@@ -28,6 +28,7 @@ _lock = threading.Lock()
 _book: Dict[str, dict] = {}
 _loaded = False
 _alert_last: Dict[str, datetime] = {}
+_live: Dict[str, dict] = {}   # symbol -> {"unrealized": Dhan's unrealised P&L, "updated": iso time}
 _notify: Optional[Callable[[str], None]] = None
 REMINDER_SECONDS = 3600
 
@@ -67,7 +68,13 @@ def _save():
 def get_all() -> List[dict]:
     with _lock:
         _load()
-        return [dict(p) for p in _book.values()]
+        return [dict(p, **_live.get(p["symbol"], {})) for p in _book.values()]
+
+
+def set_live(symbol: str, unrealized: float):
+    """Dhan's current unrealised P&L for a manual position (shown on Live Trading)."""
+    _live[symbol] = {"unrealized": round(float(unrealized or 0.0), 2),
+                     "updated": datetime.now(_IST).isoformat()}
 
 
 def symbols() -> set:

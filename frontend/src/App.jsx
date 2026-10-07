@@ -849,17 +849,18 @@ function CompactSignalPanel({ signal, strategyLabel, ltp, lastEntry }) {
 }
 
 // ── Position Panel ──────────────────────────────────────────────────────────
-function PositionPanel({ state }) {
+function PositionPanel({ state, title }) {
   const m = window.innerWidth < 768
   if (!state?.position) return (
     <Card>
-      <div style={{ color:V('text-muted'), textAlign:'center', padding:'20px 0', fontSize:13 }}>No open position</div>
+      <div style={{ color:V('text-muted'), textAlign:'center', padding:'20px 0', fontSize:13 }}>No open auto-trade position</div>
     </Card>
   )
   const p = state.position
   const pnlColor = clr(p.current_pnl)
   return (
     <Card style={{ borderLeft:`3px solid ${p.direction==='LONG'?V('green'):V('red')}` }}>
+      {title && <div style={{ color:V('yellow'), fontSize:10, textTransform:'uppercase', fontWeight:600, marginBottom:8 }}>{title}</div>}
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>
         <div>
           <Badge label={p.direction} color={p.direction==='LONG'?V('green'):V('red')} />
@@ -876,6 +877,45 @@ function PositionPanel({ state }) {
         ))}
       </div>
       {p.t1_hit && <div style={{ marginTop:8, color:V('green'), fontSize:11, fontWeight:500 }}>✓ T1 hit — SL moved to breakeven</div>}
+    </Card>
+  )
+}
+
+// ── Manual positions: your own Dhan trades (alerts only, the app never exits them) ──
+function ManualPositionsPanel({ items }) {
+  const m = window.innerWidth < 768
+  const list = items || []
+  const total = list.reduce((s, p) => s + (Number(p.unrealized) || 0), 0)
+  return (
+    <Card>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:10 }}>
+        <div>
+          <div style={{ color:V('text-primary'), fontWeight:700, fontSize:13 }}>Manual positions</div>
+          <div style={{ color:V('text-muted'), fontSize:10 }}>Your own Dhan trades — alerts only, never exited by the app</div>
+        </div>
+        {list.length > 0 && <div style={{ color:clr(total), fontWeight:700, fontFamily:"'JetBrains Mono', monospace", fontSize:16 }} title="Dhan's unrealised P&L, gross">{fmtPnl(total)}</div>}
+      </div>
+      {list.length === 0 ? (
+        <div style={{ color:V('text-muted'), textAlign:'center', padding:'12px 0', fontSize:13 }}>No manual positions</div>
+      ) : list.map(p => (
+        <div key={p.symbol} style={{ borderLeft:`3px solid ${p.direction==='LONG'?V('green'):V('red')}`, background:V('bg-tertiary'), borderRadius:V('radius-sm'), padding:'8px 10px', marginBottom:6 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+              <Badge label={p.direction} color={p.direction==='LONG'?V('green'):V('red')} />
+              <span style={{ color:V('text-primary'), fontWeight:600, fontSize:12 }}>{p.symbol}</span>
+            </div>
+            <span style={{ color:clr(p.unrealized), fontWeight:700, fontFamily:"'JetBrains Mono', monospace", fontSize:13 }}>{p.unrealized != null ? fmtPnl(p.unrealized) : '—'}</span>
+          </div>
+          <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:6, marginTop:6 }}>
+            {[['Qty', p.qty], ['Entry', p.entry_price], ['Index SL', p.sl], ['Index T2', p.target2]].map(([l, v]) => (
+              <div key={l}>
+                <div style={{ color:V('text-muted'), fontSize:9, textTransform:'uppercase' }}>{l}</div>
+                <div style={{ color:V('text-primary'), fontSize:12, fontFamily:"'JetBrains Mono', monospace" }}>{l === 'Qty' ? v : (v ? fmt(v) : '—')}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
     </Card>
   )
 }
@@ -8727,6 +8767,7 @@ function MainApp() {
   const [chartSignalsLoading, setChartSignalsLoading] = useState(false)
   const [allSignals,  setAllSignals]  = useState({})
   const [lastEntries, setLastEntries] = useState({})
+  const [manualPositions, setManualPositions] = useState([])
   const [sigJournal,  setSigJournal]  = useState([])
   const [casAlertsA,  setCasAlertsA]  = useState([])  // Mode A (CAS Window) fired alerts
   const [casAlertsB,  setCasAlertsB]  = useState([])  // Mode B (Undercurrent, stock-sourced) fired alerts
@@ -8913,6 +8954,7 @@ function MainApp() {
         setLotSize(s.lot_size || 0)
         if (s.ltp != null) setLtp(s.ltp)
         if (s.trade_state) setTradeState(s.trade_state)
+        setManualPositions(s.manual_positions || [])
         if (s.capital_state) setCapitalState(s.capital_state)
         if (s.data_health) setDataHealth(s.data_health)
         if (s.market) setMarket(s.market)
@@ -9438,7 +9480,7 @@ function MainApp() {
               {/* ══════════ SECTION 4: LIVE POSITION ══════════ */}
               <div style={{ borderTop:`1px solid ${V('border')}`, paddingTop:14 }}>
                 <div style={{ color:V('text-muted'), fontSize:11, textTransform:'uppercase', fontWeight:600, letterSpacing:1, marginBottom:10, display:'flex', alignItems:'center', gap:6 }}>
-                  <span style={{ fontSize:13 }}>📊</span> Live Position
+                  <span style={{ fontSize:13 }}>📊</span> Auto-trade position
                 </div>
                 <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:14 }}>
                   <ErrorBoundary>
@@ -9454,11 +9496,18 @@ function MainApp() {
                       // "Live Position" must reflect broker-confirmed reality only, never a
                       // paper/simulated position — matches the filter PositionGreeksPanel
                       // already applies just below, so the two panels can't disagree again.
-                      <PositionPanel state={{ ...tradeState, position: null }} />
+                      <PositionPanel
+                        state={{ ...tradeState, position: tradeState?.position?.order_id?.startsWith('PAPER_') ? tradeState.position : null }}
+                        title="Paper — no real order" />
                     )}
                   </ErrorBoundary>
                   <ErrorBoundary>
                     <PositionGreeksPanel data={optCtx} tradeState={tradeState} loading={optCtxLoading} />
+                  </ErrorBoundary>
+                </div>
+                <div style={{ marginTop:14 }}>
+                  <ErrorBoundary>
+                    <ManualPositionsPanel items={manualPositions} />
                   </ErrorBoundary>
                 </div>
               </div>

@@ -5473,6 +5473,10 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
             if not symbol or symbol in _auto_syms:
                 continue
             _manual_open.add(symbol)
+            try:
+                manual_positions.set_live(symbol, float(row.get('unrealizedProfit', 0.0) or row.get('unrealisedProfit', 0.0) or 0.0))
+            except Exception:
+                pass
             net_qty = int(row[net_qty_col])
             qty = abs(net_qty)
             if symbol in _known_manual and int(_known_manual[symbol].get("qty") or 0) == qty:
