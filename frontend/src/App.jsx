@@ -993,8 +993,16 @@ function DhanTradePanel({ position, tradeSignal, onExit, ltp, instrument }) {
   )
 }
 
+// "Manual: +₹5,499 (2 open)" under Position P&L -- your own Dhan positions (Dhan's unrealised, gross)
+const manualPnlLine = (list) => {
+  const n = (list || []).length
+  if (!n) return undefined
+  const total = list.reduce((s, p) => s + (Number(p.unrealized) || 0), 0)
+  return `Manual: ${fmtPnl(total)} (${n} open)`
+}
+
 // ── Day Stats ───────────────────────────────────────────────────────────────
-function DayStats({ state, balance, livePnl, todayPnl, lotSize }) {
+function DayStats({ state, balance, livePnl, todayPnl, lotSize, manualPositions }) {
   const m = window.innerWidth < 768
   const d = state?.day_stats
   // Backend always keeps day_stats.gross_pnl in sync with today_pnl, so the
@@ -1006,7 +1014,7 @@ function DayStats({ state, balance, livePnl, todayPnl, lotSize }) {
   return (
     <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
       <MetricBox label="Balance" value={`₹${fmt(balance)}`} color={V('accent')} />
-      <MetricBox label="Position P&L" value={fmtPnl(livePnl)} color={clr(livePnl)} />
+      <MetricBox label="Position P&L" value={fmtPnl(livePnl)} color={clr(livePnl)} sub={manualPnlLine(manualPositions)} />
       <MetricBox label="Today's P&L" value={fmtPnl(displayPnl)} color={clr(displayPnl)} sub={`${d?.total_trades||0} trades`} />
       <MetricBox label="Win/Loss" value={`${d?.wins||0} / ${d?.losses||0}`} color={V('text-primary')} sub={lotSize ? `Lot: ${lotSize}` : (d?.total_trades > 0 ? `${((d?.wins/d?.total_trades)*100).toFixed(0)}% WR` : '—')} />
     </div>
@@ -6288,7 +6296,7 @@ function CapitalBreachNotice({ capitalState }) {
   )
 }
 
-function DashboardPage({ connected, appRunning, autoTrade, toggleAutoTrade, balance, livePnl, todayPnl, lotSize, tradeState, signal, strategy, instrument, ltp, capitalState, dataHealth, toggleAppRunning, allSignals, lastEntries, telegramConfigured, refreshSettings, maxDailyLoss, maxDailyProfit }) {
+function DashboardPage({ connected, appRunning, autoTrade, toggleAutoTrade, balance, livePnl, todayPnl, lotSize, tradeState, signal, strategy, instrument, ltp, capitalState, dataHealth, toggleAppRunning, allSignals, lastEntries, telegramConfigured, refreshSettings, maxDailyLoss, maxDailyProfit, manualPositions }) {
   const m = window.innerWidth < 768
   const d = tradeState?.day_stats
   // Backend always keeps day_stats.gross_pnl in sync with today_pnl, so the
@@ -6646,7 +6654,7 @@ function DashboardPage({ connected, appRunning, autoTrade, toggleAutoTrade, bala
       {/* Key metrics */}
       <div style={{ display:'grid', gridTemplateColumns: m ? 'repeat(2,1fr)' : 'repeat(4,1fr)', gap:10 }}>
         <MetricBox label="Balance" value={`₹${fmt(balance)}`} color={V('accent')} />
-        <MetricBox label="Position P&L" value={fmtPnl(livePnl)} color={clr(livePnl)} />
+        <MetricBox label="Position P&L" value={fmtPnl(livePnl)} color={clr(livePnl)} sub={manualPnlLine(manualPositions)} />
         <MetricBox label="Today's P&L" value={fmtPnl(displayPnl)} color={clr(displayPnl)} sub={`${d?.total_trades||0} trades`} />
         <MetricBox label="Win / Loss" value={`${d?.wins||0} / ${d?.losses||0}`} color={V('text-primary')} sub={lotSize ? `Lot: ${lotSize}` : (d?.total_trades > 0 ? `${((d?.wins/d?.total_trades)*100).toFixed(0)}% WR` : '—')} />
       </div>
@@ -9405,7 +9413,7 @@ function MainApp() {
               tradeState={tradeState} signal={signal} strategy={strategy}
               instrument={instrument} ltp={ltp} capitalState={capitalState} dataHealth={dataHealth}
               toggleAppRunning={toggleAppRunning} allSignals={allSignals} lastEntries={lastEntries}
-              telegramConfigured={telegramConfigured} refreshSettings={refreshSettings}
+              telegramConfigured={telegramConfigured} refreshSettings={refreshSettings} manualPositions={manualPositions}
               maxDailyLoss={maxDailyLoss} maxDailyProfit={maxDailyProfit}
             />
           )}
@@ -9424,7 +9432,7 @@ function MainApp() {
             <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
 
               {/* ══════════ SECTION 2: METRICS ══════════ */}
-              <DayStats state={tradeState} balance={balance} livePnl={livePnl} todayPnl={todayPnl} lotSize={lotSize} />
+              <DayStats state={tradeState} balance={balance} livePnl={livePnl} todayPnl={todayPnl} lotSize={lotSize} manualPositions={manualPositions} />
 
               {/* ══════════ SECTION 3: CHART + STRATEGY SIGNALS ══════════ */}
               <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
