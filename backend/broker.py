@@ -1604,6 +1604,35 @@ def get_order_details(order_id: str) -> dict:
         }
 
 
+_sym_map_cache = {"day": None, "map": {}}
+
+
+def to_trading_symbol(sym: str) -> str:
+    """Dhan's positions / trade book name a contract by SEM_TRADING_SYMBOL
+    ('BANKNIFTY-Oct2026-54600-CE'); the app's orders carry SEM_CUSTOM_SYMBOL
+    ('BANKNIFTY 27 OCT 54600 CALL'). Found live 2026-10-07: comparing the two never matched,
+    so the app decided its own live position was 'exited on Dhan' seconds after buying it.
+    Returns the trading form for either name (unknown names unchanged)."""
+    if not sym:
+        return sym
+    s = str(sym).strip()
+    try:
+        today = datetime.now().date()
+        if _sym_map_cache["day"] != today or not _sym_map_cache["map"]:
+            df = _load_instrument_df()
+            _sym_map_cache["map"] = dict(zip(df["SEM_CUSTOM_SYMBOL"].astype(str).str.strip(),
+                                             df["SEM_TRADING_SYMBOL"].astype(str).str.strip()))
+            _sym_map_cache["day"] = today
+        return _sym_map_cache["map"].get(s, s)
+    except Exception as e:
+        logger.debug(f"to_trading_symbol({s}) failed: {e}")
+        return s
+
+
+def same_contract(a: str, b: str) -> bool:
+    return bool(a) and bool(b) and to_trading_symbol(a) == to_trading_symbol(b)
+
+
 def sync_position_from_broker(instrument: str, tracked_symbol: str = None) -> dict:
     """Check if a specific position still exists at the broker.
 
@@ -1651,7 +1680,7 @@ def sync_position_from_broker(instrument: str, tracked_symbol: str = None) -> di
 
         # Priority 1: match by exact tracked symbol
         if tracked_symbol:
-            exact = filtered[filtered[sym_col].str.strip() == tracked_symbol.strip()]
+            exact = filtered[filtered[sym_col].astype(str).str.strip() == to_trading_symbol(tracked_symbol)]
             if not exact.empty:
                 row = exact.iloc[0]
                 net_qty = int(float(row[qty_col]))

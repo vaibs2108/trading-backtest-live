@@ -1241,7 +1241,7 @@ async def manual_trade(req: ManualTradeRequest):
                 await asyncio.sleep(1.0) # sleep to allow fill
                 df = await asyncio.to_thread(broker.get_positions)
                 if df is not None and not df.empty:
-                    matched_rows = df[df['tradingSymbol'] == pos.symbol].to_dict(orient="records")
+                    matched_rows = df[df['tradingSymbol'] == broker.to_trading_symbol(pos.symbol)].to_dict(orient="records")
                     if matched_rows:
                         matched_row = matched_rows[0]
                         realized_pnl = float(matched_row.get('realizedProfit', 0.0) or matched_row.get('realisedProfit', 0.0) or 0.0)
@@ -5462,6 +5462,8 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
         _auto_syms = _tm_mod.auto_owned_symbols()
         if tm.position is not None and _tm_mod.is_live_auto_order(tm.position.order_id):
             _auto_syms.add(tm.position.symbol)
+        # the app stores order names ('BANKNIFTY 27 OCT 54600 CALL'); Dhan rows use trading names
+        _auto_syms = {broker.to_trading_symbol(s) for s in _auto_syms}
 
         # 1. MANUAL track: every open Dhan position the app didn't buy itself
         _manual_open = set()
@@ -5538,7 +5540,7 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                 dhan_open = False
                 dhan_row = None
                 for row in open_rows:
-                    if row['tradingSymbol'] == pos.symbol:
+                    if row['tradingSymbol'] == broker.to_trading_symbol(pos.symbol):
                         dhan_open = True
                         dhan_row = row
                         break
@@ -5548,7 +5550,7 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                     realized_pnl = 0.0
                     matched_row = None
                     if df is not None and not df.empty:
-                        matched_rows = df[df['tradingSymbol'] == pos.symbol].to_dict(orient="records")
+                        matched_rows = df[df['tradingSymbol'] == broker.to_trading_symbol(pos.symbol)].to_dict(orient="records")
                         if matched_rows:
                             matched_row = matched_rows[0]
                             realized_pnl = float(matched_row.get('realizedProfit', 0.0) or matched_row.get('realisedProfit', 0.0) or 0.0)
@@ -5556,7 +5558,7 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                     # contract, and the LTP at detection isn't the fill -- 10:04 booked 1,234.0, the
                     # sell was 1,233.65). Fallback: the old figures.
                     _trip_exit = None
-                    _closed = [t for t in (_dhan_round_trips_today(pos.symbol, matched_row) or [])
+                    _closed = [t for t in (_dhan_round_trips_today(broker.to_trading_symbol(pos.symbol), matched_row) or [])
                                if t.get("status") == "CLOSED"]
                     if _closed:
                         _same = [t for t in _closed if pos.entry_price and abs(t["entry_price"] - pos.entry_price) <= 0.005 * pos.entry_price]
