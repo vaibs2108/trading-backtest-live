@@ -35,7 +35,14 @@ if [ ! -f "$STATE/settings.json" ]; then
     echo '{}' > "$STATE/settings.json"
   fi
 fi
-chown -R 1000:1000 "$STATE"          # the container runs as appuser (uid 1000)
+if [ -d "$STATE/settings.json" ]; then        # a bind mount of a missing file creates a folder
+  rm -rf "$STATE/settings.json"; echo '{}' > "$STATE/settings.json"
+fi
+# The container runs as a non-root user (appuser): it must own the state folder, or the app cannot
+# write its logs and crash-loops (found 07 Oct). Read its uid/gid from the image, don't assume.
+APP_UID=$(docker run --rm --entrypoint id "$NAME" -u)
+APP_GID=$(docker run --rm --entrypoint id "$NAME" -g)
+chown -R "$APP_UID:$APP_GID" "$STATE"
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --restart unless-stopped \
