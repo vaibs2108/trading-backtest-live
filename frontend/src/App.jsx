@@ -8793,6 +8793,7 @@ function MainApp() {
   const [appRunning,    setAppRunning]    = useState(true)
   const [capitalState, setCapitalState] = useState(null)
   const [dataHealth, setDataHealth] = useState(null)
+  const [priceFrozen, setPriceFrozen] = useState(null)   // {price, since, minutes} while no live price
   const [market, setMarket] = useState(null)
   const [brokerAuthError, setBrokerAuthError] = useState(null)
   const [dhanTokens, setDhanTokens] = useState(null)
@@ -8965,6 +8966,7 @@ function MainApp() {
         setManualPositions(s.manual_positions || [])
         if (s.capital_state) setCapitalState(s.capital_state)
         if (s.data_health) setDataHealth(s.data_health)
+        setPriceFrozen(s.price_frozen || null)
         if (s.market) setMarket(s.market)
         setBrokerAuthError(s.broker_auth_error || null)
         setDhanTokens(s.dhan_tokens || null)
@@ -9311,6 +9313,16 @@ function MainApp() {
             padding:'8px 24px', fontSize:12, color:V('text-secondary'), fontWeight:600
           }}>
             ⏸ {market.label}
+          </div>
+        )}
+
+        {/* Price freeze: feed and quote both down -- price held at the last real one, checks paused */}
+        {priceFrozen && (
+          <div style={{
+            background:V('red-bg'), borderBottom:`1px solid color-mix(in srgb, ${V('red')} 30%, transparent)`,
+            padding:'8px 24px', fontSize:12, color:V('red'), fontWeight:600
+          }}>
+            PRICE FROZEN: no live price since {new Date(priceFrozen.since).toLocaleTimeString('en-IN', { hour12:false })} (last {fmt(priceFrozen.price)}, {priceFrozen.minutes} min). SL / target / strategy checks paused until prices return; open trades unchanged.
           </div>
         )}
 

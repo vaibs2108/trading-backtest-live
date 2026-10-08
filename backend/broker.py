@@ -434,6 +434,21 @@ def _live_feed_price(instrument: str, now) -> Optional[float]:
         return None
 
 
+# Price freeze (TODO 03, agreed 05 Oct, built 08 Oct): the last REAL price and when it was seen. When
+# the REST quote and the live feed both fail, get_ltp returns None (every decision skips) and the
+# screen shows this frozen price with its time; main.py alerts after 5 minutes frozen.
+_last_real_price = {}   # INSTRUMENT -> (price, datetime IST)
+
+
+def _note_real_price(instrument: str, val: float, now) -> None:
+    _last_real_price[instrument.upper()] = (float(val), now)
+
+
+def last_real_price(instrument: str):
+    """(price, time) of the last real price for the instrument, or None."""
+    return _last_real_price.get((instrument or "").upper())
+
+
 def _in_market_hours(now) -> bool:
     return now.weekday() < 5 and dt_time(9, 15) <= now.time() < dt_time(15, 30)
 
@@ -468,6 +483,7 @@ def get_ltp(instrument: str) -> Optional[float]:
         if val and val > 0:
             _ltp_cache[instrument] = val
             _ltp_cache_time[instrument] = now
+            _note_real_price(instrument, val, now)
             return val
 
         # REST quote empty/failed -> the live websocket feed's last real trade (same instrument).
@@ -475,6 +491,7 @@ def get_ltp(instrument: str) -> Optional[float]:
         if feed_val:
             _ltp_cache[instrument] = feed_val
             _ltp_cache_time[instrument] = now
+            _note_real_price(instrument, feed_val, now)
             _ltp_note(instrument, "feed", f"LTP for {instrument} from live feed: {feed_val} (REST quote unavailable)", now)
             return feed_val
 

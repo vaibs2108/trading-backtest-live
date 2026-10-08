@@ -742,6 +742,12 @@ async def get_status():
             
     lot = broker.get_lot_size(cfg.instrument)
     ltp = (await asyncio.to_thread(broker.get_ltp, cfg.instrument)) if broker.is_connected() else None
+    _frozen = None
+    if not ltp:
+        try:
+            _frozen = await asyncio.to_thread(_price_freeze_state, cfg.instrument)
+        except Exception:
+            _frozen = None
 
     # Compute Live P&L from TradeManager's tracked position.
     # "Position P&L" / "Today's P&L" are meant to reflect the real broker
@@ -815,7 +821,8 @@ async def get_status():
         "live_pnl":     live_pnl,
         "today_pnl":    today_pnl,
         "lot_size":     lot,
-        "ltp":          ltp,
+        "ltp":          ltp if ltp else ((_frozen or {}).get("price")),
+        "price_frozen": _frozen,
         "trade_state":  trade_state,
         "market":       market,
         "broker_auth_error": broker.dhan_auth_error(),
@@ -3073,6 +3080,12 @@ async def _signal_polling_loop():
                 await _ensure_live_feed(cfg, now)
             except Exception as _fw_err:
                 logger.debug(f"Live feed watchdog error: {_fw_err}")
+
+            # Price freeze watch (TODO 03): Telegram after 5 min with no real price, and when it returns
+            try:
+                await asyncio.to_thread(_check_price_freeze, cfg, now)
+            except Exception as _pf_err:
+                logger.debug(f"Price freeze check error: {_pf_err}")
 
             frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument, _by_candle)
             _t_frames = datetime.now(_IST)
@@ -5463,6 +5476,54 @@ async def _exit_position_strategy_flat(cfg, tm, pos, reason: str = "STRATEGY_FLA
     except Exception:
         pass
     return True
+
+
+_PRICE_FREEZE_ALERT_MIN = 5
+_price_freeze_alert = {}   # instrument -> (since datetime, last price) of the freeze we alerted for
+
+
+def _price_freeze_state(instrument: str, now=None) -> Optional[dict]:
+    """{'price', 'since', 'minutes'} while the instrument has no real price (REST quote and live feed
+    both unavailable) in market hours; None when prices are live."""
+    now = now or datetime.now(_IST)
+    if not broker.is_connected() or not broker._in_market_hours(now):
+        return None
+    if broker.get_ltp(instrument):          # 5-s cached; a real price -> not frozen
+        return None
+    last = broker.last_real_price(instrument)
+    if not last or last[1].date() != now.date():
+        return None
+    return {"price": round(last[0], 2), "since": last[1].isoformat(),
+            "minutes": round((now - last[1]).total_seconds() / 60.0, 1)}
+
+
+def _check_price_freeze(cfg, now):
+    """TODO 03 (your rule, 08 Oct): when the feed and the quote both drop, the price stays frozen at the
+    last real one and no check acts on it (get_ltp returns None). After 5 minutes frozen: one Telegram;
+    when a real price returns: one 'back' Telegram. Open trades are left as they are."""
+    inst = cfg.instrument
+    st = _price_freeze_state(inst, now)
+    alerted = _price_freeze_alert.get(inst)
+    if st is None:
+        if alerted:
+            _price_freeze_alert.pop(inst, None)
+            live = broker.get_ltp(inst)
+            mins = (now - alerted[0]).total_seconds() / 60.0
+            logger.warning(f"Prices back for {inst} at {now:%H:%M:%S} ({live}) after {mins:.0f} min frozen")
+            _send_telegram_alert_wrapper(
+                f"✅ PRICES BACK — {inst}\nLive price {live:,.2f} at {now:%H:%M:%S} (frozen {mins:.0f} min).\n"
+                f"SL / target / strategy checks have resumed.", cfg.telegram_bot_token, cfg.telegram_chat_id)
+        return
+    if st["minutes"] >= _PRICE_FREEZE_ALERT_MIN and not alerted:
+        since = datetime.fromisoformat(st["since"])
+        _price_freeze_alert[inst] = (since, st["price"])
+        logger.warning(f"PRICES FROZEN for {inst} since {since:%H:%M:%S} (last {st['price']}) -- "
+                       f"REST quote and live feed both unavailable; checks paused")
+        _send_telegram_alert_wrapper(
+            f"⚠️ PRICES FROZEN — {inst}\nNo live price since {since:%H:%M:%S} (last {st['price']:,.2f}) — "
+            f"Dhan quote and live feed both unavailable.\nSL / target / strategy checks are PAUSED; open trades "
+            f"are unchanged and have no app protection until prices return. Check Dhan.",
+            cfg.telegram_bot_token, cfg.telegram_chat_id)
 
 
 def _auto_entry_broker_block(cfg) -> Optional[str]:
