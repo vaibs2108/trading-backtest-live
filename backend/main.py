@@ -2583,7 +2583,11 @@ def _check_virtual_exits(ltp: float, cfg, frames=None, latest_candle_ts: str = N
 
             # Processor-managed strategies: exits are handled by LiveBarProcessor
             # on bar boundaries (matching backtest exactly). Skip real-time exit checks.
-            if strat_id in ("regime_trend_range", "multi_agent"):
+            # W1 (your rule 08 Oct): every live strategy follows ITS OWN exits on the candle close --
+            # its stop loss where it has one, its exit signal otherwise. This intrabar SL/T2 check used to
+            # run for the current processor strategies too and disagreed with them (06 Oct: CUSUM15's
+            # SHORT closed here at 15:20 for -135 pts while the strategy held it and exited +98 next day).
+            if strat_id in ("regime_trend_range", "multi_agent") or _processor_for(strat_id) is not None:
                 continue
 
                 
@@ -3385,6 +3389,24 @@ async def _signal_polling_loop():
                             _t_active = datetime.now(_IST)
                         if isinstance(new_signals, BaseException):
                             raise new_signals
+
+                        # W1: a trade the strategy already held when its processor started (restart, PC
+                        # sleep, deploy) gets its Signals Log row from the strategy's own entry -- before,
+                        # nothing was logged and its later exit had no row to close (07 Oct: Alpha Combo and
+                        # Time-Gated SHORT exits at 10:05 were lost).
+                        _adopted = getattr(_processor, "adopted_open", None)
+                        if _adopted:
+                            _processor.adopted_open = None
+                            try:
+                                signal_journal_manager.open_entry({
+                                    "signal": _adopted.get("direction"), "time": _adopted.get("entry_time"),
+                                    "entry": _adopted.get("entry_price", 0), "close": _adopted.get("entry_price", 0),
+                                    "sl": _adopted.get("sl", 0), "target1": _adopted.get("target1", 0),
+                                    "target2": _adopted.get("target2", 0), "strategy": _strat_id,
+                                    "reasons": ["Already open when the app started: logged from the strategy's own entry"],
+                                }, cfg.instrument, _qty)
+                            except Exception as _ad_err:
+                                logger.warning(f"[{_strat_id}] could not log the adopted open trade: {_ad_err}")
 
                         for _live_sig in new_signals:
                             _lat_signals.append(f"{_strat_id}:{_live_sig.signal}")

@@ -270,6 +270,7 @@ class BacktestDiffProcessor:
         self._last_exit_reason: Optional[str] = None
         self._regime = "SIDEWAYS"
         self.last_processed_ts = None
+        self.adopted_open: Optional[dict] = None   # open trade found at init, to log once (W1)
 
     def _get_module(self):
         """Return the strategy module that has run_backtest(). Override in subclass."""
@@ -391,6 +392,7 @@ class BacktestDiffProcessor:
             for t in reversed(bt_trades):
                 if t.get("exit_reason") == "OPEN":
                     self._prev_open_key = (t["direction"], t["entry_time"])
+                    self.adopted_open = dict(t)      # main.py logs it in the Signals Log once (W1)
                     self.position = t["direction"]
                     self.entry_price = t.get("entry_price", 0)
                     self.sl = t.get("sl", 0)
