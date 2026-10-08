@@ -3039,7 +3039,18 @@ async def _signal_polling_loop():
                 _by_candle = True
                 logger.debug("Signal loop triggered by live feed candle close")
             except asyncio.TimeoutError:
-                pass  # No candle event — proceed with normal poll
+                # No candle event — normal poll. W10 (07 Oct 14:20): a poll that starts a fraction of a
+                # second BEFORE a 5m close evaluates the old candle, and the new one then waits a whole
+                # cycle (~15-20 s). If a close is due within 3 s, wait for that candle instead.
+                _n = datetime.now(_IST)
+                _to_close = 300.0 - ((_n.minute % 5) * 60 + _n.second + _n.microsecond / 1e6)
+                if _to_close <= 3.0:
+                    try:
+                        await asyncio.wait_for(_feed.candle_event.wait(), timeout=_to_close + 3.0)
+                        _feed.candle_event.clear()
+                        _by_candle = True
+                    except asyncio.TimeoutError:
+                        pass
         else:
             await asyncio.sleep(15)
         try:
