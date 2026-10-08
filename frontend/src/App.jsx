@@ -922,6 +922,7 @@ function ManualPositionsPanel({ items }) {
 }
 
 // ── Strategy Details page (08 Oct): description + backtest results on 4 instruments per strategy ──
+// Refresh is PER STRATEGY (your rule): only the strategy you are looking at is re-run, after market hours.
 function StrategyDetailsPage() {
   const [data, setData] = useState(null)
   const [err, setErr] = useState('')
@@ -936,29 +937,33 @@ function StrategyDetailsPage() {
     return () => clearInterval(t)
   }, [data?.refresh?.running])
 
-  const refresh = async () => {
-    if (!window.confirm('Refresh all strategy results to the latest data?\n\nRuns every strategy on BANKNIFTY, NIFTY, SENSEX and CRUDEOIL in the backtest worker (live trading is not affected). Takes about an hour; the current results stay until it finishes.')) return
-    const r = await API.post('/api/strategy_details/refresh', {})
+  const refresh = async (s) => {
+    if (!window.confirm(`Refresh "${s.name}" on BANKNIFTY, NIFTY, SENSEX and CRUDEOIL?\n\nRuns in the backtest worker (live trading is not affected). Usually a few minutes; each instrument's result appears as soon as it finishes.`)) return
+    const r = await API.post('/api/strategy_details/refresh', { strategy: s.id })
     if (r?.detail) window.alert(r.detail)
     else if (r?.error) window.alert(r.error)
     load()
   }
 
   if (!data) return <Card><div style={{ color:V('text-muted'), padding:20 }}>{err ? 'Could not load: ' + err : 'Loading…'}</div></Card>
-  const partial = data.partial
-  const snap = data.snapshot || partial
+  const snap = data.snapshot
   const runs = {}
-  ;(data.snapshot?.runs || []).forEach(r => { runs[r.strategy + '|' + r.instrument] = r })
-  // results of a refresh in progress (or one that stopped part-way) replace older ones as they finish
-  ;(partial?.runs || []).forEach(r => { runs[r.strategy + '|' + r.instrument] = { ...r, fresh: !!data.snapshot } })
+  ;(snap?.runs || []).forEach(r => { runs[r.strategy + '|' + r.instrument] = r })
   const rf = data.refresh || {}
   const fmtDate = s => s ? new Date(s).toLocaleString('en-IN', { day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:false }) : '—'
   const num = (v, d=2) => v == null ? '—' : Number(v).toLocaleString('en-IN', { maximumFractionDigits:d })
   const groups = [['live', 'Live now'], ['backtest', 'Backtest only']]
+  const lastRunOf = sid => {
+    const ts = (data.instruments || []).map(i => runs[sid + '|' + i]?.run_at || (runs[sid + '|' + i] ? snap?.generated_at : null)).filter(Boolean)
+    return ts.length ? ts.sort()[0] : null     // oldest row = when the whole card was last fully refreshed
+  }
 
   const card = s => {
     const isActive = s.id === data.active_strategy
     const shown = !!open[s.id]
+    const mine = rf.running && rf.strategy === s.id
+    const busyOther = rf.running && rf.strategy !== s.id
+    const last = lastRunOf(s.id)
     return (
       <Card key={s.id} style={{ marginBottom:14 }}>
         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:10, flexWrap:'wrap' }}>
@@ -966,10 +971,21 @@ function StrategyDetailsPage() {
             <div style={{ color:V('text-primary'), fontWeight:700, fontSize:15 }}>{s.name}</div>
             <div style={{ color:V('text-muted'), fontSize:11, marginTop:2 }}>{s.id}</div>
           </div>
-          <div style={{ display:'flex', gap:6 }}>
+          <div style={{ display:'flex', gap:6, alignItems:'center', flexWrap:'wrap' }}>
             {isActive && <Badge label="ACTIVE" color={V('green')} />}
             <Badge label={s.group === 'live' ? 'LIVE' : 'BACKTEST ONLY'} color={s.group === 'live' ? V('blue') : V('text-muted')} />
+            <StyledButton onClick={() => refresh(s)} variant="primary" disabled={rf.running || !data.refresh_allowed}
+                          style={{ padding:'4px 10px', fontSize:11 }}>
+              <RefreshCw size={11}/> {mine ? 'Refreshing…' : 'Refresh'}
+            </StyledButton>
           </div>
+        </div>
+        <div style={{ color:V('text-muted'), fontSize:11, marginTop:6 }}>
+          {mine ? `Refreshing — ${rf.done || 0} of ${rf.total || 4} instruments done${rf.current ? ' · ' + rf.current : ''}`
+            : `Last run: ${last ? fmtDate(last) : 'never'}`
+              + (busyOther ? ' · another strategy is refreshing' : '')
+              + (!data.refresh_allowed && !rf.running ? ' · refresh after market hours' : '')}
+          {!rf.running && rf.strategy === s.id && rf.error && <span style={{ color:V('yellow') }}> · {rf.error}</span>}
         </div>
         <div style={{ color:V('text-secondary'), fontSize:13, marginTop:8, lineHeight:1.5 }}>{s.summary}</div>
         <div onClick={() => setOpen({ ...open, [s.id]: !shown })} style={{ color:V('blue'), fontSize:12, marginTop:8, cursor:'pointer', userSelect:'none' }}>
@@ -997,10 +1013,9 @@ function StrategyDetailsPage() {
                 const st = r?.stats
                 return (
                   <tr key={inst} style={{ textAlign:'right', borderBottom:`1px solid ${V('border')}` }}>
-                    <td style={{ padding:'6px 8px', textAlign:'left', color:V('text-primary'), fontWeight:600 }}>
-                      {inst}{r?.fresh && <span style={{ color:V('green'), fontSize:9, marginLeft:6 }} title="From the refresh in progress">NEW</span>}
-                    </td>
-                    {!r ? <td colSpan={7} style={{ padding:'6px 8px', color:V('text-muted'), textAlign:'left' }}>Not run yet</td>
+                    <td style={{ padding:'6px 8px', textAlign:'left', color:V('text-primary'), fontWeight:600 }}
+                        title={r?.run_at ? `Run ${fmtDate(r.run_at)} · data to ${r.period_to}` : ''}>{inst}</td>
+                    {!r ? <td colSpan={7} style={{ padding:'6px 8px', color:V('text-muted'), textAlign:'left' }}>Not run yet — press Refresh</td>
                       : r.error ? <td colSpan={7} style={{ padding:'6px 8px', color:V('yellow'), textAlign:'left' }}>{r.error}</td>
                       : <>
                         <td style={{ padding:'6px 8px' }}>{num(st.total_trades, 0)}</td>
@@ -1024,38 +1039,15 @@ function StrategyDetailsPage() {
   return (
     <div>
       <Card style={{ marginBottom:16 }}>
-        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:12, flexWrap:'wrap' }}>
-          <div>
-            <div style={{ color:V('text-primary'), fontWeight:700, fontSize:14 }}>
-              {snap ? `Results ${snap.period?.from} to ${snap.period?.to}` : 'No results yet'}
-            </div>
-            <div style={{ color:V('text-muted'), fontSize:12, marginTop:3 }}>
-              {data.snapshot ? `Last complete run ${fmtDate(data.snapshot.generated_at)} · ₹5L capital · 1 lot · carry-forward · gross P&L`
-                : partial ? `Partial results (${partial.runs?.length || 0} of ${(data.strategies || []).length * (data.instruments || []).length}) · ₹5L capital · 1 lot · carry-forward · gross P&L`
-                : 'Press "Refresh to latest" (after market hours) to run every strategy.'}
-            </div>
-            {partial && (
-              <div style={{ color:V('yellow'), fontSize:11, marginTop:3 }}>
-                {rf.running ? `Refreshing — ${rf.done || 0} of ${rf.total || '…'} done; results appear as they finish.`
-                  : 'The last refresh stopped part-way; finished results are shown, the rest are from the last complete run.'}
-              </div>
-            )}
-            {snap?.lot_sizes && <div style={{ color:V('text-muted'), fontSize:11, marginTop:3 }}>
-              Lot sizes: {Object.entries(snap.lot_sizes).map(([k, v]) => `${k} ${v}`).join(' · ')}
-            </div>}
-          </div>
-          <div style={{ textAlign:'right' }}>
-            <StyledButton onClick={refresh} variant="primary" disabled={rf.running || !data.refresh_allowed}>
-              <RefreshCw size={12}/> {rf.running ? 'Refreshing…' : 'Refresh to latest'}
-            </StyledButton>
-            <div style={{ color:V('text-muted'), fontSize:11, marginTop:4 }}>
-              {rf.running ? `${rf.done || 0} / ${rf.total || '…'} · ${rf.current || ''}`
-                : !data.refresh_allowed ? data.refresh_blocked_reason
-                : rf.error ? <span style={{ color:V('yellow') }}>{rf.error}</span>
-                : rf.message || ''}
-            </div>
-          </div>
+        <div style={{ color:V('text-primary'), fontWeight:700, fontSize:14 }}>
+          Backtest results from {snap?.period?.from || '2025-07-01'} to the latest completed day
         </div>
+        <div style={{ color:V('text-muted'), fontSize:12, marginTop:3 }}>
+          ₹5L capital · 1 lot · carry-forward · gross P&L · each strategy has its own Refresh button (after market hours); hover an instrument for its run date
+        </div>
+        {snap?.lot_sizes && <div style={{ color:V('text-muted'), fontSize:11, marginTop:3 }}>
+          Lot sizes: {Object.entries(snap.lot_sizes).map(([k, v]) => `${k} ${v}`).join(' · ')}
+        </div>}
         {snap?.caveats?.length > 0 && (
           <ul style={{ margin:'10px 0 0 16px', padding:0, color:V('text-muted'), fontSize:11, lineHeight:1.6 }}>
             {snap.caveats.map((c, i) => <li key={i}>{c}</li>)}

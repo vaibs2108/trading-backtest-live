@@ -4,8 +4,8 @@ strategy_details.py -- data for the Strategy Details page (TODO B-8, built 08 Oc
 Each Backtest-page strategy: a plain-English description and its backtest results on BANKNIFTY,
 NIFTY, SENSEX and CRUDEOIL. Your decisions (08 Oct): all 16 strategies, grouped "Live now" /
 "Backtest only"; period 1 Jul 2025 to the latest completed day; only the LAST run is kept, with
-its date, and it is refreshed to the latest on request (page button, after market hours; main.py
-runs it through the same data download + backtest worker as the Backtest page).
+its date; a Refresh button PER STRATEGY re-runs only that strategy on the 4 instruments, after market
+hours (main.py: same data download + backtest worker as the Backtest page; results merged row by row).
 """
 import json
 import logging
@@ -141,35 +141,6 @@ def save_snapshot(snap: dict) -> None:
     tmp = SNAPSHOT_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(snap, indent=1, default=str), encoding="utf-8")
     tmp.replace(SNAPSHOT_PATH)
-
-
-PARTIAL_PATH = DATA_DIR / "partial.json"
-
-
-def save_partial(snap) -> None:
-    """Results of an unfinished refresh (shown on the page; the last complete run stays in latest.json)."""
-    if not snap:
-        return
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = PARTIAL_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(snap, indent=1, default=str), encoding="utf-8")
-    tmp.replace(PARTIAL_PATH)
-
-
-def load_partial():
-    try:
-        if PARTIAL_PATH.exists():
-            return json.loads(PARTIAL_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return None
-
-
-def clear_partial() -> None:
-    try:
-        PARTIAL_PATH.unlink(missing_ok=True)
-    except Exception:
-        pass
 
 
 def slim_stats(stats: dict, lot_qty: int) -> dict:

@@ -1608,118 +1608,140 @@ async def list_custom_strategies():
 
 
 # ── Strategy Details page (TODO B-8, built 08 Oct) ─────────────────────────────────────────────────
-# Last run only, with its date; refreshed to the latest on request (page button, after market hours).
-# Same path as the Backtest page: _fetch_frames_range + _check_backtest_frames + backtest_worker, but each
-# instrument's data is downloaded ONCE for all strategies.
-_sd_state = {"running": False, "done": 0, "total": 0, "current": "", "started_at": None,
+# Your rule (08 Oct): a Refresh button PER STRATEGY -- re-run only the strategy being looked at, on the
+# 4 instruments, after market hours. Same path as the Backtest page (_fetch_frames_range +
+# _check_backtest_frames + backtest_worker; live trading untouched). Each instrument's result is merged
+# into latest.json as soon as it finishes (other strategies are never touched, nothing finished is lost),
+# and each row keeps its own run time. Downloaded data is reused for 2 hours across refreshes.
+_sd_state = {"running": False, "strategy": "", "done": 0, "total": 0, "current": "", "started_at": None,
              "finished_at": None, "error": "", "message": ""}
-_sd_partial = None   # results of the refresh in progress, shown on the page as they finish
+_sd_frames_cache = {}   # instrument -> {"to": to_d, "at": epoch, "frames", "problems", "notes", "lot"}
+_SD_FRAMES_TTL = 2 * 3600
 
 
-def _sd_build_snapshot(from_d, to_d, lots, data_notes, runs, complete):
+def _sd_to_date(now):
+    """Last completed trading day: today after the close, else the day before."""
+    to_dt = now if (now.hour, now.minute) >= (15, 40) else now - timedelta(days=1)
+    return to_dt.strftime("%Y-%m-%d")
+
+
+async def _sd_frames(inst, from_d, to_d):
+    import time as _t
+    c = _sd_frames_cache.get(inst)
+    if c and c["to"] == to_d and _t.time() - c["at"] < _SD_FRAMES_TTL:
+        return c
+    warmup_from = (datetime.strptime(from_d, "%Y-%m-%d") - timedelta(days=100)).strftime("%Y-%m-%d")
+    frames = await asyncio.to_thread(_fetch_frames_range, inst, warmup_from, to_d)
+    problems, _range, notes = _check_backtest_frames(frames, from_d, to_d, datetime.now(_IST))
+    c = {"to": to_d, "at": _t.time(), "frames": frames, "problems": list(problems or []),
+         "notes": list(notes or []), "lot": broker.get_lot_size(inst)}
+    _sd_frames_cache[inst] = c
+    return c
+
+
+def _sd_merge_run(rec, from_d, to_d, lot, notes):
+    """Put one (strategy, instrument) result into latest.json, replacing only that row."""
     import strategy_details as sd
-    return {"generated_at": datetime.now(_IST).isoformat(), "period": {"from": from_d, "to": to_d},
-            "capital": sd.CAPITAL, "lot_multiplier": 1, "hold_mode": "CARRY_FORWARD", "lot_sizes": dict(lots),
-            "data_notes": dict(data_notes), "runs": list(runs), "complete": complete,
-            "caveats": ["P&L is gross, as the backtest engine reports it (no brokerage / taxes deducted).",
-                        "1 lot per trade, Rs 5L starting capital, positions may be held overnight (carry-forward).",
-                        "CRUDEOIL history starts mid-2026 (current contract only), so its sample is short."]}
+    snap = sd.load_snapshot() or {}
+    runs = [r for r in snap.get("runs", [])
+            if not (r.get("strategy") == rec["strategy"] and r.get("instrument") == rec["instrument"])]
+    runs.append(rec)
+    lots = dict(snap.get("lot_sizes") or {})
+    lots[rec["instrument"]] = lot
+    dn = dict(snap.get("data_notes") or {})
+    dn[rec["instrument"]] = notes
+    snap.update({"generated_at": datetime.now(_IST).isoformat(), "period": {"from": from_d, "to": to_d},
+                 "capital": sd.CAPITAL, "lot_multiplier": 1, "hold_mode": "CARRY_FORWARD", "lot_sizes": lots,
+                 "data_notes": dn, "runs": runs,
+                 "caveats": ["P&L is gross, as the backtest engine reports it (no brokerage / taxes deducted).",
+                             "1 lot per trade, Rs 5L starting capital, positions may be held overnight (carry-forward).",
+                             "CRUDEOIL history starts mid-2026 (current contract only), so its sample is short.",
+                             "Each strategy is refreshed separately: check each row's run date."]})
+    sd.save_snapshot(snap)
 
 
-async def _strategy_details_run():
-    global _sd_partial
+async def _strategy_details_run(strategy_ids):
     import time as _t
     import strategy_details as sd
     import backtest_worker
     try:
-        now = datetime.now(_IST)
-        # last completed trading day: today after the close, else the day before
-        to_dt = now if (now.hour, now.minute) >= (15, 40) else now - timedelta(days=1)
-        to_d = to_dt.strftime("%Y-%m-%d")
+        to_d = _sd_to_date(datetime.now(_IST))
         from_d = sd.PERIOD_FROM
-        warmup_from = (datetime.strptime(from_d, "%Y-%m-%d") - timedelta(days=100)).strftime("%Y-%m-%d")
         cfg = get_settings()
-        runs, lots, data_notes = [], {}, {}
-        _sd_state.update(total=len(sd.INSTRUMENTS) * len(sd.STRATEGY_IDS), done=0)
+        _sd_state.update(total=len(sd.INSTRUMENTS) * len(strategy_ids), done=0)
         for inst in sd.INSTRUMENTS:
             ok, why = sd.refresh_allowed()
             if not ok:
                 raise RuntimeError("stopped: " + why)
-            _sd_state["current"] = f"downloading {inst} data"
-            frames = await asyncio.to_thread(_fetch_frames_range, inst, warmup_from, to_d)
-            problems, _range, notes = _check_backtest_frames(frames, from_d, to_d, datetime.now(_IST))
-            lot = broker.get_lot_size(inst)
-            lots[inst] = lot
-            data_notes[inst] = list(notes or [])
-            for sid in sd.STRATEGY_IDS:
+            _sd_state["current"] = f"{inst}: preparing data"
+            fr = await _sd_frames(inst, from_d, to_d)
+            for sid in strategy_ids:
                 ok, why = sd.refresh_allowed()
                 if not ok:
                     raise RuntimeError("stopped: " + why)
-                _sd_state["current"] = f"{sid} on {inst}"
-                rec = {"strategy": sid, "instrument": inst}
-                if problems:
-                    rec["error"] = "Incomplete data from Dhan: " + "; ".join(problems)
+                _sd_state["current"] = f"{inst}: running"
+                rec = {"strategy": sid, "instrument": inst, "run_at": datetime.now(_IST).isoformat(),
+                       "period_to": to_d}
+                if fr["problems"]:
+                    rec["error"] = "Incomplete data from Dhan: " + "; ".join(fr["problems"])
                 else:
                     t0 = _t.time()
                     try:
                         bt_settings = cfg.model_copy(update={"strategy": sid, "instrument": inst,
                                                              "position_hold_mode": "CARRY_FORWARD"})
-                        res = await backtest_worker.run_backtest(bt_settings, frames, sd.CAPITAL, lot, 1, from_d, to_d)
+                        res = await backtest_worker.run_backtest(bt_settings, fr["frames"], sd.CAPITAL,
+                                                                 fr["lot"], 1, from_d, to_d)
                         if not isinstance(res, dict):
                             rec["error"] = "invalid result"
                         elif res.get("error"):
                             rec["error"] = str(res["error"])[:240]
                         else:
-                            rec["stats"] = _sanitise_floats(sd.slim_stats(res.get("stats") or {}, lot))
+                            rec["stats"] = _sanitise_floats(sd.slim_stats(res.get("stats") or {}, fr["lot"]))
                     except Exception as e:
                         rec["error"] = str(e)[:240]
                     rec["secs"] = round(_t.time() - t0, 1)
-                runs.append(rec)
+                _sd_merge_run(rec, from_d, to_d, fr["lot"], fr["notes"])
                 _sd_state["done"] += 1
-                _sd_partial = _sd_build_snapshot(from_d, to_d, lots, data_notes, runs, complete=False)
-            # after each instrument: keep what is done on disk too (a crash / restart loses at most one instrument)
-            try:
-                sd.save_partial(_sd_partial)
-            except Exception as _sp_err:
-                logger.debug(f"strategy details partial save failed: {_sp_err}")
-        snap = _sd_build_snapshot(from_d, to_d, lots, data_notes, runs, complete=True)
-        sd.save_snapshot(snap)
-        sd.clear_partial()
-        _sd_state.update(message=f"Completed {_sd_state['done']} runs", error="")
-        logger.info(f"Strategy details refresh complete: {len(runs)} runs, period {from_d}..{to_d}")
+        _sd_state.update(message=f"Done: {_sd_state['done']} runs", error="")
+        logger.info(f"Strategy details refresh done: {strategy_ids} x {len(sd.INSTRUMENTS)} instruments, to {to_d}")
     except Exception as e:
-        _sd_state.update(error=str(e)[:300], message="Refresh did not finish -- the previous results are kept")
+        _sd_state.update(error=str(e)[:300], message="Refresh stopped -- finished instruments are saved")
         logger.warning(f"Strategy details refresh failed: {e}")
     finally:
-        _sd_partial = None
         _sd_state.update(running=False, current="", finished_at=datetime.now(_IST).isoformat())
+
+
+class StrategyDetailsRefresh(BaseModel):
+    strategy: str
 
 
 @app.get("/api/strategy_details")
 async def get_strategy_details():
     import strategy_details as sd
     ok, why = sd.refresh_allowed()
-    partial = _sd_partial if _sd_state["running"] else sd.load_partial()
     return _sanitise_floats({"strategies": sd.STRATEGIES, "instruments": sd.INSTRUMENTS,
                              "active_strategy": get_settings().strategy, "snapshot": sd.load_snapshot(),
-                             "partial": partial, "refresh": dict(_sd_state),
-                             "refresh_allowed": ok, "refresh_blocked_reason": why})
+                             "refresh": dict(_sd_state), "refresh_allowed": ok, "refresh_blocked_reason": why})
 
 
 @app.post("/api/strategy_details/refresh")
-async def refresh_strategy_details():
+async def refresh_strategy_details(req: StrategyDetailsRefresh):
     import strategy_details as sd
+    if req.strategy not in sd.STRATEGY_IDS:
+        raise HTTPException(status_code=400, detail="Unknown strategy")
     if _sd_state["running"]:
-        return {"started": False, "error": "A refresh is already running", "refresh": dict(_sd_state)}
+        return {"started": False, "error": f"Another strategy is refreshing ({_sd_state['strategy']}) -- try again "
+                                            f"when it finishes", "refresh": dict(_sd_state)}
     ok, why = sd.refresh_allowed()
     if not ok:
         raise HTTPException(status_code=409, detail=why)
     if not broker.is_connected():
         raise HTTPException(status_code=400, detail="Not connected to Dhan")
-    _sd_state.update(running=True, done=0, total=0, current="starting", error="", message="",
-                     started_at=datetime.now(_IST).isoformat(), finished_at=None)
-    asyncio.get_event_loop().create_task(_strategy_details_run())
-    add_activity_log("Strategy Details refresh started")
+    _sd_state.update(running=True, strategy=req.strategy, done=0, total=len(sd.INSTRUMENTS),
+                     current="starting", error="", message="", started_at=datetime.now(_IST).isoformat(),
+                     finished_at=None)
+    asyncio.get_event_loop().create_task(_strategy_details_run([req.strategy]))
+    add_activity_log(f"Strategy Details refresh started: {req.strategy}")
     return {"started": True, "refresh": dict(_sd_state)}
 
 
