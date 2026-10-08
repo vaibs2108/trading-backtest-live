@@ -980,6 +980,42 @@ async def get_dhan_tokens():
     return dhan_tokens.all_status()
 
 
+class KillSwitchRequest(BaseModel):
+    confirm: str = ""
+
+
+@app.get("/api/dhan/kill_switch")
+async def get_kill_switch():
+    """Dhan kill switch status (D3, your decision 08 Oct: the user presses it, nothing automatic)."""
+    return await asyncio.to_thread(broker.kill_switch_status)
+
+
+@app.post("/api/dhan/kill_switch/activate")
+async def activate_kill_switch(req: KillSwitchRequest):
+    """Activate Dhan's own kill switch -- Dhan then blocks all trading on the account (app and manual)
+    for the rest of the day. Needs confirm='ACTIVATE'. Also switches the app's auto-trade OFF."""
+    if (req.confirm or "").strip().upper() != "ACTIVATE":
+        raise HTTPException(status_code=400, detail="confirm must be 'ACTIVATE'")
+    res = await asyncio.to_thread(broker.activate_kill_switch)
+    cfg = get_settings()
+    if res.get("ok"):
+        try:
+            save_settings({"auto_trade": False})
+        except Exception as _ks_err:
+            logger.warning(f"auto_trade off after kill switch failed: {_ks_err}")
+        add_activity_log("Dhan kill switch ACTIVATED from the app (auto-trade switched off)")
+        try:
+            await asyncio.to_thread(
+                _send_telegram_alert_wrapper,
+                f"🛑 DHAN KILL SWITCH ACTIVATED from the app at {datetime.now(_IST):%H:%M:%S}.\n"
+                f"Dhan blocks ALL trading on the account (app and manual) for the rest of the day. "
+                f"Auto-trade switched OFF.", cfg.telegram_bot_token, cfg.telegram_chat_id)
+        except Exception:
+            pass
+    status = await asyncio.to_thread(broker.kill_switch_status)
+    return {"success": bool(res.get("ok")), "error": res.get("error", ""), "status": status}
+
+
 @app.post("/api/dhan/token")
 async def update_dhan_token(req: DhanTokenUpdate):
     """Replace a Dhan access token from the Settings page: check it, save it to .env,

@@ -9207,6 +9207,32 @@ function MainApp() {
     setAutoTrade(newVal)
   }
 
+  // D3 (08 Oct): Dhan's own kill switch, pressed by the user only -- nothing triggers it automatically.
+  const [killSwitch, setKillSwitch] = useState(null)   // {ok, active, raw}
+  const refreshKillSwitch = async () => {
+    try { setKillSwitch(await API.get('/api/dhan/kill_switch')) } catch { /* status only */ }
+  }
+  useEffect(() => { refreshKillSwitch() }, [])
+  const activateKillSwitch = async () => {
+    const confirmed = window.confirm(
+      'ACTIVATE DHAN KILL SWITCH?\n\n' +
+      'Dhan will BLOCK ALL TRADING on your account for the rest of today:\n' +
+      '- the app cannot place or exit orders\n' +
+      '- you cannot trade manually on Dhan either\n\n' +
+      'Open positions stay open. The app\'s auto-trade will be switched OFF.\n\n' +
+      'Click OK to activate.'
+    )
+    if (!confirmed) return
+    try {
+      const r = await API.post('/api/dhan/kill_switch/activate', { confirm: 'ACTIVATE' })
+      if (r?.status) setKillSwitch(r.status)
+      if (r?.success) { setAutoTrade(false); window.alert('Dhan kill switch is ACTIVE. Trading is blocked for today.') }
+      else window.alert('Kill switch NOT activated: ' + (r?.error || 'unknown error') + '\nActivate it in the Dhan app if needed.')
+    } catch (e) {
+      window.alert('Kill switch request failed: ' + (e?.message || e) + '\nActivate it in the Dhan app if needed.')
+    }
+  }
+
   const handleManualTrade = async (action) => {
     const r = await API.post('/api/trade/manual', { action })
     if (!r.success) alert(r.error || 'Trade failed')
@@ -9414,6 +9440,14 @@ function MainApp() {
               <StyledButton onClick={toggleAutoTrade} variant={autoTrade ? 'success' : 'default'}>
                 {autoTrade ? <><Zap size={12}/> Auto ON</> : <><Square size={12}/> Auto OFF</>}
               </StyledButton>
+
+              {killSwitch?.active
+                ? <StyledButton variant="danger" disabled title="Dhan blocks all trading on the account for the rest of today">
+                    <Square size={12}/> Kill switch ACTIVE
+                  </StyledButton>
+                : <StyledButton onClick={activateKillSwitch} variant="danger" title="Dhan's own kill switch: blocks ALL trading on the account for the rest of today">
+                    <Square size={12}/> Dhan Kill Switch
+                  </StyledButton>}
             </PageHeader>
           )}
 

@@ -579,6 +579,33 @@ def get_option_ltp(symbol: str) -> float:
     return _option_ltp_cache.get(symbol, 0.0)
 
 
+def kill_switch_status() -> dict:
+    """Dhan's account kill switch (D3, 08 Oct): {'ok', 'active', 'raw'} -- read-only."""
+    if not _connected or _dhan_client is None:
+        return {"ok": False, "active": None, "raw": "not connected"}
+    try:
+        r = dhan_api_call("user_data", _dhan_client.status_kill_switch) or {}
+        raw = str(((r.get("data") or {}).get("killSwitchStatus")) or "")
+        return {"ok": r.get("status") == "success", "active": "ACTIVAT" in raw.upper(), "raw": raw or "inactive"}
+    except Exception as e:
+        return {"ok": False, "active": None, "raw": str(e)[:120]}
+
+
+def activate_kill_switch() -> dict:
+    """Turn ON Dhan's kill switch: Dhan blocks ALL trading on the account (app and manual) for the
+    rest of the trading day. Only ever called from the user's own button (no automatic trigger)."""
+    if not _connected or _dhan_client is None:
+        return {"ok": False, "error": "Not connected to Dhan"}
+    try:
+        r = dhan_api_call("order", _dhan_client.kill_switch, "activate") or {}
+        ok = r.get("status") == "success"
+        logger.warning(f"Dhan kill switch ACTIVATE requested -> {r}")
+        return {"ok": ok, "response": r, "error": "" if ok else str(r.get("remarks") or r)[:200]}
+    except Exception as e:
+        logger.error(f"Dhan kill switch activation failed: {e}")
+        return {"ok": False, "error": str(e)[:200]}
+
+
 def get_index_security_id(symbol: str) -> Optional[str]:
     """Helper to dynamically resolve index security ID from Dhan instrument master."""
     try:
