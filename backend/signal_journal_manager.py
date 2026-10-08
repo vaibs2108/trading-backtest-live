@@ -175,6 +175,20 @@ def close_entry(exit_sig: dict, instrument: str, exit_reason: str = "", index_pr
         "pnl_inr":     pnl_inr,
         "status":      "WIN" if pnl_pts > 0 else ("LOSS" if pnl_pts < 0 else "FLAT"),
     })
+    # A strategy holds one position per direction, so any OLDER open row for the same strategy +
+    # direction is a duplicate of this trade (found 08 Oct: 07 Oct's 10:10 Option B LONG was logged
+    # twice at the 10:20 join; the 13:00 exit closed only the newest, and the leftover showed as
+    # "LONG (active)" on the tile the next day). Void them instead of leaving them open.
+    for j in range(open_idx):
+        e = entries[j]
+        if (e.get("instrument") == instrument and e.get("direction") == entry_direction and
+                (not strat_id or e.get("strategy") == strat_id) and e.get("status") == "OPEN"):
+            e.update({"exit_time": entries[open_idx]["exit_time"], "exit_price": e.get("entry_price"),
+                      "exit_reason": "VOID_DUPLICATE", "pnl_pts": 0.0, "pnl_inr": 0.0, "status": "VOID"})
+            e.setdefault("reasons", []).append(f"VOID: duplicate open row, closed with the {entry_direction} exit at "
+                                               f"{entries[open_idx]['exit_time']}")
+            logger.warning(f"Signal journal: voided duplicate OPEN {entry_direction} from {e.get('entry_time')} "
+                           f"[{e.get('strategy')}]")
     _save(entries)
     logger.info(
         f"Signal journal: CLOSE {entry_direction} @ {exit_price} -> "

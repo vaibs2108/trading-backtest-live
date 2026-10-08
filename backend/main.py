@@ -669,6 +669,19 @@ def _get_active_entries(cfg, tm) -> dict:
     except Exception as e_journal:
         logger.warning(f"Failed to load active entries from journal: {e_journal}")
 
+    # The tile shows what the STRATEGY holds now (08 Oct H2: a leftover duplicate OPEN row showed Option B
+    # "LONG (active)" for hours while the strategy was flat). An open journal row is dropped when the
+    # strategy's live processor is initialised and holds nothing, or holds the other direction.
+    for _sid in list(active_entries):
+        try:
+            _p = _processor_for(_sid)
+            if _p is not None and getattr(_p, "_initialised", False):
+                _held = getattr(_p, "position", "NONE")
+                if _held != active_entries[_sid].get("signal"):
+                    active_entries.pop(_sid, None)
+        except Exception:
+            pass
+
     # Only overlay tm.position onto the active strategy's tile when it's
     # ACTUALLY that strategy's own position. Previously this ran unconditionally
     # on tm.position.instrument alone, so a broker-synced position (strategy=
@@ -5375,8 +5388,8 @@ _flat_exit_last_try = datetime(2000, 1, 1, tzinfo=_IST)
 _limit_exit_last_try = datetime(2000, 1, 1, tzinfo=_IST)
 
 
-def _active_processor(cfg):
-    """The live processor of the ACTIVE strategy (same set as the signal loop's _proc_list)."""
+def _processor_for(strategy_id):
+    """The live processor of a strategy (same set as the signal loop's _proc_list), or None."""
     import live_bar_processor as _lbp
     _m = {
         "custom_alpha_combo_cusum125": _lbp.get_alpha_combo_processor,
@@ -5385,8 +5398,13 @@ def _active_processor(cfg):
         "custom_option_b_ram_rf": _lbp.get_option_b_processor,
         "custom_cusum15_nodonchian_cd8": _lbp.get_cusum15_processor,
     }
-    _f = _m.get(cfg.strategy)
+    _f = _m.get(strategy_id)
     return _f() if _f else None
+
+
+def _active_processor(cfg):
+    """The live processor of the ACTIVE strategy."""
+    return _processor_for(cfg.strategy)
 
 
 async def _exit_position_strategy_flat(cfg, tm, pos, reason: str = "STRATEGY_FLAT",
