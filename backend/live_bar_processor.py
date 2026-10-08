@@ -737,6 +737,14 @@ class OptionBRamRFLiveProcessor(BacktestDiffProcessor):
         last_ts = pd.Timestamp(last_ts)
         if last_ts.time() >= pd.Timestamp("15:25").time():
             return []                      # next bar is tomorrow's open: the normal diff handles it
+        if last_ts.time() <= pd.Timestamp("09:15").time():
+            # Found live 08 Oct: the feed-built 09:15 candle misses the opening auction print (its
+            # open/high came out 54,989.50 / 55,002.85 vs Dhan's 55,042.90 / 55,043.00), which made
+            # Ram SELL at 09:20; the candle is corrected from Dhan's data ~09:23 (every day) and the
+            # SHORT vanished at 09:25. A signal on the first candle waits for that correction: the
+            # normal diff emits it at 09:25, as before this change.
+            logger.info(f"[{self.strategy_id}] no early entry on the 09:15 candle (corrected from Dhan's data ~09:23)")
+            return []
         next_ts = last_ts + pd.Timedelta(minutes=5)
         px = 0.0
         try:
