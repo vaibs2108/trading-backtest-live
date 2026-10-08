@@ -322,6 +322,7 @@ function Sidebar({ tab, setTab, theme, toggleTheme, onSettings, onConnect, conne
     { id:'live',            icon:<Activity size={18}/>,        label:'Live Trading' },
     { id:'auto_monitor',    icon:<Zap size={18}/>,             label:'Auto Trade' },
     { id:'backtest',        icon:<BarChart2 size={18}/>,       label:'Backtest' },
+    { id:'strategy_details', icon:<BookOpen size={18}/>,       label:'Strategy Details' },
     { id:'sig_journal',     icon:<TrendingUp size={18}/>,      label:'Strategy Signals Log' },
     { id:'journal',         icon:<BookOpen size={18}/>,        label:'Broker Journal' },
     { id:'performance',     icon:<BarChart2 size={18}/>,       label:'Performance' },
@@ -917,6 +918,146 @@ function ManualPositionsPanel({ items }) {
         </div>
       ))}
     </Card>
+  )
+}
+
+// ── Strategy Details page (08 Oct): description + backtest results on 4 instruments per strategy ──
+function StrategyDetailsPage() {
+  const [data, setData] = useState(null)
+  const [err, setErr] = useState('')
+  const [open, setOpen] = useState({})
+  const load = async () => {
+    try { setData(await API.get('/api/strategy_details')); setErr('') } catch (e) { setErr(String(e?.message || e)) }
+  }
+  useEffect(() => { load() }, [])
+  useEffect(() => {
+    if (!data?.refresh?.running) return
+    const t = setInterval(load, 5000)
+    return () => clearInterval(t)
+  }, [data?.refresh?.running])
+
+  const refresh = async () => {
+    if (!window.confirm('Refresh all strategy results to the latest data?\n\nRuns every strategy on BANKNIFTY, NIFTY, SENSEX and CRUDEOIL in the backtest worker (live trading is not affected). Takes about an hour; the current results stay until it finishes.')) return
+    const r = await API.post('/api/strategy_details/refresh', {})
+    if (r?.detail) window.alert(r.detail)
+    else if (r?.error) window.alert(r.error)
+    load()
+  }
+
+  if (!data) return <Card><div style={{ color:V('text-muted'), padding:20 }}>{err ? 'Could not load: ' + err : 'Loading…'}</div></Card>
+  const snap = data.snapshot
+  const runs = {}
+  ;(snap?.runs || []).forEach(r => { runs[r.strategy + '|' + r.instrument] = r })
+  const rf = data.refresh || {}
+  const fmtDate = s => s ? new Date(s).toLocaleString('en-IN', { day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:false }) : '—'
+  const num = (v, d=2) => v == null ? '—' : Number(v).toLocaleString('en-IN', { maximumFractionDigits:d })
+  const groups = [['live', 'Live now'], ['backtest', 'Backtest only']]
+
+  const card = s => {
+    const isActive = s.id === data.active_strategy
+    const shown = !!open[s.id]
+    return (
+      <Card key={s.id} style={{ marginBottom:14 }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:10, flexWrap:'wrap' }}>
+          <div style={{ minWidth:0 }}>
+            <div style={{ color:V('text-primary'), fontWeight:700, fontSize:15 }}>{s.name}</div>
+            <div style={{ color:V('text-muted'), fontSize:11, marginTop:2 }}>{s.id}</div>
+          </div>
+          <div style={{ display:'flex', gap:6 }}>
+            {isActive && <Badge label="ACTIVE" color={V('green')} />}
+            <Badge label={s.group === 'live' ? 'LIVE' : 'BACKTEST ONLY'} color={s.group === 'live' ? V('blue') : V('text-muted')} />
+          </div>
+        </div>
+        <div style={{ color:V('text-secondary'), fontSize:13, marginTop:8, lineHeight:1.5 }}>{s.summary}</div>
+        <div onClick={() => setOpen({ ...open, [s.id]: !shown })} style={{ color:V('blue'), fontSize:12, marginTop:8, cursor:'pointer', userSelect:'none' }}>
+          {shown ? '▾ Hide how it works' : '▸ How it works'}
+        </div>
+        {shown && (
+          <div style={{ display:'grid', gap:6, marginTop:8, fontSize:12, color:V('text-secondary'), lineHeight:1.5 }}>
+            {[['Entry', s.entry], ['Exit', s.exit], ['Risk', s.risk], ['Notes', s.notes]].filter(([, v]) => v).map(([l, v]) => (
+              <div key={l}><span style={{ color:V('text-muted'), fontWeight:600 }}>{l}: </span>{v}</div>
+            ))}
+          </div>
+        )}
+        <div style={{ overflowX:'auto', marginTop:12 }}>
+          <table style={{ width:'100%', borderCollapse:'collapse', fontSize:12, minWidth:620 }}>
+            <thead>
+              <tr style={{ color:V('text-muted'), textAlign:'right' }}>
+                {['Instrument', 'Trades', 'Win %', 'Profit factor', 'Points', 'P&L (gross)', 'Max DD %', 'Expectancy'].map((h, i) => (
+                  <th key={h} style={{ padding:'6px 8px', fontWeight:600, textAlign: i === 0 ? 'left' : 'right', borderBottom:`1px solid ${V('border')}` }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {(data.instruments || []).map(inst => {
+                const r = runs[s.id + '|' + inst]
+                const st = r?.stats
+                return (
+                  <tr key={inst} style={{ textAlign:'right', borderBottom:`1px solid ${V('border')}` }}>
+                    <td style={{ padding:'6px 8px', textAlign:'left', color:V('text-primary'), fontWeight:600 }}>{inst}</td>
+                    {!r ? <td colSpan={7} style={{ padding:'6px 8px', color:V('text-muted'), textAlign:'left' }}>Not run yet</td>
+                      : r.error ? <td colSpan={7} style={{ padding:'6px 8px', color:V('yellow'), textAlign:'left' }}>{r.error}</td>
+                      : <>
+                        <td style={{ padding:'6px 8px' }}>{num(st.total_trades, 0)}</td>
+                        <td style={{ padding:'6px 8px' }}>{num(st.win_rate_pct, 1)}</td>
+                        <td style={{ padding:'6px 8px', color: st.profit_factor >= 1 ? V('green') : V('red') }}>{num(st.profit_factor)}</td>
+                        <td style={{ padding:'6px 8px', color:clr(st.points) }}>{num(st.points, 0)}</td>
+                        <td style={{ padding:'6px 8px', color:clr(st.total_pnl), fontWeight:600 }}>{fmtPnl(st.total_pnl)}</td>
+                        <td style={{ padding:'6px 8px' }}>{num(st.max_drawdown_pct, 2)}</td>
+                        <td style={{ padding:'6px 8px', color:clr(st.expectancy) }}>{fmtPnl(st.expectancy)}</td>
+                      </>}
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    )
+  }
+
+  return (
+    <div>
+      <Card style={{ marginBottom:16 }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:12, flexWrap:'wrap' }}>
+          <div>
+            <div style={{ color:V('text-primary'), fontWeight:700, fontSize:14 }}>
+              {snap ? `Results ${snap.period?.from} to ${snap.period?.to}` : 'No results yet'}
+            </div>
+            <div style={{ color:V('text-muted'), fontSize:12, marginTop:3 }}>
+              {snap ? `Last run ${fmtDate(snap.generated_at)} · ₹5L capital · 1 lot · carry-forward · gross P&L` : 'Press "Refresh to latest" (after market hours) to run every strategy.'}
+            </div>
+            {snap?.lot_sizes && <div style={{ color:V('text-muted'), fontSize:11, marginTop:3 }}>
+              Lot sizes: {Object.entries(snap.lot_sizes).map(([k, v]) => `${k} ${v}`).join(' · ')}
+            </div>}
+          </div>
+          <div style={{ textAlign:'right' }}>
+            <StyledButton onClick={refresh} variant="primary" disabled={rf.running || !data.refresh_allowed}>
+              <RefreshCw size={12}/> {rf.running ? 'Refreshing…' : 'Refresh to latest'}
+            </StyledButton>
+            <div style={{ color:V('text-muted'), fontSize:11, marginTop:4 }}>
+              {rf.running ? `${rf.done || 0} / ${rf.total || '…'} · ${rf.current || ''}`
+                : !data.refresh_allowed ? data.refresh_blocked_reason
+                : rf.error ? <span style={{ color:V('yellow') }}>{rf.error}</span>
+                : rf.message || ''}
+            </div>
+          </div>
+        </div>
+        {snap?.caveats?.length > 0 && (
+          <ul style={{ margin:'10px 0 0 16px', padding:0, color:V('text-muted'), fontSize:11, lineHeight:1.6 }}>
+            {snap.caveats.map((c, i) => <li key={i}>{c}</li>)}
+          </ul>
+        )}
+      </Card>
+      {groups.map(([g, title]) => (
+        <div key={g} style={{ marginBottom:22 }}>
+          <div style={{ color:V('text-primary'), fontWeight:700, fontSize:13, textTransform:'uppercase', letterSpacing:0.5, margin:'4px 0 10px' }}>
+            {title} <span style={{ color:V('text-muted'), fontWeight:500 }}>({(data.strategies || []).filter(s => s.group === g).length})</span>
+          </div>
+          {(data.strategies || []).filter(s => s.group === g).map(card)}
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -9257,6 +9398,7 @@ function MainApp() {
     live: ['Live Trading', `${instrument} • ${chartTf === 'DAY' ? 'Daily' : chartTf + 'm'} • ${LIVE_STRATEGY_LABELS[strategy] || strategy}`],
     research_studio: ['Strategy Research Studio', 'Ingest PineScript v5+, AI prompts, or custom Python — Transpile, Validate & Move to Backtesting'],
     backtest: ['Backtest', 'Run historical backtests on your strategies'],
+    strategy_details: ['Strategy Details', 'What each strategy does and how it performed on BANKNIFTY, NIFTY, SENSEX and CRUDEOIL'],
     sig_journal: ['Strategy Signals Log', 'Strategy signal history and theoretical P&L'],
     journal: ['Broker Journal', 'Actual broker execution log'],
     performance: ['Performance', 'Analytics, equity curve, and system health'],
@@ -9623,6 +9765,12 @@ function MainApp() {
           )}
 
           {tab === 'backtest' && <BacktestPanel connected={connected} selectedStrategy={btStrategy} onStrategyChange={setBtStrategy} onSelectStrategy={(sId) => { setResearchLoadReq({ id: sId, ts: Date.now() }); setTab('research_studio'); }} />}
+
+          {tab === 'strategy_details' && (
+            <ErrorBoundary>
+              <StrategyDetailsPage />
+            </ErrorBoundary>
+          )}
 
           {tab === 'sig_journal' && (
             <ErrorBoundary>

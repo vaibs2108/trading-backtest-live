@@ -1607,6 +1607,105 @@ async def list_custom_strategies():
     return {"strategies": CustomStrategyManager.list_custom_strategies()}
 
 
+# ── Strategy Details page (TODO B-8, built 08 Oct) ─────────────────────────────────────────────────
+# Last run only, with its date; refreshed to the latest on request (page button, after market hours).
+# Same path as the Backtest page: _fetch_frames_range + _check_backtest_frames + backtest_worker, but each
+# instrument's data is downloaded ONCE for all strategies.
+_sd_state = {"running": False, "done": 0, "total": 0, "current": "", "started_at": None,
+             "finished_at": None, "error": "", "message": ""}
+
+
+async def _strategy_details_run():
+    import time as _t
+    import strategy_details as sd
+    import backtest_worker
+    try:
+        now = datetime.now(_IST)
+        # last completed trading day: today after the close, else the day before
+        to_dt = now if (now.hour, now.minute) >= (15, 40) else now - timedelta(days=1)
+        to_d = to_dt.strftime("%Y-%m-%d")
+        from_d = sd.PERIOD_FROM
+        warmup_from = (datetime.strptime(from_d, "%Y-%m-%d") - timedelta(days=100)).strftime("%Y-%m-%d")
+        cfg = get_settings()
+        runs, lots, data_notes = [], {}, {}
+        _sd_state.update(total=len(sd.INSTRUMENTS) * len(sd.STRATEGY_IDS), done=0)
+        for inst in sd.INSTRUMENTS:
+            ok, why = sd.refresh_allowed()
+            if not ok:
+                raise RuntimeError("stopped: " + why)
+            _sd_state["current"] = f"downloading {inst} data"
+            frames = await asyncio.to_thread(_fetch_frames_range, inst, warmup_from, to_d)
+            problems, _range, notes = _check_backtest_frames(frames, from_d, to_d, datetime.now(_IST))
+            lot = broker.get_lot_size(inst)
+            lots[inst] = lot
+            data_notes[inst] = list(notes or [])
+            for sid in sd.STRATEGY_IDS:
+                ok, why = sd.refresh_allowed()
+                if not ok:
+                    raise RuntimeError("stopped: " + why)
+                _sd_state["current"] = f"{sid} on {inst}"
+                rec = {"strategy": sid, "instrument": inst}
+                if problems:
+                    rec["error"] = "Incomplete data from Dhan: " + "; ".join(problems)
+                else:
+                    t0 = _t.time()
+                    try:
+                        bt_settings = cfg.model_copy(update={"strategy": sid, "instrument": inst,
+                                                             "position_hold_mode": "CARRY_FORWARD"})
+                        res = await backtest_worker.run_backtest(bt_settings, frames, sd.CAPITAL, lot, 1, from_d, to_d)
+                        if not isinstance(res, dict):
+                            rec["error"] = "invalid result"
+                        elif res.get("error"):
+                            rec["error"] = str(res["error"])[:240]
+                        else:
+                            rec["stats"] = _sanitise_floats(sd.slim_stats(res.get("stats") or {}, lot))
+                    except Exception as e:
+                        rec["error"] = str(e)[:240]
+                    rec["secs"] = round(_t.time() - t0, 1)
+                runs.append(rec)
+                _sd_state["done"] += 1
+        snap = {"generated_at": datetime.now(_IST).isoformat(), "period": {"from": from_d, "to": to_d},
+                "capital": sd.CAPITAL, "lot_multiplier": 1, "hold_mode": "CARRY_FORWARD", "lot_sizes": lots,
+                "data_notes": data_notes, "runs": runs,
+                "caveats": ["P&L is gross, as the backtest engine reports it (no brokerage / taxes deducted).",
+                            "1 lot per trade, Rs 5L starting capital, positions may be held overnight (carry-forward).",
+                            "CRUDEOIL history starts mid-2026 (current contract only), so its sample is short."]}
+        sd.save_snapshot(snap)
+        _sd_state.update(message=f"Completed {_sd_state['done']} runs", error="")
+        logger.info(f"Strategy details refresh complete: {len(runs)} runs, period {from_d}..{to_d}")
+    except Exception as e:
+        _sd_state.update(error=str(e)[:300], message="Refresh did not finish -- the previous results are kept")
+        logger.warning(f"Strategy details refresh failed: {e}")
+    finally:
+        _sd_state.update(running=False, current="", finished_at=datetime.now(_IST).isoformat())
+
+
+@app.get("/api/strategy_details")
+async def get_strategy_details():
+    import strategy_details as sd
+    ok, why = sd.refresh_allowed()
+    return _sanitise_floats({"strategies": sd.STRATEGIES, "instruments": sd.INSTRUMENTS,
+                             "active_strategy": get_settings().strategy, "snapshot": sd.load_snapshot(),
+                             "refresh": dict(_sd_state), "refresh_allowed": ok, "refresh_blocked_reason": why})
+
+
+@app.post("/api/strategy_details/refresh")
+async def refresh_strategy_details():
+    import strategy_details as sd
+    if _sd_state["running"]:
+        return {"started": False, "error": "A refresh is already running", "refresh": dict(_sd_state)}
+    ok, why = sd.refresh_allowed()
+    if not ok:
+        raise HTTPException(status_code=409, detail=why)
+    if not broker.is_connected():
+        raise HTTPException(status_code=400, detail="Not connected to Dhan")
+    _sd_state.update(running=True, done=0, total=0, current="starting", error="", message="",
+                     started_at=datetime.now(_IST).isoformat(), finished_at=None)
+    asyncio.get_event_loop().create_task(_strategy_details_run())
+    add_activity_log("Strategy Details refresh started")
+    return {"started": True, "refresh": dict(_sd_state)}
+
+
 @app.get("/api/backtest/strategies")
 async def get_backtest_strategies():
     from strategy_sandbox import CustomStrategyManager
