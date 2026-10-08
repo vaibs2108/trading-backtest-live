@@ -1613,9 +1613,21 @@ async def list_custom_strategies():
 # instrument's data is downloaded ONCE for all strategies.
 _sd_state = {"running": False, "done": 0, "total": 0, "current": "", "started_at": None,
              "finished_at": None, "error": "", "message": ""}
+_sd_partial = None   # results of the refresh in progress, shown on the page as they finish
+
+
+def _sd_build_snapshot(from_d, to_d, lots, data_notes, runs, complete):
+    import strategy_details as sd
+    return {"generated_at": datetime.now(_IST).isoformat(), "period": {"from": from_d, "to": to_d},
+            "capital": sd.CAPITAL, "lot_multiplier": 1, "hold_mode": "CARRY_FORWARD", "lot_sizes": dict(lots),
+            "data_notes": dict(data_notes), "runs": list(runs), "complete": complete,
+            "caveats": ["P&L is gross, as the backtest engine reports it (no brokerage / taxes deducted).",
+                        "1 lot per trade, Rs 5L starting capital, positions may be held overnight (carry-forward).",
+                        "CRUDEOIL history starts mid-2026 (current contract only), so its sample is short."]}
 
 
 async def _strategy_details_run():
+    global _sd_partial
     import time as _t
     import strategy_details as sd
     import backtest_worker
@@ -1664,19 +1676,22 @@ async def _strategy_details_run():
                     rec["secs"] = round(_t.time() - t0, 1)
                 runs.append(rec)
                 _sd_state["done"] += 1
-        snap = {"generated_at": datetime.now(_IST).isoformat(), "period": {"from": from_d, "to": to_d},
-                "capital": sd.CAPITAL, "lot_multiplier": 1, "hold_mode": "CARRY_FORWARD", "lot_sizes": lots,
-                "data_notes": data_notes, "runs": runs,
-                "caveats": ["P&L is gross, as the backtest engine reports it (no brokerage / taxes deducted).",
-                            "1 lot per trade, Rs 5L starting capital, positions may be held overnight (carry-forward).",
-                            "CRUDEOIL history starts mid-2026 (current contract only), so its sample is short."]}
+                _sd_partial = _sd_build_snapshot(from_d, to_d, lots, data_notes, runs, complete=False)
+            # after each instrument: keep what is done on disk too (a crash / restart loses at most one instrument)
+            try:
+                sd.save_partial(_sd_partial)
+            except Exception as _sp_err:
+                logger.debug(f"strategy details partial save failed: {_sp_err}")
+        snap = _sd_build_snapshot(from_d, to_d, lots, data_notes, runs, complete=True)
         sd.save_snapshot(snap)
+        sd.clear_partial()
         _sd_state.update(message=f"Completed {_sd_state['done']} runs", error="")
         logger.info(f"Strategy details refresh complete: {len(runs)} runs, period {from_d}..{to_d}")
     except Exception as e:
         _sd_state.update(error=str(e)[:300], message="Refresh did not finish -- the previous results are kept")
         logger.warning(f"Strategy details refresh failed: {e}")
     finally:
+        _sd_partial = None
         _sd_state.update(running=False, current="", finished_at=datetime.now(_IST).isoformat())
 
 
@@ -1684,9 +1699,11 @@ async def _strategy_details_run():
 async def get_strategy_details():
     import strategy_details as sd
     ok, why = sd.refresh_allowed()
+    partial = _sd_partial if _sd_state["running"] else sd.load_partial()
     return _sanitise_floats({"strategies": sd.STRATEGIES, "instruments": sd.INSTRUMENTS,
                              "active_strategy": get_settings().strategy, "snapshot": sd.load_snapshot(),
-                             "refresh": dict(_sd_state), "refresh_allowed": ok, "refresh_blocked_reason": why})
+                             "partial": partial, "refresh": dict(_sd_state),
+                             "refresh_allowed": ok, "refresh_blocked_reason": why})
 
 
 @app.post("/api/strategy_details/refresh")

@@ -945,9 +945,12 @@ function StrategyDetailsPage() {
   }
 
   if (!data) return <Card><div style={{ color:V('text-muted'), padding:20 }}>{err ? 'Could not load: ' + err : 'Loading…'}</div></Card>
-  const snap = data.snapshot
+  const partial = data.partial
+  const snap = data.snapshot || partial
   const runs = {}
-  ;(snap?.runs || []).forEach(r => { runs[r.strategy + '|' + r.instrument] = r })
+  ;(data.snapshot?.runs || []).forEach(r => { runs[r.strategy + '|' + r.instrument] = r })
+  // results of a refresh in progress (or one that stopped part-way) replace older ones as they finish
+  ;(partial?.runs || []).forEach(r => { runs[r.strategy + '|' + r.instrument] = { ...r, fresh: !!data.snapshot } })
   const rf = data.refresh || {}
   const fmtDate = s => s ? new Date(s).toLocaleString('en-IN', { day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:false }) : '—'
   const num = (v, d=2) => v == null ? '—' : Number(v).toLocaleString('en-IN', { maximumFractionDigits:d })
@@ -994,7 +997,9 @@ function StrategyDetailsPage() {
                 const st = r?.stats
                 return (
                   <tr key={inst} style={{ textAlign:'right', borderBottom:`1px solid ${V('border')}` }}>
-                    <td style={{ padding:'6px 8px', textAlign:'left', color:V('text-primary'), fontWeight:600 }}>{inst}</td>
+                    <td style={{ padding:'6px 8px', textAlign:'left', color:V('text-primary'), fontWeight:600 }}>
+                      {inst}{r?.fresh && <span style={{ color:V('green'), fontSize:9, marginLeft:6 }} title="From the refresh in progress">NEW</span>}
+                    </td>
                     {!r ? <td colSpan={7} style={{ padding:'6px 8px', color:V('text-muted'), textAlign:'left' }}>Not run yet</td>
                       : r.error ? <td colSpan={7} style={{ padding:'6px 8px', color:V('yellow'), textAlign:'left' }}>{r.error}</td>
                       : <>
@@ -1025,8 +1030,16 @@ function StrategyDetailsPage() {
               {snap ? `Results ${snap.period?.from} to ${snap.period?.to}` : 'No results yet'}
             </div>
             <div style={{ color:V('text-muted'), fontSize:12, marginTop:3 }}>
-              {snap ? `Last run ${fmtDate(snap.generated_at)} · ₹5L capital · 1 lot · carry-forward · gross P&L` : 'Press "Refresh to latest" (after market hours) to run every strategy.'}
+              {data.snapshot ? `Last complete run ${fmtDate(data.snapshot.generated_at)} · ₹5L capital · 1 lot · carry-forward · gross P&L`
+                : partial ? `Partial results (${partial.runs?.length || 0} of ${(data.strategies || []).length * (data.instruments || []).length}) · ₹5L capital · 1 lot · carry-forward · gross P&L`
+                : 'Press "Refresh to latest" (after market hours) to run every strategy.'}
             </div>
+            {partial && (
+              <div style={{ color:V('yellow'), fontSize:11, marginTop:3 }}>
+                {rf.running ? `Refreshing — ${rf.done || 0} of ${rf.total || '…'} done; results appear as they finish.`
+                  : 'The last refresh stopped part-way; finished results are shown, the rest are from the last complete run.'}
+              </div>
+            )}
             {snap?.lot_sizes && <div style={{ color:V('text-muted'), fontSize:11, marginTop:3 }}>
               Lot sizes: {Object.entries(snap.lot_sizes).map(([k, v]) => `${k} ${v}`).join(' · ')}
             </div>}

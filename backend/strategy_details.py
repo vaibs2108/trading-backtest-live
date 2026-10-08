@@ -143,6 +143,35 @@ def save_snapshot(snap: dict) -> None:
     tmp.replace(SNAPSHOT_PATH)
 
 
+PARTIAL_PATH = DATA_DIR / "partial.json"
+
+
+def save_partial(snap) -> None:
+    """Results of an unfinished refresh (shown on the page; the last complete run stays in latest.json)."""
+    if not snap:
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PARTIAL_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(snap, indent=1, default=str), encoding="utf-8")
+    tmp.replace(PARTIAL_PATH)
+
+
+def load_partial():
+    try:
+        if PARTIAL_PATH.exists():
+            return json.loads(PARTIAL_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return None
+
+
+def clear_partial() -> None:
+    try:
+        PARTIAL_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def slim_stats(stats: dict, lot_qty: int) -> dict:
     """The page's numbers for one run (gross, as the backtest engine reports them)."""
     out = {k: (stats or {}).get(k) for k in STAT_KEYS}
