@@ -5613,6 +5613,24 @@ def _sync_dhan_positions(cfg, tm, latest_candle_ts: str = None):
                     _pnl = round((_exit_px - _ep) * int(_mp.get("qty") or 0), 2) if _ep else float(_trip["pnl"])
             except Exception as _mx:
                 logger.debug(f"manual close fill lookup failed for {_sym}: {_mx}")
+            # W9 (07 Oct): a position bought on an EARLIER day has no buy in today's trade book, so no
+            # round trip is found ("@ None | P&L unknown" for the 54500 CE sold @1,260). Dhan's position
+            # row for the contract stays for the day (netQty 0) with both averages: the side matching
+            # our entry is the entry, the other side is the exit.
+            if _exit_px is None and df is not None and not df.empty and "tradingSymbol" in df.columns:
+                try:
+                    _ep = float(_mp.get("entry_price") or 0)
+                    _r = df[df["tradingSymbol"].astype(str) == str(_sym)]
+                    if _ep > 0 and not _r.empty:
+                        _r = _r.iloc[-1]
+                        _buy, _sell = float(_r.get("buyAvg") or 0), float(_r.get("sellAvg") or 0)
+                        _qty = int(_mp.get("qty") or 0)
+                        if _buy > 0 and _sell > 0:
+                            _bought = abs(_buy - _ep) <= abs(_sell - _ep)
+                            _exit_px = _sell if _bought else _buy
+                            _pnl = round(((_exit_px - _ep) if _bought else (_ep - _exit_px)) * _qty, 2)
+                except Exception as _mx2:
+                    logger.debug(f"manual close position-row lookup failed for {_sym}: {_mx2}")
             manual_positions.close(_sym, _exit_px, _pnl)
                 
         # 2. AUTO track: a live auto position no longer open on Dhan -> close it locally
