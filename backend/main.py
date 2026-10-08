@@ -6219,6 +6219,18 @@ def _fetch_5m_rest_with_freshness_retry(instrument: str, from_d: str, today: str
     return df
 
 
+_official_refresh_last = 0.0
+
+
+def _set_official_5m_last(ts):
+    """Tell the volume-based live processors which 5m bars carry Dhan's official volume (W7a)."""
+    try:
+        import live_bar_processor as _lbp
+        _lbp.set_official_5m_last(ts)
+    except Exception:
+        pass
+
+
 def _fetch_all_frames(instrument: str, candle_close: bool = False) -> dict:
     """Fetch all timeframes needed for the strategy.
 
@@ -6274,6 +6286,34 @@ def _fetch_all_frames(instrument: str, candle_close: bool = False) -> dict:
         # Reuse cached HTF data
         frames.update(_htf_cache.get(instrument, {}))
 
+    # W7(a) (your choice 08 Oct): Dhan's index feed carries no volume, so a live-built candle has volume 0
+    # and the volume-based strategies can only decide on Dhan's OFFICIAL candle. Fetch it as soon as Dhan
+    # publishes it: on each poll after a close, while the REST base is behind the feed, refresh the 5m
+    # REST base (one call, no cache) -- not on the candle-close cycle itself (H5).
+    global _official_refresh_last
+    if not htf_stale and not candle_close:
+        try:
+            _rb = _rest_5m_cache.get(instrument)
+            _fd = get_live_feed()
+            if (_rb is not None and len(_rb) and _fd.is_running
+                    and getattr(_fd, "_instrument", None) == instrument and _fd.candle_5m.candles
+                    and _time_mod.time() - _official_refresh_last >= 10):
+                _feed_last = pd.Timestamp(_fd.candle_5m.candles[-1]["timestamp"])
+                _rest_last = pd.Timestamp(_rb["timestamp"].max())
+                if _feed_last.tzinfo is not None:
+                    _feed_last = _feed_last.tz_localize(None)
+                if _rest_last.tzinfo is not None:
+                    _rest_last = _rest_last.tz_localize(None)
+                if _feed_last > _rest_last:
+                    _official_refresh_last = _time_mod.time()
+                    _from5 = (now_ist - timedelta(days=30)).strftime("%Y-%m-%d")
+                    _df5 = broker.get_historical_data(instrument, "5", _from5, today, use_cache=False)
+                    _df5 = _drop_unready_bars(_df5, 5, instrument, now_ist)
+                    if _df5 is not None and len(_df5) >= 30:
+                        _rest_5m_cache[instrument] = _df5
+        except Exception as _of_err:
+            logger.debug(f"official 5m refresh failed: {_of_err}")
+
     # Fast timeframes: prefer live feed candles (near-instant) with historical API fallback
     _feed = get_live_feed()
     _feed_ok = (_feed.is_running
@@ -6290,8 +6330,10 @@ def _fetch_all_frames(instrument: str, candle_close: bool = False) -> dict:
                 _last_rest_ts = _rest_base["timestamp"].max()
                 _tail = live_5m[live_5m["timestamp"] > _last_rest_ts]
                 frames["5"] = pd.concat([_rest_base, _tail], ignore_index=True)
+                _set_official_5m_last(_last_rest_ts)        # bars after this are feed-built, volume 0
             else:
                 frames["5"] = live_5m
+                _set_official_5m_last(None)
             logger.debug(f"Using live feed 5m candles ({len(live_5m)} bars)")
 
             # ── Freshness guard ──────────────────────────────────────────

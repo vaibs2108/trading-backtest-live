@@ -628,6 +628,60 @@ class BacktestDiffProcessor:
 # STRATEGY-SPECIFIC PROCESSORS (thin wrappers)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── W7(a): strategies that need real volume decide on Dhan's official candle ──────────────────
+import pytz as _pytz_w7
+_IST_W7 = _pytz_w7.timezone("Asia/Kolkata")
+_official_5m_last = None    # last 5m bar timestamp with Dhan's official volume (main.py sets it)
+
+
+def set_official_5m_last(ts):
+    global _official_5m_last
+    _official_5m_last = ts
+
+
+class OfficialVolumeMixin:
+    """Found live 07/08 Oct (W7/H3): Dhan's index feed carries no volume, so the live-built newest
+    candle has volume 0. Alpha Combo, Time-Gated, CUSUM15 and Regime V1 use VWAP (checked: random
+    volume changes their trades; Option B's do not), so at the close they saw volume 0, found no
+    signal, and the signal appeared a candle later -- backdated -- once Dhan's official candle
+    replaced it. Your choice (a): evaluate them on official candles only, as soon as Dhan publishes
+    them (main.py refreshes every poll until it does), and record the signal at the live price and
+    time of detection, not backdated."""
+
+    def process_frames(self, frames: dict, cfg, lot_size: int = 30) -> List[LiveSignal]:
+        f = frames
+        last_off = _official_5m_last
+        try:
+            if last_off is not None and frames.get("5") is not None and len(frames["5"]):
+                df5 = frames["5"]
+                cut = df5[pd.to_datetime(df5["timestamp"]) <= pd.Timestamp(last_off)]
+                if 30 <= len(cut) < len(df5):
+                    f = dict(frames)
+                    f["5"] = cut
+        except Exception as e:
+            logger.debug(f"[{self.strategy_id}] official-candle cut skipped: {e}")
+        sigs = super().process_frames(f, cfg, lot_size)
+        if sigs:
+            live = None
+            try:
+                live = broker.get_ltp(getattr(cfg, "instrument", "BANKNIFTY"))
+            except Exception:
+                live = None
+            now_iso = datetime.now(_IST_W7).isoformat()
+            for sg in sigs:
+                bar = sg.time
+                if live:
+                    if sg.signal_type == "ENTRY":
+                        sg.entry_price = round(float(live), 2)
+                    else:
+                        sg.exit_price = round(float(live), 2)
+                sg.time = now_iso
+                sg.reasons = list(sg.reasons or []) + [
+                    f"Decided on Dhan's official {str(bar)[11:16]} candle (live candles carry no volume); "
+                    f"price and time at detection"]
+        return sigs
+
+
 class RegimeLiveProcessor(BacktestDiffProcessor):
     """Regime Trend/Range Optimized strategy."""
     strategy_id = "regime_trend_range"
@@ -658,7 +712,7 @@ class DonchianIntradayLiveProcessor(BacktestDiffProcessor):
     strategy_id = "donchian_5m_intraday"
 
 
-class RegimeV1FinalLiveProcessor(BacktestDiffProcessor):
+class RegimeV1FinalLiveProcessor(OfficialVolumeMixin, BacktestDiffProcessor):
     """Regime T/R V1 Final (Research) -- Donchian+CUSUM(2.0)+HTF-hold+
     SuperTrend-adaptive on the trend side, VWAP+half-life on the range
     side. Promoted to live after the scratch/research_v1/ session."""
@@ -829,7 +883,7 @@ class OptionBRamRFLiveProcessor(BacktestDiffProcessor):
             return signals
 
 
-class Cusum15LiveProcessor(BacktestDiffProcessor):
+class Cusum15LiveProcessor(OfficialVolumeMixin, BacktestDiffProcessor):
     """CUSUM 1.5 + No Donchian + CD8 (Research) -- best points/PF/net of
     the whole research session; maxDD runs ~0.9pp over the user's 7% cap,
     accepted deliberately. Promoted to live after the scratch/research_v1/
@@ -837,7 +891,7 @@ class Cusum15LiveProcessor(BacktestDiffProcessor):
     strategy_id = "custom_cusum15_nodonchian_cd8"
 
 
-class AlphaComboLiveProcessor(BacktestDiffProcessor):
+class AlphaComboLiveProcessor(OfficialVolumeMixin, BacktestDiffProcessor):
     """Alpha Combo (CUSUM 1.25 Tuned) -- CUSUM 1.5/No-Donchian/CD8 with the
     CUSUM threshold loosened to 1.25; beat the CUSUM 1.5 baseline on every
     metric in every train/validate/full window. Default live strategy,
@@ -846,7 +900,7 @@ class AlphaComboLiveProcessor(BacktestDiffProcessor):
     strategy_id = "custom_alpha_combo_cusum125"
 
 
-class TimeGatedAlphaComboLiveProcessor(BacktestDiffProcessor):
+class TimeGatedAlphaComboLiveProcessor(OfficialVolumeMixin, BacktestDiffProcessor):
     """Time-Gated Alpha Combo -- Alpha Combo with new entries blocked during
     two intraday "trap" windows (10:00-10:45 AM, 1:00-1:45 PM); existing
     positions still managed normally through those windows. Promoted to
