@@ -738,13 +738,22 @@ class OptionBRamRFLiveProcessor(BacktestDiffProcessor):
         if last_ts.time() >= pd.Timestamp("15:25").time():
             return []                      # next bar is tomorrow's open: the normal diff handles it
         if last_ts.time() <= pd.Timestamp("09:15").time():
-            # Found live 08 Oct: the feed-built 09:15 candle misses the opening auction print (its
+            # Found live 08 Oct: the feed-built 09:15 candle missed the opening auction print (its
             # open/high came out 54,989.50 / 55,002.85 vs Dhan's 55,042.90 / 55,043.00), which made
-            # Ram SELL at 09:20; the candle is corrected from Dhan's data ~09:23 (every day) and the
-            # SHORT vanished at 09:25. A signal on the first candle waits for that correction: the
-            # normal diff emits it at 09:25, as before this change.
-            logger.info(f"[{self.strategy_id}] no early entry on the 09:15 candle (corrected from Dhan's data ~09:23)")
-            return []
+            # Ram SELL at 09:20; the candle was corrected from Dhan's data ~09:23 and the SHORT
+            # vanished at 09:25. live_feed now sets that candle from the exchange's day open/high/low;
+            # only if that didn't happen today (e.g. feed connected late) does a first-candle signal
+            # wait for the correction (the normal diff emits it at 09:25).
+            official = False
+            try:
+                from live_feed import get_live_feed
+                official = get_live_feed().first_candle_official(last_ts.date())
+            except Exception:
+                official = False
+            if not official:
+                logger.info(f"[{self.strategy_id}] no early entry on the 09:15 candle: it was not set from the "
+                            f"exchange's day open/high/low today (Dhan's data corrects it ~09:23)")
+                return []
         next_ts = last_ts + pd.Timedelta(minutes=5)
         px = 0.0
         try:

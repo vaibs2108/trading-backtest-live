@@ -232,6 +232,7 @@ class LiveFeedManager:
         self._silent_alerted = False
 
     def _reset_trade_day(self):
+        self._first_candle_official = None   # date whose first 5m candle came from the day OHLC
         # Real (current) trades seen today -- see traded_today()
         self._trade_day = None
         self._trade_ticks = 0
@@ -466,6 +467,44 @@ class LiveFeedManager:
             except Exception as e:
                 logger.warning(f"LiveFeed watchdog error: {e}")
 
+    def _apply_official_first_candle(self, data: dict, ltp: float, tick_time: datetime):
+        """While the session's first candle (09:15; 09:00 on MCX) is forming, take its open/high/low
+        from the exchange's day open/high/low carried in every Quote packet.
+
+        Found live 2026-10-08: candles built from ticks miss the opening auction print, so the
+        09:15 candle came out O/H 54,989.50 / 55,002.85 instead of Dhan's 55,042.90 / 55,043.00
+        -- every day (REST corrected it ~09:23). Option B's SELL fired on the wrong high at 09:20
+        and the trade vanished at 09:25. During the first slot the day's open/high/low ARE that
+        candle's open/high/low, so this makes the candle exact before the 09:20 evaluation."""
+        try:
+            d_open = float(data.get("open") or 0)
+            d_high = float(data.get("high") or 0)
+            d_low = float(data.get("low") or 0)
+        except (TypeError, ValueError):
+            return
+        if d_open <= 0 or d_high <= 0 or d_low <= 0 or abs(d_open - ltp) / ltp > 0.05:
+            return
+        b = _session_bounds(self._exchange_seg, tick_time)
+        if not b:
+            return
+        first_slot = b[0]
+        _naive = lambda x: x.replace(tzinfo=None) if getattr(x, "tzinfo", None) else x
+        for builder in (self.candle_1m, self.candle_5m):
+            cur = builder._current
+            if cur is None or builder._current_slot is None or _naive(builder._current_slot) != _naive(first_slot):
+                continue
+            cur["open"] = d_open
+            cur["high"] = max(cur["high"], d_high)    # still inside the first slot: day high/low =
+            cur["low"] = min(cur["low"], d_low)       # this candle's high/low so far
+            if builder is self.candle_5m and self._first_candle_official != first_slot.date():
+                self._first_candle_official = first_slot.date()
+                logger.info(f"LiveFeed: first 5m candle {first_slot:%H:%M} set from the exchange's day "
+                            f"open/high/low (O={d_open:.2f} H={cur['high']:.2f} L={cur['low']:.2f})")
+
+    def first_candle_official(self, day) -> bool:
+        """True when today's first 5m candle was set from the exchange's day open/high/low."""
+        return self._first_candle_official == day
+
     def _process_tick(self, data: dict):
         """Process a single tick from MarketFeed."""
         if not data:
@@ -558,6 +597,7 @@ class LiveFeedManager:
         # Feed ticks into candle builders
         self.candle_1m.on_tick(ltp, ltq, tick_time)
         completed_5m = self.candle_5m.on_tick(ltp, ltq, tick_time)
+        self._apply_official_first_candle(data, ltp, tick_time)
 
         # If a 5m candle just completed, signal the async loop
         if completed_5m:
