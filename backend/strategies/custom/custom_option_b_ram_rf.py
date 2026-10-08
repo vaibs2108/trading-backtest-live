@@ -13,6 +13,14 @@ Verified 2026-10-01 through the app's backtest engine (CARRY_FORWARD, index poin
     By year: 2022 +5,948 | 2023 +12,056 | 2024 +8,273 | 2025 +6,084 | 2026 Jan-Sep +29,856.
   Reversal test (all Ram + Range Filter signals flipped): PF 0.70, -11,022 pts -> the edge is directional, not luck.
 Only CARRY_FORWARD was validated.
+
+HONEST RESULTS 2026-10-08 (D2, your decision: the Backtest page must show the honest view). Two look-aheads
+were removed from the shared engine (custom_ram_rf_box.py): the Range Filter "keep holding?" decision at a
+Ram limit fill used RF at the END of the fill bar, and a limit fill in the same bar as a reversal was booked
+at the limit instead of the open. Same data, index points, 1 lot:
+  2025-07-01..2026-09-30: 32,234 pts, PF 1.77, worst DD -1,923 (was 33,947 / 1.83 / -1,862)
+  Dhan 5-yr 2022-01..2026-09: 53,798 pts, PF 1.29, worst DD -6,648 (was 62,217 / 1.35 / -5,477)
+The live app follows exactly these rules.
 """
 import os
 import sys

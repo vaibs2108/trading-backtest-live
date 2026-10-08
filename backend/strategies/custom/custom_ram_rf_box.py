@@ -154,11 +154,18 @@ def _ram_track(o, h, l, c):
         tr.entry_px[ei] = e
         tr.exit_px[i] = px
 
+    tr.limit_bars = set()      # bars where the UT limit filled INSIDE the bar (see _combine)
     for i in range(1, len(c)):
-        if pos and lim is not None and ((pos > 0 and h[i] >= lim) or (pos < 0 and l[i] <= lim)):
-            close_at(i, max(lim, o[i]) if pos > 0 else min(lim, o[i]))
-            pos, lim = 0, None
         want = 1 if buy[i - 1] else -1 if sell[i - 1] else 0
+        if pos and lim is not None and ((pos > 0 and h[i] >= lim) or (pos < 0 and l[i] <= lim)):
+            if want and ((want > 0 and pos < 0) or (want < 0 and pos > 0)):
+                # HONEST 08 Oct (D2): the reversal happens at this bar's OPEN, before any later limit
+                # fill inside the bar -- the old position is closed at the open, not at the limit.
+                close_at(i, o[i])
+            else:
+                close_at(i, max(lim, o[i]) if pos > 0 else min(lim, o[i]))
+                tr.limit_bars.add(i)
+            pos, lim = 0, None
         if want and ((want > 0 and pos <= 0) or (want < 0 and pos >= 0)):
             if pos:
                 close_at(i, o[i])
@@ -291,6 +298,21 @@ def _combine(ts, c, tracks, order, hold_only, i0, qty, sl_pts, t1_pct, t2_pct):
                            "target1": round(cur_t1, 2), "target2": round(cur_t2, 2)})
 
     for i in range(len(c)):
+        # HONEST 08 Oct (D2): the controlling engine's exit was a LIMIT filled inside bar i. Whether a
+        # hold-only engine keeps the lot is decided with that engine's state at the PREVIOUS close (what
+        # is known when the limit fills), not at bar i's close (that was a look-ahead: ~-7,900 pts of the
+        # 5-year result). Held then -> the hold engine controls (it exits at bar i's close if it flips
+        # there); not held -> out at the limit price, even if a hold engine turns the same way at the close.
+        if (cur_dir != 0 and cur_ctrl is not None and i > 0
+                and i in getattr(tracks[cur_ctrl], "limit_bars", ())
+                and tracks[cur_ctrl].dir_end[i] != cur_dir and not np.isnan(tracks[cur_ctrl].exit_px[i])):
+            holder = next((k for k in order if k in hold_only and k != cur_ctrl
+                           and tracks[k].dir_end[i - 1] == cur_dir), None)
+            if holder is not None:
+                cur_ctrl = holder
+            else:
+                book(i, tracks[cur_ctrl].exit_px[i], f"{cur_ctrl}_EXIT")
+                cur_dir, cur_ctrl = 0, None
         ctrl, d = None, 0
         for k in order:
             v = tracks[k].dir_end[i]
