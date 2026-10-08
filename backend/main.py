@@ -3074,7 +3074,7 @@ async def _signal_polling_loop():
             except Exception as _fw_err:
                 logger.debug(f"Live feed watchdog error: {_fw_err}")
 
-            frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument)
+            frames = await asyncio.to_thread(_fetch_all_frames, cfg.instrument, _by_candle)
             _t_frames = datetime.now(_IST)
 
             # Cache frames for chart_signals endpoint (avoids 12.5s re-fetch)
@@ -6071,7 +6071,7 @@ def _fetch_5m_rest_with_freshness_retry(instrument: str, from_d: str, today: str
     return df
 
 
-def _fetch_all_frames(instrument: str) -> dict:
+def _fetch_all_frames(instrument: str, candle_close: bool = False) -> dict:
     """Fetch all timeframes needed for the strategy.
 
     Optimization: Daily/60m/15m data changes slowly, so we cache them and
@@ -6091,6 +6091,14 @@ def _fetch_all_frames(instrument: str) -> dict:
 
     # Higher timeframes: refresh every 5th cycle (~75s) or on first run
     htf_stale = (_htf_poll_count % 5 == 1) or not _htf_cache.get(instrument)
+    # H5 (08 Oct): this refresh is 4 Dhan history calls (~5 s with the rate limit). When the 5th cycle
+    # was the candle-close cycle, the active strategy waited for it -- Option B handled +5-6 s late at
+    # 09:45, 10:35, 11:25 ... (every 50 min) instead of +0.5 s. On a candle close, use the cache if it
+    # is under 5 minutes old and let the next 15-s poll refresh it (the cycle count is not advanced).
+    if (htf_stale and candle_close and _htf_cache.get(instrument)
+            and _htf_cache_ts and (_time_mod.time() - _htf_cache_ts) < 300):
+        htf_stale = False
+        _htf_poll_count -= 1
 
     if htf_stale:
         # Refresh the REST 5m base too — it carries exchange volume (live tick
